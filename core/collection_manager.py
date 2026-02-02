@@ -8,7 +8,7 @@ Chaque collection est stockée dans un sous-dossier distinct :
 import shutil
 from pathlib import Path
 
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 from core.embeddings import get_embeddings
 
