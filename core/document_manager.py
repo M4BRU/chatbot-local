@@ -15,8 +15,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from core.collection_manager import CollectionManager
 from core.parsers import parser_document
 
-CHUNK_SIZE = 700
-CHUNK_OVERLAP = 80
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 
 
 class DocumentManager:

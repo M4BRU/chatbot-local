@@ -5,3 +5,11 @@ chroma_db/
 .env
 *.egg-info/
 .DS_Store
+
+# BMAD & Claude tooling (private)
+_bmad/
+_bmad-output/
+.claude/
+
+# User documents (PDFs ingested by the chatbot)
+documents/

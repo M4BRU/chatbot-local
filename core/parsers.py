@@ -52,28 +52,24 @@ def parser_document(chemin: Path) -> list[ParsedPage]:
 
 
 def _parser_pdf(chemin: Path) -> list[ParsedPage]:
-    """Extraction PDF via PyPDF2, avec fallback OCR (pytesseract)."""
-    from PyPDF2 import PdfReader
+    """Extraction PDF via PyMuPDF4LLM — meilleure qualité que PyPDF2.
+
+    Retourne le texte en markdown (tableaux, titres, listes préservés).
+    """
+    import pymupdf4llm
 
     pages = []
     try:
-        lecteur = PdfReader(str(chemin))
+        pages_md = pymupdf4llm.to_markdown(str(chemin), page_chunks=True)
     except Exception as e:
         print(f"  Impossible de lire {chemin.name} : {e}")
         return pages
 
-    for num_page, page in enumerate(lecteur.pages, start=1):
-        texte = ""
-        try:
-            texte = page.extract_text() or ""
-        except Exception:
-            pass
-
-        # Si le texte extrait est trop court, tenter l'OCR
-        if len(texte.strip()) < 50:
-            texte_ocr = _ocr_page(chemin, num_page)
-            if texte_ocr:
-                texte = texte_ocr
+    for page_data in pages_md:
+        texte = page_data.get("text", "")
+        num_page = page_data.get("metadata", {}).get("page", 1)
+        # pymupdf4llm utilise un index 0-based pour les pages
+        num_page = num_page + 1 if isinstance(num_page, int) else 1
 
         if texte.strip():
             pages.append(ParsedPage(
@@ -83,27 +79,6 @@ def _parser_pdf(chemin: Path) -> list[ParsedPage]:
             ))
 
     return pages
-
-
-def _ocr_page(chemin: Path, num_page: int) -> str:
-    """Tente l'OCR sur une page PDF via pdf2image + pytesseract."""
-    try:
-        from pdf2image import convert_from_path
-        import pytesseract
-
-        images = convert_from_path(
-            str(chemin),
-            first_page=num_page,
-            last_page=num_page,
-            dpi=200,
-        )
-        if images:
-            return pytesseract.image_to_string(images[0], lang="fra")
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    return ""
 
 
 def _parser_docx(chemin: Path) -> list[ParsedPage]:
