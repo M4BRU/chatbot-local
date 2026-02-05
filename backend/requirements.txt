@@ -11,8 +11,19 @@ sse-starlette>=2.1.0
 # HTTP client
 httpx>=0.27.0
 
-# ChromaDB client
-chromadb>=1.4.0
+# LangChain and vector store
+langchain-ollama>=0.3.0
+langchain-chroma>=0.2.0
+langchain-text-splitters>=0.3.0
+chromadb>=1.0.0
+
+# HTTP client for RAG
+requests>=2.32.0
+
+# Document parsers
+pymupdf4llm>=0.0.17
+python-docx>=1.1.0
+pandas>=2.2.0
 
 # Testing
 pytest>=8.0.0

@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { streamChat } from "../lib/api";
+import { streamChat, fetchCollections } from "../lib/api";
 import type { ChatMessage, ChatSource } from "../lib/types";
 
 function generateId(): string {
@@ -15,15 +15,16 @@ interface ChatInputProps {
   onSend: (message: string) => void;
   disabled: boolean;
   collection: string;
+  collections: string[];
   onCollectionChange: (collection: string) => void;
 }
 
-function ChatInput({ onSend, disabled, collection, onCollectionChange }: ChatInputProps) {
+function ChatInput({ onSend, disabled, collection, collections, onCollectionChange }: ChatInputProps) {
   const [input, setInput] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (input.trim() && !disabled) {
+    if (input.trim() && !disabled && collection) {
       onSend(input.trim());
       setInput("");
     }
@@ -31,24 +32,27 @@ function ChatInput({ onSend, disabled, collection, onCollectionChange }: ChatInp
 
   return (
     <form onSubmit={handleSubmit} className="flex gap-2 p-4 border-t border-gray-200">
-      <input
-        type="text"
+      <select
         value={collection}
         onChange={(e) => onCollectionChange(e.target.value)}
-        placeholder="Collection"
-        className="px-3 py-2 border border-gray-300 rounded-lg w-40 text-sm"
-      />
+        className="px-3 py-2 border border-gray-300 rounded-lg w-48 text-sm bg-white"
+      >
+        <option value="">-- Collection --</option>
+        {collections.map((c) => (
+          <option key={c} value={c}>{c}</option>
+        ))}
+      </select>
       <input
         type="text"
         value={input}
         onChange={(e) => setInput(e.target.value)}
         placeholder="Posez votre question..."
-        disabled={disabled}
+        disabled={disabled || !collection}
         className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
       />
       <button
         type="submit"
-        disabled={disabled || !input.trim()}
+        disabled={disabled || !input.trim() || !collection}
         className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
       >
         {disabled ? "..." : "Envoyer"}
@@ -66,7 +70,7 @@ function Sources({ sources }: { sources: ChatSource[] }) {
       <ul className="text-xs text-gray-600 space-y-0.5">
         {sources.map((s, i) => (
           <li key={i}>
-            📄 {s.fichier} - p.{s.page} (score: {s.score})
+            {s.fichier} - p.{s.page} (score: {s.score})
           </li>
         ))}
       </ul>
@@ -91,7 +95,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         ) : (
           <div className="prose prose-sm max-w-none">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {message.content || (message.isStreaming ? "▊" : "")}
+              {message.content || (message.isStreaming ? "..." : "")}
             </ReactMarkdown>
           </div>
         )}
@@ -104,9 +108,20 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 export default function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [collection, setCollection] = useState("vlm_robotics");
+  const [collection, setCollection] = useState("");
+  const [collections, setCollections] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Fetch collections on mount
+  useEffect(() => {
+    fetchCollections().then((cols) => {
+      setCollections(cols);
+      if (cols.length > 0 && !collection) {
+        setCollection(cols[0]);
+      }
+    });
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -185,7 +200,7 @@ export default function Chat() {
           <p className="text-sm text-gray-500">RAG chatbot pour VLM Robotics</p>
         </div>
         <Link href="/admin" className="text-blue-600 hover:underline text-sm">
-          Admin →
+          Admin
         </Link>
       </header>
 
@@ -194,7 +209,9 @@ export default function Chat() {
           <div className="text-center text-gray-400 mt-20">
             <p className="text-lg">Bienvenue!</p>
             <p className="text-sm mt-2">
-              Posez une question sur les produits VLM Robotics
+              {collections.length === 0
+                ? "Aucune collection disponible. Allez dans Admin pour en créer une."
+                : "Sélectionnez une collection et posez votre question"}
             </p>
           </div>
         )}
@@ -211,6 +228,7 @@ export default function Chat() {
         onSend={handleSend}
         disabled={isStreaming}
         collection={collection}
+        collections={collections}
         onCollectionChange={setCollection}
       />
     </div>
