@@ -1,0 +1,15 @@
+[project]
+name = "chatbot-local-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
