@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install dependencies
-COPY requirements.txt .
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Production stage
@@ -22,10 +22,14 @@ COPY --from=builder /root/.local /root/.local
 ENV PATH=/root/.local/bin:$PATH
 
 # Copy application code
-COPY . .
+COPY backend/ ./backend/
+COPY core/ ./core/
 
 # Create documents directory
 RUN mkdir -p /app/documents
+
+# Add /app to Python path
+ENV PYTHONPATH=/app
 
 # Expose port
 EXPOSE 8000

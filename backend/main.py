@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.dependencies import get_settings
-from backend.api.routes import chat_router, health_router
+from backend.api.routes import chat_router, collections_router, documents_router, health_router
 
 settings = get_settings()
 
@@ -26,6 +26,8 @@ app.add_middleware(
 # Register routers
 app.include_router(health_router)
 app.include_router(chat_router)
+app.include_router(collections_router)
+app.include_router(documents_router)
 
 
 @app.get("/")

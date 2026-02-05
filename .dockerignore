@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+*.egg-info
+
+# Node
+frontend/node_modules
+frontend/.next
+
+# IDE
+.vscode
+.idea
+
+# Docs and configs
+*.md
+!README.md
+_bmad-output
+.env
+.env.*
+
+# Data
+chroma_db
+*.pdf
