@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamChat } from "../lib/api";
@@ -178,9 +179,14 @@ export default function Chat() {
 
   return (
     <div className="flex flex-col h-screen max-w-4xl mx-auto">
-      <header className="p-4 border-b border-gray-200">
-        <h1 className="text-xl font-bold text-gray-800">chatbot-local</h1>
-        <p className="text-sm text-gray-500">RAG chatbot pour VLM Robotics</p>
+      <header className="p-4 border-b border-gray-200 flex justify-between items-center">
+        <div>
+          <h1 className="text-xl font-bold text-gray-800">chatbot-local</h1>
+          <p className="text-sm text-gray-500">RAG chatbot pour VLM Robotics</p>
+        </div>
+        <Link href="/admin" className="text-blue-600 hover:underline text-sm">
+          Admin →
+        </Link>
       </header>
 
       <div className="flex-1 overflow-y-auto p-4">
