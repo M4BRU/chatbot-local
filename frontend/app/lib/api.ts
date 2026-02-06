@@ -2,10 +2,16 @@ import type { SSEEvent } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+interface HistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export async function* streamChat(
   message: string,
   collectionName: string,
-  promptName: string = "defaut"
+  promptName: string = "defaut",
+  history: HistoryMessage[] = []
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_URL}/api/chat`, {
     method: "POST",
@@ -14,6 +20,7 @@ export async function* streamChat(
       message,
       collection_name: collectionName,
       prompt_name: promptName,
+      history,
     }),
   });
 

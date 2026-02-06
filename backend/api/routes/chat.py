@@ -10,12 +10,30 @@ from backend.domain.models.chat import ChatRequest, ChatResponse
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+# Maximum number of history messages to include
+MAX_HISTORY_MESSAGES = 10
+
+
+def _format_history(history: list) -> str:
+    """Format conversation history for the prompt."""
+    if not history:
+        return ""
+
+    formatted = []
+    # Take only the last N messages
+    recent_history = history[-MAX_HISTORY_MESSAGES:]
+
+    for msg in recent_history:
+        role = "User" if msg.role == "user" else "Assistant"
+        formatted.append(f"{role}: {msg.content}")
+
+    return "\n".join(formatted)
+
 
 async def _stream_rag_response(
-    message: str, collection_name: str, prompt_name: str
+    message: str, collection_name: str, prompt_name: str, history: list
 ) -> AsyncGenerator[str, None]:
     """Stream RAG response as SSE events."""
-    # Import here to avoid circular imports and allow lazy loading
     from core.collection_manager import CollectionManager
     from core.search import RAGEngine
 
@@ -26,7 +44,11 @@ async def _stream_rag_response(
             return
 
         rag = RAGEngine(collection_name, prompt_name=prompt_name, collection_manager=cm)
-        result = rag.generer_avec_sources(message, stream=True)
+
+        # Format history for context
+        history_text = _format_history(history)
+
+        result = rag.generer_avec_sources(message, stream=True, history=history_text)
 
         # Stream tokens
         for token in result["reponse"]:
@@ -50,7 +72,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     then streams the LLM response token by token.
     """
     return StreamingResponse(
-        _stream_rag_response(request.message, request.collection_name, request.prompt_name),
+        _stream_rag_response(
+            request.message,
+            request.collection_name,
+            request.prompt_name,
+            request.history
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -76,7 +103,8 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
 
     try:
         rag = RAGEngine(request.collection_name, prompt_name=request.prompt_name, collection_manager=cm)
-        result = rag.generer_avec_sources(request.message, stream=False)
+        history_text = _format_history(request.history)
+        result = rag.generer_avec_sources(request.message, stream=False, history=history_text)
         return ChatResponse(response=result["reponse"], sources=result["sources"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -15,8 +15,8 @@ PROMPT_DEFAUT = """Tu es un assistant intelligent. Utilise le contexte ci-dessou
 
 Contexte :
 {context}
-
-Question : {question}
+{history_section}
+Question actuelle : {question}
 
 Réponds de manière précise et concise. Si l'information n'est pas dans le contexte, dis-le clairement."""
 
@@ -32,7 +32,7 @@ Ton expertise couvre :
 
 Contexte disponible :
 {context}
-
+{history_section}
 Question client : {question}
 
 Consignes de réponse :
@@ -107,14 +107,24 @@ class RAGEngine:
         contexte = "\n\n---\n\n".join(contexte_parts)
         return contexte, sources
 
-    def generer_avec_sources(self, question: str, stream: bool = True) -> dict:
+    def generer_avec_sources(self, question: str, stream: bool = True, history: str = "") -> dict:
         """
         Recherche + génération LLM.
 
         Retourne {"reponse": generator|str, "sources": list[dict]}
         """
         contexte, sources = self.rechercher(question)
-        prompt = self.prompt_template.format(context=contexte, question=question)
+
+        # Format history section if provided
+        history_section = ""
+        if history:
+            history_section = f"\nHistorique de conversation:\n{history}\n"
+
+        prompt = self.prompt_template.format(
+            context=contexte,
+            question=question,
+            history_section=history_section
+        )
 
         reponse = self._appeler_ollama(prompt, stream=stream)
         return {"reponse": reponse, "sources": sources}

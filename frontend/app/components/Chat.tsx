@@ -142,11 +142,16 @@ export default function Chat() {
       isStreaming: true,
     };
 
+    // Prepare history from existing messages (exclude sources for smaller payload)
+    const history = messages
+      .filter((m) => m.content && !m.isStreaming)
+      .map((m) => ({ role: m.role, content: m.content }));
+
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setIsStreaming(true);
 
     try {
-      for await (const event of streamChat(content, collection)) {
+      for await (const event of streamChat(content, collection, "defaut", history)) {
         if (event.error) {
           setError(event.error);
           setMessages((prev) =>
