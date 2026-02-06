@@ -15,3 +15,7 @@ out/
 # Misc
 .DS_Store
 *.log
+
+# Playwright
+playwright-report/
+test-results/
