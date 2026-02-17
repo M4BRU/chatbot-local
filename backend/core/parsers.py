@@ -22,6 +22,8 @@ _EXTENSIONS = {
     ".txt": "_parser_texte",
     ".md": "_parser_texte",
     ".csv": "_parser_csv",
+    ".xlsx": "_parser_excel",
+    ".xls": "_parser_excel",
 }
 
 
@@ -127,3 +129,41 @@ def _parser_csv(chemin: Path) -> list[ParsedPage]:
         source=chemin.name,
         page=1,
     )]
+
+
+def _parser_excel(chemin: Path) -> list[ParsedPage]:
+    """Extraction Excel (.xlsx et .xls) via pandas.
+
+    Gère les fichiers Excel multi-feuilles en concaténant toutes les feuilles.
+    Chaque feuille est préfixée par son nom pour le contexte.
+
+    Formats supportés:
+    - .xlsx (Excel 2007+) via openpyxl
+    - .xls (Excel 97-2003) via xlrd
+    """
+    import pandas as pd
+
+    pages = []
+
+    try:
+        # Lire toutes les feuilles du fichier Excel
+        excel_file = pd.ExcelFile(str(chemin))
+
+        for sheet_name in excel_file.sheet_names:
+            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+
+            # Convertir le DataFrame en texte formaté
+            if not df.empty:
+                texte = f"# Feuille: {sheet_name}\n\n"
+                texte += df.to_string(index=False)
+
+                pages.append(ParsedPage(
+                    texte=texte.strip(),
+                    source=f"{chemin.name} (Feuille: {sheet_name})",
+                    page=len(pages) + 1,
+                ))
+    except Exception as e:
+        print(f"  Impossible de lire {chemin.name} : {e}")
+        return []
+
+    return pages

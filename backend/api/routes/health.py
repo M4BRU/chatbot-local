@@ -2,6 +2,7 @@
 
 import subprocess
 
+import chromadb
 import httpx
 from fastapi import APIRouter, Depends
 
@@ -25,15 +26,14 @@ async def check_ollama(settings: Settings) -> str:
 
 
 async def check_chromadb(settings: Settings) -> str:
-    """Check ChromaDB service health."""
+    """Check ChromaDB service health via Python client."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                f"http://{settings.chroma_host}:{settings.chroma_port}/api/v1/heartbeat"
-            )
-            if response.status_code == 200:
-                return "ok"
-            return "unavailable"
+        client = chromadb.HttpClient(
+            host=settings.chroma_host,
+            port=settings.chroma_port,
+        )
+        client.heartbeat()
+        return "ok"
     except Exception:
         return "unavailable"
 

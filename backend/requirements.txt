@@ -24,6 +24,8 @@ requests>=2.32.0
 pymupdf4llm>=0.0.17
 python-docx>=1.1.0
 pandas>=2.2.0
+openpyxl>=3.1.0  # For .xlsx (Excel 2007+)
+xlrd>=2.0.0      # For .xls (Excel 97-2003)
 
 # Testing
 pytest>=8.0.0

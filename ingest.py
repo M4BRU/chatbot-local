@@ -14,6 +14,9 @@ import sys
 import time
 from pathlib import Path
 
+# Source de vérité unique : backend/core/
+sys.path.insert(0, str(Path(__file__).parent / "backend"))
+
 from core.embeddings import verifier_ollama
 from core.parsers import extensions_supportees
 from core.collection_manager import CollectionManager

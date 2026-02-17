@@ -151,7 +151,7 @@ export default function Chat() {
     setIsStreaming(true);
 
     try {
-      for await (const event of streamChat(content, collection, "defaut", history)) {
+      for await (const event of streamChat(content, collection, collection, history)) {
         if (event.error) {
           setError(event.error);
           setMessages((prev) =>

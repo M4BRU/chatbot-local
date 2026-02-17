@@ -1,41 +1,44 @@
 """
-core/collection_manager.py — Gestion multi-collections ChromaDB.
+core/collection_manager.py — Gestion multi-collections ChromaDB via HTTP.
 
-Chaque collection est stockée dans un sous-dossier distinct :
-    ./chroma_db/{nom_collection}/
+Se connecte au service ChromaDB via HTTP (mode microservices).
+Configuration par variables d'environnement :
+    CHROMA_HOST  : hôte ChromaDB (défaut: localhost)
+    CHROMA_PORT  : port ChromaDB (défaut: 8100 en local, 8000 dans Docker)
 """
 
-import shutil
-from pathlib import Path
+import os
 
+import chromadb
 from langchain_chroma import Chroma
 
 from core.embeddings import get_embeddings
 
-CHROMA_BASE_DIR = Path("./chroma_db")
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8100"))
 
 
 class CollectionManager:
-    """Gère les collections ChromaDB (CRUD)."""
+    """Gère les collections ChromaDB via le client HTTP."""
 
-    def __init__(self, base_dir: Path | None = None):
-        self.base_dir = Path(base_dir) if base_dir else CHROMA_BASE_DIR
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-
-    def _chemin_collection(self, nom: str) -> Path:
-        return self.base_dir / nom
+    def __init__(self, host: str | None = None, port: int | None = None):
+        self.host = host or CHROMA_HOST
+        self.port = port or CHROMA_PORT
+        self._client = chromadb.HttpClient(host=self.host, port=self.port)
 
     def collection_existe(self, nom: str) -> bool:
         """Vérifie si une collection existe."""
-        chemin = self._chemin_collection(nom)
-        return chemin.exists() and any(chemin.iterdir())
+        try:
+            self._client.get_collection(nom)
+            return True
+        except Exception:
+            return False
 
     def creer_collection(self, nom: str) -> Chroma:
         """Crée (ou ouvre) une collection ChromaDB."""
-        chemin = self._chemin_collection(nom)
-        chemin.mkdir(parents=True, exist_ok=True)
         return Chroma(
-            persist_directory=str(chemin),
+            client=self._client,
+            collection_name=nom,
             embedding_function=get_embeddings(),
         )
 
@@ -44,22 +47,15 @@ class CollectionManager:
         if not self.collection_existe(nom):
             raise ValueError(f"Collection '{nom}' introuvable.")
         return Chroma(
-            persist_directory=str(self._chemin_collection(nom)),
+            client=self._client,
+            collection_name=nom,
             embedding_function=get_embeddings(),
         )
 
     def lister_collections(self) -> list[str]:
         """Liste toutes les collections disponibles."""
-        if not self.base_dir.exists():
-            return []
-        collections = []
-        for d in sorted(self.base_dir.iterdir()):
-            if d.is_dir() and any(d.iterdir()):
-                collections.append(d.name)
-        return collections
+        return sorted(c.name for c in self._client.list_collections())
 
     def supprimer_collection(self, nom: str) -> None:
-        """Supprime une collection et tous ses fichiers."""
-        chemin = self._chemin_collection(nom)
-        if chemin.exists():
-            shutil.rmtree(chemin)
+        """Supprime une collection ChromaDB."""
+        self._client.delete_collection(nom)

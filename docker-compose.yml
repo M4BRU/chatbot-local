@@ -21,7 +21,8 @@ services:
     environment:
       - OLLAMA_URL=http://ollama:11434
       - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8100
+      - CHROMA_PORT=8000
+      - METADATA_DIR=/app/documents/metadata
       - CORS_ORIGINS=["http://localhost:3000","http://frontend:3000"]
     volumes:
       - documents_store:/app/documents

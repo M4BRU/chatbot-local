@@ -23,13 +23,13 @@ ENV PATH=/root/.local/bin:$PATH
 
 # Copy application code
 COPY backend/ ./backend/
-COPY core/ ./core/
 
 # Create documents directory
 RUN mkdir -p /app/documents
 
-# Add /app to Python path
-ENV PYTHONPATH=/app
+# backend/core/ doit prendre la priorité sur core/ racine pour les imports
+# PYTHONPATH=/app/backend:/app → "import core" résout backend/core/ en premier
+ENV PYTHONPATH=/app/backend:/app
 
 # Expose port
 EXPOSE 8000

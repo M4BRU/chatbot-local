@@ -18,6 +18,7 @@ export default function AdminPage() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [newCollectionName, setNewCollectionName] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   // Fetch collections
@@ -96,35 +97,50 @@ export default function AdminPage() {
     }
   };
 
-  // Upload document
+  // Upload documents (multi-fichiers, séquentiel)
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!selectedCollection || !e.target.files?.length) return;
 
-    const file = e.target.files[0];
-    const formData = new FormData();
-    formData.append("file", file);
-
+    const files = Array.from(e.target.files);
     setUploading(true);
+    setUploadProgress({ current: 0, total: files.length });
     setMessage(null);
 
-    try {
-      const res = await fetch(
-        `${API_URL}/api/collections/${selectedCollection}/documents`,
-        { method: "POST", body: formData }
-      );
+    const successes: string[] = [];
+    const errors: string[] = [];
 
-      const data = await res.json();
-      if (res.ok) {
-        setMessage({ type: "success", text: data.message });
-        fetchDocuments(selectedCollection);
-      } else {
-        setMessage({ type: "error", text: data.detail || "Erreur upload" });
+    for (let i = 0; i < files.length; i++) {
+      setUploadProgress({ current: i + 1, total: files.length });
+      const formData = new FormData();
+      formData.append("file", files[i]);
+
+      try {
+        const res = await fetch(
+          `${API_URL}/api/collections/${selectedCollection}/documents`,
+          { method: "POST", body: formData }
+        );
+        const data = await res.json();
+        if (res.ok) {
+          successes.push(files[i].name);
+        } else {
+          errors.push(`${files[i].name} : ${data.detail || "erreur"}`);
+        }
+      } catch {
+        errors.push(`${files[i].name} : erreur de connexion`);
       }
-    } catch {
-      setMessage({ type: "error", text: "Erreur de connexion" });
-    } finally {
-      setUploading(false);
-      e.target.value = "";
+    }
+
+    setUploading(false);
+    setUploadProgress(null);
+    e.target.value = "";
+    fetchDocuments(selectedCollection);
+
+    if (errors.length === 0) {
+      setMessage({ type: "success", text: `${successes.length} fichier(s) indexé(s) avec succès` });
+    } else if (successes.length === 0) {
+      setMessage({ type: "error", text: `Échec : ${errors.join(", ")}` });
+    } else {
+      setMessage({ type: "success", text: `${successes.length} indexé(s) — Erreurs : ${errors.join(", ")}` });
     }
   };
 
@@ -224,18 +240,31 @@ export default function AdminPage() {
             {selectedCollection ? (
               <>
                 <label className="block mb-4">
-                  <span className="sr-only">Choisir un fichier</span>
+                  <span className="block text-sm text-gray-600 mb-1">
+                    Ajouter des documents (PDF, DOCX, TXT, MD, CSV, XLSX, XLS)
+                  </span>
                   <input
                     type="file"
-                    accept=".pdf,.txt,.md,.docx"
+                    accept=".pdf,.txt,.md,.docx,.csv,.xlsx,.xls"
+                    multiple
                     onChange={handleUpload}
                     disabled={uploading}
                     className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
                   />
                 </label>
 
-                {uploading && (
-                  <div className="mb-4 text-blue-600">Indexation en cours...</div>
+                {uploading && uploadProgress && (
+                  <div className="mb-4">
+                    <div className="text-blue-600 text-sm mb-1">
+                      Indexation en cours… ({uploadProgress.current}/{uploadProgress.total})
+                    </div>
+                    <div className="w-full bg-gray-200 rounded-full h-2">
+                      <div
+                        className="bg-blue-600 h-2 rounded-full transition-all"
+                        style={{ width: `${(uploadProgress.current / uploadProgress.total) * 100}%` }}
+                      />
+                    </div>
+                  </div>
                 )}
 
                 <ul className="space-y-2">

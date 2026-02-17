@@ -2,10 +2,14 @@
 core/document_manager.py — Indexation incrémentale des documents.
 
 Tracking via metadata.json par collection (hash SHA256, date, chunk_ids).
+Les fichiers metadata sont stockés dans METADATA_DIR (variable d'env).
 """
 
 import hashlib
 import json
+import os
+import re
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +21,81 @@ from core.parsers import parser_document
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+
+# Répertoire de stockage des metadata (séparé de ChromaDB)
+METADATA_DIR = Path(os.environ.get("METADATA_DIR", "./documents_metadata"))
+
+# Noms de machines VLM Robotics à détecter dans les noms de fichiers
+_MACHINES = ["GEMINI", "SOLO", "COMPAQT", "HYMANCO"]
+
+# Mots-clés de type de document (en minuscules)
+_MOTS_TYPE_DOC = {"devis", "quotation", "quote", "offre", "dossier", "rfi"}
+
+
+def _normaliser(texte: str) -> str:
+    """Supprime les accents et met en majuscules (pour comparer sans accent)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texte.upper())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _extraire_metadata_fichier(nom_fichier: str) -> dict:
+    """
+    Extrait machine, type_doc, ref_projet et client depuis le nom de fichier.
+
+    Patterns reconnus (best-effort, silencieux si non détecté) :
+      "0082 - PRISMA - Gémini VLM Robotics - ind1.pdf"  → client=PRISMA,  machine=GEMINI
+      "AP0120 - FAN3D - Devis - Ind05.pdf"              → client=FAN3D,   type_doc=devis
+      "Irepa_Laser- AP0082 - Offre VLM Robotics.docx"   → client=Irepa Laser
+      "DossierTechnique_SOLO_FR_ind3.pdf"               → machine=SOLO,   type_doc=dossier
+    """
+    stem = Path(nom_fichier).stem
+    stem_norm = _normaliser(stem)
+    stem_low = stem.lower()
+
+    # ── Machine ────────────────────────────────────────────────────────
+    machine = next((m for m in _MACHINES if m in stem_norm), "")
+
+    # ── Type de document ───────────────────────────────────────────────
+    type_doc = ""
+    if "devis" in stem_low or "quotation" in stem_low or "quote" in stem_low:
+        type_doc = "devis"
+    elif "offre" in stem_low:
+        type_doc = "offre"
+    elif "dossier" in stem_low and "technique" in stem_low:
+        type_doc = "dossier_technique"
+    elif "rfi" in stem_low:
+        type_doc = "rfi"
+
+    # ── Référence projet (AP0xxx ou suite de 4-6 chiffres) ────────────
+    ref = ""
+    m_ref = re.search(r"(AP\d+|\b\d{4,6}\b)", stem)
+    if m_ref:
+        ref = m_ref.group(0)
+
+    # ── Client ─────────────────────────────────────────────────────────
+    client = ""
+
+    # Pattern 1 : "NNNN - CLIENT - ..." ou "APxxxx - CLIENT - ..."
+    m1 = re.match(r"^(?:AP)?\d+\s*-+\s*([A-Za-z][A-Za-z0-9]+)\s*-", stem)
+    if m1:
+        candidate = m1.group(1).strip()
+        if len(candidate) >= 3 and candidate.lower() not in _MOTS_TYPE_DOC:
+            client = candidate
+
+    # Pattern 2 : "Nom_Composé- ref..." (ex: "Irepa_Laser- AP0082")
+    if not client:
+        m2 = re.match(r"^([A-Za-z][A-Za-z]*(?:_[A-Za-z]+)+)\s*[-_ ]+(?:AP|\d)", stem)
+        if m2:
+            client = m2.group(1).replace("_", " ").strip()
+
+    return {
+        "machine": machine,
+        "type_doc": type_doc,
+        "ref_projet": ref,
+        "client": client,
+    }
 
 
 class DocumentManager:
@@ -32,7 +111,7 @@ class DocumentManager:
         )
 
     def _metadata_path(self, nom_collection: str) -> Path:
-        return self.cm._chemin_collection(nom_collection) / "metadata.json"
+        return METADATA_DIR / f"{nom_collection}.json"
 
     def _charger_metadata(self, nom_collection: str) -> dict:
         chemin = self._metadata_path(nom_collection)
@@ -91,6 +170,11 @@ class DocumentManager:
         metadonnees = []
         chunk_ids = []
 
+        # Filtrer les champs vides (ChromaDB rejette les chaînes vides)
+        meta_fichier = {
+            k: v for k, v in _extraire_metadata_fichier(chemin.name).items() if v
+        }
+
         for page in pages:
             morceaux = self.splitter.split_text(page.texte)
             for morceau in morceaux:
@@ -100,6 +184,7 @@ class DocumentManager:
                 metadonnees.append({
                     "source": page.source,
                     "page": page.page,
+                    **meta_fichier,   # machine, type_doc, ref_projet, client (si non vides)
                 })
 
         # Supprimer les anciens chunks de ce document si re-indexation
