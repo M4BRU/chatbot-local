@@ -70,6 +70,14 @@ RERANKER_CANDIDATS_MULT = 3   # récupère k×3 candidats avant reranking
 RERANKER_CANDIDATS_MAX = 25   # plafond pour éviter un contexte trop large
 _reranker_instance = None
 
+# ── ColBERT config (RAGatouille) ──────────────────────────────────────────────
+# Late-interaction : scoring token-à-token, meilleur que cross-encoder BGE
+# sur les termes techniques et acronymes.
+# USE_COLBERT=true remplace BGE. Modèle ~2GB, téléchargé au premier appel.
+USE_COLBERT = os.environ.get("USE_COLBERT", "false").lower() == "true"
+COLBERT_MODEL = os.environ.get("COLBERT_MODEL", "colbert-ir/colbertv2.0")
+_colbert_instance = None
+
 # ── Session scoping ───────────────────────────────────────────────────────────
 SCOPING_BOOST = 2.0   # Facteur multiplicatif appliqué aux sources identifiées
 
@@ -404,6 +412,56 @@ def _get_reranker():
         return None
 
 
+def _get_colbert():
+    """
+    Singleton lazy du reranker ColBERT (RAGatouille).
+    Late-interaction : un vecteur par token → scoring MaxSim token-à-token.
+    Meilleur que BGE sur termes techniques, acronymes, requêtes courtes.
+    Modèle ~2GB téléchargé depuis HuggingFace au premier appel.
+    Retourne None si USE_COLBERT=false ou si ragatouille est absent.
+    """
+    global _colbert_instance
+    if _colbert_instance is not None:
+        return _colbert_instance
+    if not USE_COLBERT:
+        return None
+    try:
+        from ragatouille import RAGPretrainedModel
+        _colbert_instance = RAGPretrainedModel.from_pretrained(COLBERT_MODEL)
+        logger.info(f"ColBERT initialisé : {COLBERT_MODEL}")
+        return _colbert_instance
+    except Exception as e:
+        logger.warning(f"ColBERT indisponible ({e}) — désactivé")
+        return None
+
+
+def _appliquer_colbert(colbert, question: str, resultats: list, top_k: int) -> list:
+    """
+    Reranke les candidats via ColBERT late-interaction (RAGatouille).
+    Retourne les top_k résultats triés par score décroissant.
+    """
+    if not resultats:
+        return resultats
+    try:
+        docs_text = [doc.page_content for doc, _ in resultats]
+        ranked = colbert.rerank(query=question, documents=docs_text, k=min(top_k, len(docs_text)))
+        # ranked = [{"content": str, "score": float, "rank": int}, ...]
+        content_to_original = {doc.page_content: (doc, score) for doc, score in resultats}
+        reranked = []
+        for item in ranked:
+            original = content_to_original.get(item["content"])
+            if original:
+                reranked.append((original[0], float(item["score"])))
+        logger.info(
+            f"ColBERT : {len(resultats)} candidats → {len(reranked)} gardés "
+            f"(score top : {reranked[0][1]:.3f})"
+        )
+        return reranked
+    except Exception as e:
+        logger.warning(f"ColBERT reranking échoué ({e}) — résultats originaux conservés")
+        return resultats[:top_k]
+
+
 def _appliquer_reranker(reranker, question: str, resultats: list, top_k: int) -> list:
     """
     Reranke les candidats ChromaDB via cross-encoder BGE.
@@ -693,8 +751,11 @@ class RAGEngine:
             bm25_results = bm25_index.search(question, k=k_candidats, filtre=filtre)
             resultats = _rrf_fusion(resultats, bm25_results, k_final=k_candidats)
 
-        # 5. Reranking
-        if reranker and len(resultats) > k:
+        # 5. Reranking — ColBERT (prioritaire si USE_COLBERT=true) ou BGE
+        colbert = _get_colbert()
+        if colbert and len(resultats) > k:
+            resultats = _appliquer_colbert(colbert, question, resultats, top_k=k)
+        elif reranker and len(resultats) > k:
             resultats = _appliquer_reranker(reranker, question, resultats, top_k=k)
 
         # 5b. Keyword fallback — si le reranker (ou la RRF sans reranker) ne trouve

@@ -34,6 +34,8 @@ services:
       - CONTEXTUAL_MAX_WORKERS=3
       - USE_SEMANTIC_CHUNKING=false
       - SEMANTIC_BREAKPOINT_THRESHOLD=95
+      - USE_COLBERT=false
+      - COLBERT_MODEL=colbert-ir/colbertv2.0
     volumes:
       - documents_store:/app/documents
     depends_on:

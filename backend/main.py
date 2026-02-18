@@ -48,10 +48,10 @@ def _warmup_ollama() -> None:
 
 
 def _warmup_reranker() -> None:
-    """Pre-charge le reranker BGE (FlagEmbedding) en mémoire."""
+    """Pre-charge le reranker actif (BGE ou ColBERT) en mémoire."""
     try:
-        from core.search import _get_reranker
-        _get_reranker()
+        from core.search import _get_reranker, _get_colbert
+        _get_colbert() or _get_reranker()
         logger.info("Warmup reranker OK")
     except Exception as e:
         logger.warning(f"Warmup reranker échoué : {e}")
