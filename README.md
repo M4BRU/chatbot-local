@@ -75,6 +75,7 @@ Depuis l'UI vous pouvez :
 | Word | `.docx` | python-docx |
 | Texte | `.txt`, `.md` | Lecture directe |
 | CSV | `.csv` | pandas |
+| Excel | `.xlsx`, `.xls` | pandas + openpyxl (xlsx) + xlrd (xls) |
 
 ## Architecture
 

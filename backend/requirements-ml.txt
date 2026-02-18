@@ -1,0 +1,8 @@
+# Dépendances ML lourdes — couche Docker séparée pour préserver le cache.
+# Ne modifier ce fichier que si vraiment nécessaire (déclenche un rebuild long ~10-15 min).
+
+# Advanced document parsing (PDF layout AI, table extraction via TableFormer)
+docling>=2.0.0
+
+# Reranker cross-encoder multilingue (partage torch avec docling)
+FlagEmbedding>=1.3.0
