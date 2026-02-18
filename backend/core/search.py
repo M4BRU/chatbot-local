@@ -179,11 +179,13 @@ class _BM25CollectionIndex:
     def __init__(self, docs: list, texts: list):
         from rank_bm25 import BM25Okapi
         self._docs = docs
-        tokenized = [t.lower().split() for t in texts]
+        # re.findall(r'\w+') split sur apostrophes/tirets/ponctuations
+        # → "l'AMDEC" → ["l", "amdec"], "d'Apave" → ["d", "apave"]
+        tokenized = [re.findall(r'\w+', t.lower()) for t in texts]
         self._bm25 = BM25Okapi(tokenized)
 
     def search(self, query: str, k: int, filtre: dict | None = None) -> list:
-        tokens = query.lower().split()
+        tokens = re.findall(r'\w+', query.lower())
         raw_scores = self._bm25.get_scores(tokens)
         ranked = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)
         machine_filtre = None
@@ -252,6 +254,76 @@ def _rrf_fusion(vector_results: list, bm25_results: list, k_final: int) -> list:
 
     sorted_uids = sorted(scores, key=lambda u: scores[u], reverse=True)
     return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
+
+
+# ── Keyword fallback (where_document) ─────────────────────────────────────────
+# Seuil en dessous duquel le keyword fallback est déclenché.
+# Reranker normalisé [0,1] : < 0.1 = aucune correspondance sémantique.
+KEYWORD_FALLBACK_THRESHOLD = float(os.environ.get("KEYWORD_FALLBACK_THRESHOLD", "0.1"))
+
+_STOPWORDS_FALLBACK = {
+    # FR
+    "les", "des", "pour", "dans", "avec", "sur", "par", "une", "qui", "que",
+    "est", "son", "ses", "moi", "lui", "leur", "tout", "cette", "aussi",
+    "donne", "mois", "references", "documents", "trouve", "trouver",
+    "parle", "concernant", "cela", "ceci", "avoir", "etre", "faire",
+    "peux", "mots", "toute", "base", "donnees", "infos", "informations",
+    "passages", "concernant",
+    # EN
+    "the", "and", "for", "with", "that", "this", "from", "about",
+}
+
+
+def _keyword_fallback_search(db, question: str, k: int) -> list:
+    """
+    Recherche exacte via ChromaDB where_document lorsque la recherche sémantique
+    ne trouve rien de pertinent.
+
+    Extrait les mots significatifs de la question et cherche les chunks qui les
+    contiennent littéralement (plusieurs variantes de casse tentées).
+    Exemple : question="l'AMDEC" → cherche "AMDEC", "amdec", "Amdec" dans les chunks.
+    """
+    from langchain_core.documents import Document
+
+    tokens = re.findall(r'\w+', question.lower())
+    mots_cles = [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS_FALLBACK]
+    if not mots_cles:
+        return []
+
+    resultats = []
+    vus: set[str] = set()
+
+    for mot in mots_cles[:3]:
+        for variant in {mot, mot.upper(), mot.capitalize()}:
+            try:
+                result = db._collection.get(
+                    where_document={"$contains": variant},
+                    include=["documents", "metadatas"],
+                )
+                docs = result.get("documents") or []
+                metas = result.get("metadatas") or []
+                for text, meta in zip(docs, metas):
+                    uid = text[:120]
+                    if uid not in vus:
+                        vus.add(uid)
+                        resultats.append(
+                            (Document(page_content=text, metadata=meta or {}), 0.5)
+                        )
+                        if len(resultats) >= k:
+                            break
+            except Exception as e:
+                logger.debug(f"where_document('{variant}') échoué : {e}")
+            if len(resultats) >= k:
+                break
+        if len(resultats) >= k:
+            break
+
+    if resultats:
+        logger.info(
+            f"Keyword fallback : {len(resultats)} chunk(s) trouvé(s) "
+            f"pour mots-clés {mots_cles[:3]}"
+        )
+    return resultats
 
 
 def _extraire_filtre_question(question: str) -> dict | None:
@@ -581,6 +653,15 @@ class RAGEngine:
         # 5. Reranking
         if reranker and len(resultats) > k:
             resultats = _appliquer_reranker(reranker, question, resultats, top_k=k)
+
+        # 5b. Keyword fallback — si le reranker (ou la RRF sans reranker) ne trouve
+        # rien de pertinent, recherche exacte par mots-clés via where_document.
+        score_best = resultats[0][1] if resultats else 0.0
+        if score_best < KEYWORD_FALLBACK_THRESHOLD:
+            fallback = _keyword_fallback_search(self.db, question, k=k)
+            if fallback:
+                # On prepend les résultats keyword : ils ont une correspondance exacte
+                resultats = fallback + [r for r in resultats if r not in fallback]
 
         # 6. Seuil reranker relatif : élimine les chunks trop éloignés du meilleur
         # (score < score_max × 0.1). Le meilleur chunk passe toujours ce seuil.
