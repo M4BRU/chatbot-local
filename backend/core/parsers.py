@@ -100,13 +100,22 @@ def _get_docling_converter():
         do_cell_matching=True,
     )
 
+    # XLSX : SimplePipeline si supporté par la version installée
+    allowed_formats = [InputFormat.PDF, InputFormat.DOCX]
+    format_options = {
+        InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+        InputFormat.DOCX: WordFormatOption(pipeline_cls=SimplePipeline),
+    }
+    try:
+        if hasattr(InputFormat, "XLSX"):
+            allowed_formats.append(InputFormat.XLSX)
+            logger.info("Docling : support XLSX activé")
+    except Exception:
+        pass
+
     _docling_converter = DocumentConverter(
-        allowed_formats=[InputFormat.PDF, InputFormat.DOCX],
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
-            # DOCX : SimplePipeline — pas de modèles IA, extrait quand même les tableaux
-            InputFormat.DOCX: WordFormatOption(pipeline_cls=SimplePipeline),
-        },
+        allowed_formats=allowed_formats,
+        format_options=format_options,
     )
 
     mode_str = f"OCR={'on' if DOCLING_OCR else 'off'}, table={DOCLING_TABLE_MODE}"
@@ -294,11 +303,37 @@ def _parser_csv(chemin: Path) -> list[ParsedPage]:
 
 def _parser_excel(chemin: Path) -> list[ParsedPage]:
     """
-    Extraction Excel (.xlsx et .xls) via pandas.
-    Gère les fichiers multi-feuilles en concaténant toutes les feuilles.
+    Extraction Excel (.xlsx/.xls).
+    Priorité : Docling (si InputFormat.XLSX disponible) — meilleure structure.
+    Fallback  : pandas avec groupement par blocs de 30 lignes + markdown.
+    """
+    # Tentative Docling (ne supporte que .xlsx, pas .xls)
+    if USE_DOCLING and chemin.suffix.lower() == ".xlsx":
+        try:
+            from docling.datamodel.base_models import InputFormat
+            if hasattr(InputFormat, "XLSX"):
+                converter = _get_docling_converter()
+                result = converter.convert(str(chemin))
+                pages = _docling_result_to_pages(result, chemin)
+                if pages:
+                    logger.info(f"Docling XLSX OK : {len(pages)} pages — {chemin.name}")
+                    return pages
+                logger.warning(f"Docling XLSX : aucun contenu — fallback pandas ({chemin.name})")
+        except Exception as e:
+            logger.warning(f"Docling XLSX échoué ({e}) — fallback pandas ({chemin.name})")
+
+    return _parser_excel_pandas(chemin)
+
+
+def _parser_excel_pandas(chemin: Path) -> list[ParsedPage]:
+    """
+    Fallback Excel via pandas.
+    Groupe les lignes par blocs de 30 (headers répétés) pour éviter
+    les micro-chunks (une ligne = un chunk) avec le semantic chunker.
     """
     import pandas as pd
 
+    ROWS_PER_BLOCK = 30
     pages = []
 
     try:
@@ -306,18 +341,22 @@ def _parser_excel(chemin: Path) -> list[ParsedPage]:
 
         for sheet_name in excel_file.sheet_names:
             df = pd.read_excel(excel_file, sheet_name=sheet_name)
+            if df.empty:
+                continue
 
-            if not df.empty:
-                texte = f"# Feuille: {sheet_name}\n\n"
-                texte += df.to_string(index=False)
-
+            # Diviser en blocs de ROWS_PER_BLOCK lignes avec headers répétés
+            for i in range(0, len(df), ROWS_PER_BLOCK):
+                bloc = df.iloc[i: i + ROWS_PER_BLOCK]
+                texte = f"# Feuille: {sheet_name} (lignes {i + 1}-{i + len(bloc)})\n\n"
+                texte += bloc.to_markdown(index=False)
                 pages.append(ParsedPage(
                     texte=texte.strip(),
                     source=f"{chemin.name} (Feuille: {sheet_name})",
                     page=len(pages) + 1,
                 ))
+
     except Exception as e:
-        print(f"  Impossible de lire {chemin.name} : {e}")
+        logger.warning(f"Impossible de lire {chemin.name} : {e}")
         return []
 
     return pages
