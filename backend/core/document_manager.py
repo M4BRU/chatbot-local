@@ -7,23 +7,64 @@ Les fichiers metadata sont stockés dans METADATA_DIR (variable d'env).
 
 import hashlib
 import json
+import logging
 import os
 import re
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import requests
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.collection_manager import CollectionManager
 from core.parsers import parser_document
+
+logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # Répertoire de stockage des metadata (séparé de ChromaDB)
 METADATA_DIR = Path(os.environ.get("METADATA_DIR", "./documents_metadata"))
+
+# ── Contextual Retrieval ──────────────────────────────────────────────────────
+# Enrichit chaque chunk avec son contexte dans le document avant indexation.
+# Réduit les erreurs de retrieval de ~67% (technique Anthropic).
+# Désactivé par défaut : nécessite N appels Ollama par document à l'ingest.
+USE_CONTEXTUAL_RETRIEVAL = os.environ.get("USE_CONTEXTUAL_RETRIEVAL", "false").lower() == "true"
+CONTEXTUAL_MAX_WORKERS = int(os.environ.get("CONTEXTUAL_MAX_WORKERS", "3"))  # 3 = bon compromis Ollama
+_CONTEXTUAL_PROMPT = (
+    "Tu es un assistant technique. Voici un document :\n"
+    "<document>\n{document}\n</document>\n\n"
+    "Voici un extrait de ce document :\n"
+    "<chunk>\n{chunk}\n</chunk>\n\n"
+    "Génère en 1-2 phrases le contexte de cet extrait : quelle machine est concernée, "
+    "quel sujet ou quelle section. Réponds uniquement avec ce contexte, sans introduction."
+)
+
+
+def _enrichir_chunk_contexte(chunk: str, document_complet: str, ollama_url: str, model: str) -> str:
+    """
+    Appelle Ollama pour générer un contexte spécifique à ce chunk dans le document.
+    Retourne le chunk préfixé par son contexte, ou le chunk original en cas d'échec.
+    """
+    prompt = _CONTEXTUAL_PROMPT.format(document=document_complet[:6000], chunk=chunk)
+    try:
+        resp = requests.post(
+            f"{ollama_url}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        contexte = resp.json().get("response", "").strip()
+        if contexte:
+            return f"[{contexte}]\n\n{chunk}"
+    except Exception as e:
+        logger.warning(f"Contextual retrieval chunk échoué : {e}")
+    return chunk
 
 # Noms de machines VLM Robotics à détecter dans les noms de fichiers
 _MACHINES = ["GEMINI", "SOLO", "COMPAQT", "HYMANCO"]
@@ -175,16 +216,61 @@ class DocumentManager:
             k: v for k, v in _extraire_metadata_fichier(chemin.name).items() if v
         }
 
+        # Contextual retrieval : texte complet du document pour le contexte Ollama
+        document_complet = ""
+        ollama_url = ""
+        ollama_model = ""
+        if USE_CONTEXTUAL_RETRIEVAL:
+            from core.embeddings import OLLAMA_MODEL
+            ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+            ollama_model = OLLAMA_MODEL
+            document_complet = "\n\n".join(p.texte for p in pages)
+
+        # Collecter tous les morceaux de toutes les pages d'abord
+        morceaux_par_page: list[tuple[object, list[str]]] = []
         for page in pages:
-            morceaux = self.splitter.split_text(page.texte)
+            morceaux_par_page.append((page, self.splitter.split_text(page.texte)))
+
+        # Enrichissement contextuel en parallèle si activé
+        if USE_CONTEXTUAL_RETRIEVAL and document_complet:
+            tous_morceaux = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
+            nb_total = len(tous_morceaux)
+            logger.info(
+                f"Contextual retrieval : {nb_total} chunks à enrichir "
+                f"({CONTEXTUAL_MAX_WORKERS} workers parallèles)…"
+            )
+            # Dispatch parallèle — même principe qu'un compute shader :
+            # chaque worker traite un chunk indépendamment, on collecte dans l'ordre d'origine
+            enrichis: dict[int, str] = {}
+            with ThreadPoolExecutor(max_workers=CONTEXTUAL_MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(
+                        _enrichir_chunk_contexte, morceau, document_complet, ollama_url, ollama_model
+                    ): idx
+                    for idx, (_, morceau) in enumerate(tous_morceaux)
+                }
+                for future in as_completed(futures):
+                    enrichis[futures[future]] = future.result()
+
+            # Reconstruire morceaux_par_page avec les chunks enrichis dans le bon ordre
+            idx = 0
+            morceaux_par_page_enrichis: list[tuple[object, list[str]]] = []
+            for page, morceaux in morceaux_par_page:
+                enrichis_page = [enrichis[idx + i] for i in range(len(morceaux))]
+                morceaux_par_page_enrichis.append((page, enrichis_page))
+                idx += len(morceaux)
+            morceaux_par_page = morceaux_par_page_enrichis
+            logger.info(f"Contextual retrieval terminé : {nb_total} chunks enrichis")
+
+        for page, morceaux in morceaux_par_page:
             for morceau in morceaux:
                 cid = str(uuid.uuid4())
                 chunk_ids.append(cid)
                 textes.append(morceau)
                 metadonnees.append({
                     "source": page.source,
-                    "page": page.page,
-                    **meta_fichier,   # machine, type_doc, ref_projet, client (si non vides)
+                    "page":   page.page,
+                    **meta_fichier,
                 })
 
         # Supprimer les anciens chunks de ce document si re-indexation

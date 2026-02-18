@@ -24,6 +24,14 @@ services:
       - CHROMA_PORT=8000
       - METADATA_DIR=/app/documents/metadata
       - CORS_ORIGINS=["http://localhost:3000","http://frontend:3000"]
+      - USE_DOCLING=true
+      - DOCLING_OCR=false
+      - DOCLING_TABLE_MODE=fast
+      - USE_RERANKER=true
+      - RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+      - USE_HYBRID_SEARCH=true
+      - USE_CONTEXTUAL_RETRIEVAL=true
+      - CONTEXTUAL_MAX_WORKERS=3
     volumes:
       - documents_store:/app/documents
     depends_on:

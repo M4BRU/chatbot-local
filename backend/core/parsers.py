@@ -1,11 +1,29 @@
 """
-core/parsers.py — Parsers multi-format : PDF, DOCX, TXT/MD, CSV.
+core/parsers.py — Parsers multi-format : PDF, DOCX, TXT/MD, CSV, Excel.
 
-Chaque parser retourne une liste de dicts : {"texte": str, "source": str, "page": int}
+Chaque parser retourne une liste de ParsedPage : {"texte": str, "source": str, "page": int}
+
+Docling est utilisé en priorité pour PDF et DOCX (meilleure extraction de tableaux,
+compréhension du layout). Variables d'environnement :
+    USE_DOCLING         : active Docling (défaut: true)
+    DOCLING_OCR         : active l'OCR pour PDF scannés (défaut: false — lourd)
+    DOCLING_TABLE_MODE  : fast ou accurate (défaut: fast)
 """
 
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ── Configuration Docling ───────────────────────────────────────────────────
+USE_DOCLING = os.environ.get("USE_DOCLING", "true").lower() == "true"
+DOCLING_OCR = os.environ.get("DOCLING_OCR", "false").lower() == "true"
+DOCLING_TABLE_MODE = os.environ.get("DOCLING_TABLE_MODE", "fast")  # fast | accurate
+
+# Singleton lazy — initialisé au premier appel
+_docling_converter = None
 
 
 @dataclass
@@ -50,14 +68,136 @@ def parser_document(chemin: Path) -> list[ParsedPage]:
     return parser_fn(chemin)
 
 
-# --- Parsers spécifiques ---
+# ── Docling ─────────────────────────────────────────────────────────────────
 
+def _get_docling_converter():
+    """
+    Initialisation lazy du converter Docling.
+    Les modèles sont téléchargés au premier appel (~600MB sans OCR, ~1.5GB avec).
+    """
+    global _docling_converter
+    if _docling_converter is not None:
+        return _docling_converter
+
+    from docling.document_converter import (
+        DocumentConverter,
+        PdfFormatOption,
+        WordFormatOption,
+    )
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        TableFormerMode,
+        TableStructureOptions,
+    )
+    from docling.pipeline.simple_pipeline import SimplePipeline
+
+    pdf_options = PdfPipelineOptions()
+    pdf_options.do_ocr = DOCLING_OCR
+    pdf_options.do_table_structure = True
+    pdf_options.table_structure_options = TableStructureOptions(
+        mode=TableFormerMode.FAST if DOCLING_TABLE_MODE == "fast" else TableFormerMode.ACCURATE,
+        do_cell_matching=True,
+    )
+
+    _docling_converter = DocumentConverter(
+        allowed_formats=[InputFormat.PDF, InputFormat.DOCX],
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options),
+            # DOCX : SimplePipeline — pas de modèles IA, extrait quand même les tableaux
+            InputFormat.DOCX: WordFormatOption(pipeline_cls=SimplePipeline),
+        },
+    )
+
+    mode_str = f"OCR={'on' if DOCLING_OCR else 'off'}, table={DOCLING_TABLE_MODE}"
+    logger.info(f"Docling initialisé ({mode_str})")
+    return _docling_converter
+
+
+def _docling_result_to_pages(result, chemin: Path) -> list[ParsedPage]:
+    """
+    Convertit un résultat Docling en liste de ParsedPage groupée par numéro de page.
+
+    Utilise la provenance (prov) de chaque item pour récupérer le numéro de page.
+    Les tableaux sont exportés en Markdown pour préserver leur structure.
+    """
+    from collections import defaultdict
+    from docling_core.types.doc import TableItem, TextItem
+
+    doc = result.document
+    pages_content: dict[int, list[str]] = defaultdict(list)
+
+    for item, _level in doc.iterate_items():
+        text = None
+
+        if isinstance(item, TableItem):
+            # Tableau → Markdown avec headers (meilleur pour le LLM)
+            try:
+                df = item.export_to_dataframe(doc=doc)
+                text = df.to_markdown(index=False)
+            except Exception:
+                try:
+                    text = item.export_to_html(doc=doc)
+                except Exception:
+                    pass
+
+        elif isinstance(item, TextItem):
+            text = item.text
+
+        if not text or not text.strip():
+            continue
+
+        # Récupérer le numéro de page depuis la provenance
+        page_no = 1
+        if hasattr(item, "prov") and item.prov:
+            page_no = item.prov[0].page_no
+
+        pages_content[page_no].append(text.strip())
+
+    if not pages_content:
+        # Fallback : export markdown complet
+        markdown = doc.export_to_markdown()
+        if markdown.strip():
+            return [ParsedPage(texte=markdown.strip(), source=chemin.name, page=1)]
+        return []
+
+    return [
+        ParsedPage(
+            texte="\n\n".join(texts),
+            source=chemin.name,
+            page=page_no,
+        )
+        for page_no, texts in sorted(pages_content.items())
+        if texts and any(t.strip() for t in texts)
+    ]
+
+
+# ── Parsers spécifiques ─────────────────────────────────────────────────────
 
 def _parser_pdf(chemin: Path) -> list[ParsedPage]:
-    """Extraction PDF via PyMuPDF4LLM — meilleure qualité que PyPDF2.
-
-    Retourne le texte en markdown (tableaux, titres, listes préservés).
     """
+    Extraction PDF.
+    Priorité : Docling (layout AI + extraction tableaux)
+    Fallback  : PyMuPDF4LLM
+    """
+    if USE_DOCLING:
+        try:
+            logger.info(f"Docling PDF : {chemin.name}")
+            converter = _get_docling_converter()
+            result = converter.convert(str(chemin))
+            pages = _docling_result_to_pages(result, chemin)
+            if pages:
+                logger.info(f"Docling OK : {len(pages)} pages extraites")
+                return pages
+            logger.warning(f"Docling : aucun contenu extrait pour {chemin.name}, fallback PyMuPDF")
+        except Exception as e:
+            logger.warning(f"Docling échoué pour {chemin.name} : {e} — fallback PyMuPDF4LLM")
+
+    return _parser_pdf_pymupdf(chemin)
+
+
+def _parser_pdf_pymupdf(chemin: Path) -> list[ParsedPage]:
+    """Fallback PDF via PyMuPDF4LLM."""
     import pymupdf4llm
 
     pages = []
@@ -70,7 +210,6 @@ def _parser_pdf(chemin: Path) -> list[ParsedPage]:
     for page_data in pages_md:
         texte = page_data.get("text", "")
         num_page = page_data.get("metadata", {}).get("page", 1)
-        # pymupdf4llm utilise un index 0-based pour les pages
         num_page = num_page + 1 if isinstance(num_page, int) else 1
 
         if texte.strip():
@@ -84,7 +223,29 @@ def _parser_pdf(chemin: Path) -> list[ParsedPage]:
 
 
 def _parser_docx(chemin: Path) -> list[ParsedPage]:
-    """Extraction DOCX via python-docx (paragraphes)."""
+    """
+    Extraction DOCX.
+    Priorité : Docling (extrait les tableaux — python-docx les ignore)
+    Fallback  : python-docx (paragraphes uniquement)
+    """
+    if USE_DOCLING:
+        try:
+            logger.info(f"Docling DOCX : {chemin.name}")
+            converter = _get_docling_converter()
+            result = converter.convert(str(chemin))
+            pages = _docling_result_to_pages(result, chemin)
+            if pages:
+                logger.info(f"Docling OK : {len(pages)} pages extraites")
+                return pages
+            logger.warning(f"Docling : aucun contenu extrait pour {chemin.name}, fallback python-docx")
+        except Exception as e:
+            logger.warning(f"Docling échoué pour {chemin.name} : {e} — fallback python-docx")
+
+    return _parser_docx_legacy(chemin)
+
+
+def _parser_docx_legacy(chemin: Path) -> list[ParsedPage]:
+    """Fallback DOCX via python-docx (paragraphes uniquement, sans tableaux)."""
     from docx import Document
 
     doc = Document(str(chemin))
@@ -132,27 +293,20 @@ def _parser_csv(chemin: Path) -> list[ParsedPage]:
 
 
 def _parser_excel(chemin: Path) -> list[ParsedPage]:
-    """Extraction Excel (.xlsx et .xls) via pandas.
-
-    Gère les fichiers Excel multi-feuilles en concaténant toutes les feuilles.
-    Chaque feuille est préfixée par son nom pour le contexte.
-
-    Formats supportés:
-    - .xlsx (Excel 2007+) via openpyxl
-    - .xls (Excel 97-2003) via xlrd
+    """
+    Extraction Excel (.xlsx et .xls) via pandas.
+    Gère les fichiers multi-feuilles en concaténant toutes les feuilles.
     """
     import pandas as pd
 
     pages = []
 
     try:
-        # Lire toutes les feuilles du fichier Excel
         excel_file = pd.ExcelFile(str(chemin))
 
         for sheet_name in excel_file.sheet_names:
             df = pd.read_excel(excel_file, sheet_name=sheet_name)
 
-            # Convertir le DataFrame en texte formaté
             if not df.empty:
                 texte = f"# Feuille: {sheet_name}\n\n"
                 texte += df.to_string(index=False)

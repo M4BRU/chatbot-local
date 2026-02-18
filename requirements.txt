@@ -10,3 +10,5 @@ requests
 ollama
 python-docx
 pandas
+openpyxl
+xlrd

@@ -8,7 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
+# Étape 1 : dépendances ML lourdes (Docling + FlagEmbedding + torch).
+# Couche séparée — cachée tant que requirements-ml.txt ne change pas.
+COPY backend/requirements-ml.txt .
+RUN pip install --no-cache-dir --user -r requirements-ml.txt
+
+# Étape 2 : dépendances légères (FastAPI, LangChain, parsers…).
+# Invalidée seulement si requirements.txt change, sans retoucher les ML.
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
