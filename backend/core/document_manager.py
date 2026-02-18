@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import requests
@@ -24,8 +25,35 @@ from core.parsers import parser_document
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+# Taille en tokens (pas en caractères) — mxbai-embed-large : 512 tokens max.
+# 450 tokens = sweet spot benchmarks RAG sur docs techniques, avec marge sous la limite.
+CHUNK_SIZE_TOKENS = int(os.environ.get("CHUNK_SIZE_TOKENS", "450"))
+CHUNK_OVERLAP_TOKENS = int(os.environ.get("CHUNK_OVERLAP_TOKENS", "67"))  # ~15%
+MAX_CHUNK_TOKENS = 490  # seuil de protection (< 512 limite modèle)
+
+# Modèle HuggingFace pour le tokenizer (doit correspondre à OLLAMA_EMBED_MODEL)
+_EMBED_HF_MODEL = os.environ.get("EMBED_HF_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
+
+
+@lru_cache(maxsize=1)
+def _get_tokenizer():
+    """Charge le tokenizer de l'embedding model. Fallback caractères si indisponible."""
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(_EMBED_HF_MODEL)
+        logger.info(f"Tokenizer chargé : {_EMBED_HF_MODEL}")
+        return tok
+    except Exception as e:
+        logger.warning(f"Tokenizer indisponible ({e}) — fallback 1 token ≈ 3 chars")
+        return None
+
+
+def _count_tokens(text: str) -> int:
+    """Compte les tokens du texte selon le tokenizer de l'embedding model."""
+    tok = _get_tokenizer()
+    if tok is not None:
+        return len(tok.encode(text, add_special_tokens=False))
+    return len(text) // 3  # estimation conservative pour texte technique FR
 
 # ── Semantic Chunking ─────────────────────────────────────────────────────────
 # Découpe le texte aux frontières sémantiques (changement de sujet) au lieu
@@ -156,10 +184,10 @@ class DocumentManager:
 
         # Splitter de secours : toujours disponible (protection anti-chunks trop gros)
         self._recursive_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
+            chunk_size=CHUNK_SIZE_TOKENS,
+            chunk_overlap=CHUNK_OVERLAP_TOKENS,
             separators=["\n\n", "\n", ". ", " ", ""],
-            length_function=len,
+            length_function=_count_tokens,
         )
 
         if USE_SEMANTIC_CHUNKING:
@@ -259,16 +287,16 @@ class DocumentManager:
         morceaux_par_page: list[tuple[object, list[str]]] = []
         for page in pages:
             morceaux = self.splitter.split_text(page.texte)
-            # Protection : SemanticChunker peut produire des chunks très longs
-            # (ex: un seul paragraphe de 5000 chars). On re-découpe si nécessaire.
-            if USE_SEMANTIC_CHUNKING:
-                morceaux_proteges = []
-                for m in morceaux:
-                    if len(m) > CHUNK_SIZE * 2:
-                        morceaux_proteges.extend(self._recursive_splitter.split_text(m))
-                    else:
-                        morceaux_proteges.append(m)
-                morceaux = morceaux_proteges
+            # Protection : re-découpe tout chunk dépassant MAX_CHUNK_TOKENS (< 512 limite mxbai).
+            # Appliqué toujours (SemanticChunker ET RecursiveCharacterTextSplitter peuvent
+            # produire des chunks trop grands sur du texte technique dense sans séparateur).
+            morceaux_proteges = []
+            for m in morceaux:
+                if _count_tokens(m) > MAX_CHUNK_TOKENS:
+                    morceaux_proteges.extend(self._recursive_splitter.split_text(m))
+                else:
+                    morceaux_proteges.append(m)
+            morceaux = morceaux_proteges
             morceaux_par_page.append((page, morceaux))
 
         # Enrichissement contextuel en parallèle si activé

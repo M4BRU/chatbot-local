@@ -25,6 +25,8 @@ services:
       - METADATA_DIR=/app/documents/metadata
       - CORS_ORIGINS=["http://localhost:3000","http://frontend:3000"]
       - OLLAMA_EMBED_MODEL=mxbai-embed-large
+      - EMBED_HF_MODEL=mixedbread-ai/mxbai-embed-large-v1
+      - TOKENIZERS_PARALLELISM=false
       - USE_DOCLING=true
       - DOCLING_OCR=false
       - DOCLING_TABLE_MODE=fast
