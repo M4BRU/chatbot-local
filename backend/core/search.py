@@ -172,6 +172,34 @@ USE_HYBRID_SEARCH = os.environ.get("USE_HYBRID_SEARCH", "true").lower() == "true
 RRF_K = 60  # constante RRF standard (valeur de référence de la littérature)
 _bm25_cache: dict[str, tuple[int, object]] = {}  # {collection: (nb_chunks, index)}
 
+# Stemmer français Snowball (NLTK) — normalisé au premier appel
+_stemmer = None
+
+
+def _get_stemmer():
+    """Retourne le stemmer Snowball français (lazy init, pas de téléchargement réseau)."""
+    global _stemmer
+    if _stemmer is None:
+        try:
+            from nltk.stem.snowball import FrenchStemmer
+            _stemmer = FrenchStemmer()
+        except Exception as e:
+            logger.warning(f"Stemmer NLTK indisponible ({e}) — stemming désactivé")
+    return _stemmer
+
+
+def _stemmer_tokens(tokens: list[str]) -> list[str]:
+    """
+    Applique le stemmer Snowball français sur une liste de tokens.
+    'directives' → 'direct', 'directive' → 'direct'  ← même racine ✓
+    'machines' → 'machin', 'machine' → 'machin'       ← même racine ✓
+    Retourne les tokens originaux si le stemmer est indisponible.
+    """
+    stemmer = _get_stemmer()
+    if stemmer is None:
+        return tokens
+    return [stemmer.stem(t) for t in tokens]
+
 
 class _BM25CollectionIndex:
     """Index BM25 sur les chunks d'une collection ChromaDB."""
@@ -181,11 +209,13 @@ class _BM25CollectionIndex:
         self._docs = docs
         # re.findall(r'\w+') split sur apostrophes/tirets/ponctuations
         # → "l'AMDEC" → ["l", "amdec"], "d'Apave" → ["d", "apave"]
-        tokenized = [re.findall(r'\w+', t.lower()) for t in texts]
+        # _stemmer_tokens normalise pluriel/singulier
+        # → "directives" et "directive" → même racine "direct"
+        tokenized = [_stemmer_tokens(re.findall(r'\w+', t.lower())) for t in texts]
         self._bm25 = BM25Okapi(tokenized)
 
     def search(self, query: str, k: int, filtre: dict | None = None) -> list:
-        tokens = re.findall(r'\w+', query.lower())
+        tokens = _stemmer_tokens(re.findall(r'\w+', query.lower()))
         raw_scores = self._bm25.get_scores(tokens)
         ranked = sorted(range(len(raw_scores)), key=lambda i: raw_scores[i], reverse=True)
         machine_filtre = None
@@ -294,7 +324,17 @@ def _keyword_fallback_search(db, question: str, k: int) -> list:
     vus: set[str] = set()
 
     for mot in mots_cles[:3]:
-        for variant in {mot, mot.upper(), mot.capitalize()}:
+        # Variantes morphologiques : singulier ↔ pluriel + casse
+        variantes_morpho = {mot}
+        if mot.endswith('s') and len(mot) > 3:
+            variantes_morpho.add(mot[:-1])   # directives → directive
+        elif mot.endswith('aux') and len(mot) > 4:
+            variantes_morpho.add(mot[:-3] + 'al')  # normaux → normal
+        else:
+            variantes_morpho.add(mot + 's')   # directive → directives
+        # Toutes les variantes × toutes les casses
+        variantes = {v for base in variantes_morpho for v in (base, base.upper(), base.capitalize())}
+        for variant in variantes:
             try:
                 result = db._collection.get(
                     where_document={"$contains": variant},
@@ -352,9 +392,12 @@ def _get_reranker():
     if not USE_RERANKER:
         return None
     try:
+        import torch
         from FlagEmbedding import FlagReranker
-        _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=True)
-        logger.info(f"Reranker initialisé : {RERANKER_MODEL}")
+        # use_fp16=True cause "meta tensor" error sur CPU — on n'utilise fp16 que si GPU dispo
+        use_fp16 = torch.cuda.is_available()
+        _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=use_fp16)
+        logger.info(f"Reranker initialisé : {RERANKER_MODEL} (fp16={use_fp16})")
         return _reranker_instance
     except Exception as e:
         logger.warning(f"Reranker indisponible ({e}) — désactivé")
