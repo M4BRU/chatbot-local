@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
+# ── Semantic Chunking ─────────────────────────────────────────────────────────
+# Découpe le texte aux frontières sémantiques (changement de sujet) au lieu
+# de couper arbitrairement à N caractères.
+# Utilise les embeddings nomic-embed-text pour détecter les ruptures sémantiques.
+# Plus lent à l'ingest (N appels Ollama par document), mais chunks plus cohérents.
+USE_SEMANTIC_CHUNKING = os.environ.get("USE_SEMANTIC_CHUNKING", "false").lower() == "true"
+# Seuil percentile : 95 = on coupe seulement aux ruptures très nettes
+SEMANTIC_BREAKPOINT_THRESHOLD = int(os.environ.get("SEMANTIC_BREAKPOINT_THRESHOLD", "95"))
+
 # Répertoire de stockage des metadata (séparé de ChromaDB)
 METADATA_DIR = Path(os.environ.get("METADATA_DIR", "./documents_metadata"))
 
@@ -144,12 +153,32 @@ class DocumentManager:
 
     def __init__(self, collection_manager: CollectionManager | None = None):
         self.cm = collection_manager or CollectionManager()
-        self.splitter = RecursiveCharacterTextSplitter(
+
+        # Splitter de secours : toujours disponible (protection anti-chunks trop gros)
+        self._recursive_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len,
         )
+
+        if USE_SEMANTIC_CHUNKING:
+            try:
+                from langchain_experimental.text_splitter import SemanticChunker
+                from core.embeddings import get_embeddings
+                self.splitter = SemanticChunker(
+                    get_embeddings(),
+                    breakpoint_threshold_type="percentile",
+                    breakpoint_threshold_amount=SEMANTIC_BREAKPOINT_THRESHOLD,
+                )
+                logger.info(
+                    f"Semantic chunking activé (seuil percentile={SEMANTIC_BREAKPOINT_THRESHOLD})"
+                )
+            except Exception as e:
+                logger.warning(f"SemanticChunker indisponible ({e}) — fallback RecursiveCharacterTextSplitter")
+                self.splitter = self._recursive_splitter
+        else:
+            self.splitter = self._recursive_splitter
 
     def _metadata_path(self, nom_collection: str) -> Path:
         return METADATA_DIR / f"{nom_collection}.json"
@@ -229,7 +258,18 @@ class DocumentManager:
         # Collecter tous les morceaux de toutes les pages d'abord
         morceaux_par_page: list[tuple[object, list[str]]] = []
         for page in pages:
-            morceaux_par_page.append((page, self.splitter.split_text(page.texte)))
+            morceaux = self.splitter.split_text(page.texte)
+            # Protection : SemanticChunker peut produire des chunks très longs
+            # (ex: un seul paragraphe de 5000 chars). On re-découpe si nécessaire.
+            if USE_SEMANTIC_CHUNKING:
+                morceaux_proteges = []
+                for m in morceaux:
+                    if len(m) > CHUNK_SIZE * 2:
+                        morceaux_proteges.extend(self._recursive_splitter.split_text(m))
+                    else:
+                        morceaux_proteges.append(m)
+                morceaux = morceaux_proteges
+            morceaux_par_page.append((page, morceaux))
 
         # Enrichissement contextuel en parallèle si activé
         if USE_CONTEXTUAL_RETRIEVAL and document_complet:

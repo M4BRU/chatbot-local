@@ -30,6 +30,9 @@ xlrd>=2.0.0      # For .xls (Excel 97-2003)
 # Hybrid search BM25 (pure Python, léger)
 rank-bm25>=0.2.2
 
+# Semantic chunking (découpage aux frontières sémantiques via embeddings)
+langchain-experimental>=0.3.0
+
 # Stemmer français pour BM25 (algo Snowball, pas de modèle à télécharger)
 nltk>=3.9.0
 

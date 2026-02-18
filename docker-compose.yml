@@ -30,8 +30,10 @@ services:
       - USE_RERANKER=true
       - RERANKER_MODEL=BAAI/bge-reranker-v2-m3
       - USE_HYBRID_SEARCH=true
-      - USE_CONTEXTUAL_RETRIEVAL=true
+      - USE_CONTEXTUAL_RETRIEVAL=false
       - CONTEXTUAL_MAX_WORKERS=3
+      - USE_SEMANTIC_CHUNKING=false
+      - SEMANTIC_BREAKPOINT_THRESHOLD=95
     volumes:
       - documents_store:/app/documents
     depends_on:
