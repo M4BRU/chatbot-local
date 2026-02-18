@@ -2,6 +2,11 @@
 core/embeddings.py — Configuration Ollama et embeddings.
 
 Source unique de vérité pour le modèle et l'URL du serveur Ollama.
+
+Modèles supportés et leurs préfixes :
+  - nomic-embed-text   : doc="search_document: "  query="search_query: "
+  - mxbai-embed-large  : doc=""                   query="Represent this sentence for searching relevant passages: "
+  - (autres)           : configurable via OLLAMA_EMBED_DOC_PREFIX / OLLAMA_EMBED_QUERY_PREFIX
 """
 
 import os
@@ -11,9 +16,18 @@ from langchain_ollama import OllamaEmbeddings
 
 # --- Configuration centralisée (variables d'env ou valeurs locales par défaut) ---
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
-EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_API_GENERATE = f"{OLLAMA_BASE_URL}/api/generate"
+
+# Préfixes d'instruction selon le modèle
+_DEFAULT_PREFIXES = {
+    "nomic-embed-text": ("search_document: ", "search_query: "),
+    "mxbai-embed-large": ("", "Represent this sentence for searching relevant passages: "),
+}
+_defaults = _DEFAULT_PREFIXES.get(EMBEDDING_MODEL, ("", ""))
+EMBED_DOC_PREFIX = os.environ.get("OLLAMA_EMBED_DOC_PREFIX", _defaults[0])
+EMBED_QUERY_PREFIX = os.environ.get("OLLAMA_EMBED_QUERY_PREFIX", _defaults[1])
 
 
 def verifier_ollama() -> bool:
@@ -27,23 +41,21 @@ def verifier_ollama() -> bool:
 
 class NomicEmbeddings(OllamaEmbeddings):
     """
-    OllamaEmbeddings avec préfixes d'instruction pour nomic-embed-text.
+    OllamaEmbeddings avec préfixes d'instruction configurables.
 
-    nomic-embed-text est un modèle instruction-tuned : sans préfixes, les
-    vecteurs de requête et de document sont mal alignés (scores > 0.7 même
-    pour des correspondances exactes).
-
-    Préfixes officiels :
-        - documents indexés  → "search_document: <texte>"
-        - requêtes           → "search_query: <texte>"
+    Les modèles instruction-tuned nécessitent des préfixes différents selon
+    leur entraînement. Les préfixes sont lus depuis les variables d'env
+    OLLAMA_EMBED_DOC_PREFIX et OLLAMA_EMBED_QUERY_PREFIX (ou auto-détectés
+    selon OLLAMA_EMBED_MODEL).
     """
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        prefixed = [f"search_document: {t}" for t in texts]
-        return super().embed_documents(prefixed)
+        if EMBED_DOC_PREFIX:
+            texts = [f"{EMBED_DOC_PREFIX}{t}" for t in texts]
+        return super().embed_documents(texts)
 
     def embed_query(self, text: str) -> list[float]:
-        return super().embed_query(f"search_query: {text}")
+        return super().embed_query(f"{EMBED_QUERY_PREFIX}{text}")
 
 
 def get_embeddings() -> NomicEmbeddings:
