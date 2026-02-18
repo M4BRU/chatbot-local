@@ -720,6 +720,18 @@ class RAGEngine:
                     f"{nb_filtres} chunk(s) écarté(s) sur {nb_avant}"
                 )
 
+        # 6b. Seuil absolu : élimine les chunks quasi-nuls même après keyword fallback.
+        # Quand aucune recherche ne trouve rien, on retourne [] → le LLM dira
+        # "je n'ai pas trouvé" plutôt que de servir du contexte non pertinent.
+        # Seuil 0.01 intentionnellement bas : keyword fallback = 0.5, reranker OK > 0.1.
+        nb_avant_absolu = len(resultats)
+        resultats = [(doc, s) for doc, s in resultats if s >= 0.01]
+        if len(resultats) < nb_avant_absolu:
+            logger.info(
+                f"Seuil absolu (≥0.01) : {nb_avant_absolu - len(resultats)} "
+                f"chunk(s) quasi-nuls éliminés"
+            )
+
         # 7. Déduplication PDF/DOCX
         resultats = _deduplicater_pdf_docx(resultats)
 
