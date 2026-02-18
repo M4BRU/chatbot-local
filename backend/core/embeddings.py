@@ -51,9 +51,10 @@ class NomicEmbeddings(OllamaEmbeddings):
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         # Tronque les textes trop longs avant d'ajouter le préfixe.
-        # mxbai-embed-large : 512 tokens max ≈ 1200 chars pour texte technique dense.
-        # Évite les overflow 400 du SemanticChunker sur des lignes de tableau très longues.
-        MAX_CHARS = 1200
+        # mxbai-embed-large : 512 tokens max.
+        # Tableaux markdown (|, chiffres) : ratio ~2 chars/token → 1200 chars = 600 tokens, trop.
+        # 500 chars garantit <250 tokens même pour le pire cas tabulaire.
+        MAX_CHARS = 500
         texts = [t[:MAX_CHARS] if len(t) > MAX_CHARS else t for t in texts]
         if EMBED_DOC_PREFIX:
             texts = [f"{EMBED_DOC_PREFIX}{t}" for t in texts]
