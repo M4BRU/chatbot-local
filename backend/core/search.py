@@ -470,7 +470,7 @@ def _appliquer_reranker(reranker, question: str, resultats: list, top_k: int) ->
     """
     try:
         pairs = [[question, doc.page_content] for doc, _ in resultats]
-        scores = reranker.compute_score(pairs, normalize=True)
+        scores = reranker.compute_score(pairs, normalize=True, max_length=512)
         indexes_tries = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
         top = [(resultats[i][0], float(scores[i])) for i in indexes_tries[:top_k]]
         logger.info(

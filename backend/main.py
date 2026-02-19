@@ -57,13 +57,18 @@ def _warmup_reranker() -> None:
         logger.warning(f"Warmup reranker échoué : {e}")
 
 
+def _warmup_all() -> None:
+    """Séquence de warmup dans un seul thread pour éviter le deadlock ModuleLock."""
+    _warmup_ollama()
+    _warmup_reranker()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lance le pre-warm Ollama + reranker en arrière-plan au démarrage."""
     loop = asyncio.get_event_loop()
     logger.info("Démarrage pre-warm modèles (arrière-plan)…")
-    loop.run_in_executor(None, _warmup_ollama)
-    loop.run_in_executor(None, _warmup_reranker)
+    loop.run_in_executor(None, _warmup_all)
     yield
 
 

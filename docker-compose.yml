@@ -39,8 +39,10 @@ services:
       - SEMANTIC_BREAKPOINT_THRESHOLD=95
       - USE_COLBERT=false
       - COLBERT_MODEL=colbert-ir/colbertv2.0
+      - USE_HF_EMBEDDINGS=true
     volumes:
       - documents_store:/app/documents
+      - hf_cache:/root/.cache/huggingface
     depends_on:
       - ollama
       - chromadb
@@ -83,3 +85,4 @@ volumes:
   chroma_data:
   documents_store:
   ollama_models:
+  hf_cache:

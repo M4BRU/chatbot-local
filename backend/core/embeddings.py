@@ -7,11 +7,18 @@ Modèles supportés et leurs préfixes :
   - nomic-embed-text   : doc="search_document: "  query="search_query: "
   - mxbai-embed-large  : doc=""                   query="Represent this sentence for searching relevant passages: "
   - (autres)           : configurable via OLLAMA_EMBED_DOC_PREFIX / OLLAMA_EMBED_QUERY_PREFIX
+
+Mode embeddings :
+  - USE_HF_EMBEDDINGS=false (défaut) : embeddings via Ollama (GPU)
+  - USE_HF_EMBEDDINGS=true           : embeddings via HuggingFace sentence-transformers (CPU)
+    → libère la VRAM pour le LLM, élimine les évictions de modèle (swap de 30s)
+    → qualité identique, latence embed ~100-200ms au lieu de 67ms (imperceptible)
 """
 
 import os
 import urllib.request
 
+from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 
 # --- Configuration centralisée (variables d'env ou valeurs locales par défaut) ---
@@ -19,6 +26,10 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_API_GENERATE = f"{OLLAMA_BASE_URL}/api/generate"
+
+# Mode HuggingFace : embeddings sur CPU, libère la VRAM pour le LLM
+USE_HF_EMBEDDINGS = os.environ.get("USE_HF_EMBEDDINGS", "false").lower() == "true"
+HF_EMBED_MODEL = os.environ.get("EMBED_HF_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
 
 # Préfixes d'instruction selon le modèle
 _DEFAULT_PREFIXES = {
@@ -28,6 +39,8 @@ _DEFAULT_PREFIXES = {
 _defaults = _DEFAULT_PREFIXES.get(EMBEDDING_MODEL, ("", ""))
 EMBED_DOC_PREFIX = os.environ.get("OLLAMA_EMBED_DOC_PREFIX", _defaults[0])
 EMBED_QUERY_PREFIX = os.environ.get("OLLAMA_EMBED_QUERY_PREFIX", _defaults[1])
+
+_MAX_CHARS = 500  # ~250 tokens max, couvre le pire cas tabulaire (2 chars/token)
 
 
 def verifier_ollama() -> bool:
@@ -42,20 +55,12 @@ def verifier_ollama() -> bool:
 class NomicEmbeddings(OllamaEmbeddings):
     """
     OllamaEmbeddings avec préfixes d'instruction configurables.
-
-    Les modèles instruction-tuned nécessitent des préfixes différents selon
-    leur entraînement. Les préfixes sont lus depuis les variables d'env
-    OLLAMA_EMBED_DOC_PREFIX et OLLAMA_EMBED_QUERY_PREFIX (ou auto-détectés
-    selon OLLAMA_EMBED_MODEL).
+    Tourne sur GPU via Ollama. Sur petite VRAM (<8 Go), provoque des évictions
+    du LLM à chaque appel embed → privilégier HFEmbeddings dans ce cas.
     """
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        # Tronque les textes trop longs avant d'ajouter le préfixe.
-        # mxbai-embed-large : 512 tokens max.
-        # Tableaux markdown (|, chiffres) : ratio ~2 chars/token → 1200 chars = 600 tokens, trop.
-        # 500 chars garantit <250 tokens même pour le pire cas tabulaire.
-        MAX_CHARS = 500
-        texts = [t[:MAX_CHARS] if len(t) > MAX_CHARS else t for t in texts]
+        texts = [t[:_MAX_CHARS] if len(t) > _MAX_CHARS else t for t in texts]
         if EMBED_DOC_PREFIX:
             texts = [f"{EMBED_DOC_PREFIX}{t}" for t in texts]
         return super().embed_documents(texts)
@@ -64,8 +69,40 @@ class NomicEmbeddings(OllamaEmbeddings):
         return super().embed_query(f"{EMBED_QUERY_PREFIX}{text}")
 
 
-def get_embeddings() -> NomicEmbeddings:
-    """Retourne une instance NomicEmbeddings configurée avec le modèle dédié."""
+class HFEmbeddings(Embeddings):
+    """
+    Embeddings via HuggingFace sentence-transformers sur CPU.
+    Libère intégralement la VRAM pour le LLM — élimine les évictions Ollama.
+    Modèle téléchargé depuis HuggingFace Hub au premier démarrage (~700 Mo),
+    puis mis en cache dans le volume hf_cache.
+    """
+
+    def __init__(self) -> None:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        self._model = HuggingFaceEmbeddings(
+            model_name=HF_EMBED_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        texts = [t[:_MAX_CHARS] if len(t) > _MAX_CHARS else t for t in texts]
+        if EMBED_DOC_PREFIX:
+            texts = [f"{EMBED_DOC_PREFIX}{t}" for t in texts]
+        return self._model.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._model.embed_query(f"{EMBED_QUERY_PREFIX}{text}")
+
+
+def get_embeddings() -> Embeddings:
+    """
+    Retourne l'instance d'embeddings selon USE_HF_EMBEDDINGS :
+      - false (défaut) : NomicEmbeddings via Ollama (GPU)
+      - true           : HFEmbeddings via sentence-transformers (CPU)
+    """
+    if USE_HF_EMBEDDINGS:
+        return HFEmbeddings()
     return NomicEmbeddings(
         model=EMBEDDING_MODEL,
         base_url=OLLAMA_BASE_URL,
