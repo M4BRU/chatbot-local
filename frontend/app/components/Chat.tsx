@@ -4,7 +4,9 @@ import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { streamChat, fetchCollections } from "../lib/api";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github.css";
+import { streamChat, fetchCollections, fetchLLMStatus } from "../lib/api";
 import type { ChatMessage, ChatSource } from "../lib/types";
 
 function generateId(): string {
@@ -94,7 +96,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           <p>{message.content}</p>
         ) : (
           <div className="prose prose-sm max-w-none">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
               {message.content || (message.isStreaming ? "..." : "")}
             </ReactMarkdown>
           </div>
@@ -111,6 +113,7 @@ export default function Chat() {
   const [collection, setCollection] = useState("");
   const [collections, setCollections] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [llmReady, setLlmReady] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Fetch collections on mount
@@ -121,6 +124,28 @@ export default function Chat() {
         setCollection(cols[0]);
       }
     });
+  }, []);
+
+  // Poll LLM status until ready — max 100 tentatives (5 min)
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 100;
+
+    const check = async () => {
+      attempts++;
+      const ready = await fetchLLMStatus();
+      if (ready) {
+        setLlmReady(true);
+        clearInterval(interval);
+      } else if (attempts >= MAX_ATTEMPTS) {
+        setError("Le modèle IA n'a pas pu démarrer après 5 minutes. Vérifiez qu'Ollama est bien lancé.");
+        clearInterval(interval);
+      }
+    };
+    check();
+    interval = setInterval(check, 3000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -229,9 +254,18 @@ export default function Chat() {
         <div ref={messagesEndRef} />
       </div>
 
+      {!llmReady && (
+        <div className="mx-4 mb-2 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-2 text-sm text-amber-800">
+          <svg className="animate-spin h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+          Modèle IA en cours de chargement... (peut prendre 1-2 min au démarrage)
+        </div>
+      )}
       <ChatInput
         onSend={handleSend}
-        disabled={isStreaming}
+        disabled={isStreaming || !llmReady}
         collection={collection}
         collections={collections}
         onCollectionChange={setCollection}

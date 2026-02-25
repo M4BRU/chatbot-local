@@ -21,26 +21,41 @@ def _warmup_ollama() -> None:
     Pre-charge les modèles Ollama (embed + LLM) pour que la première requête
     utilisateur soit rapide. Exécuté en thread de fond au démarrage.
     """
-    from core.embeddings import OLLAMA_API_GENERATE, OLLAMA_BASE_URL, EMBEDDING_MODEL
+    from core.embeddings import OLLAMA_API_GENERATE, OLLAMA_BASE_URL, OLLAMA_MODEL, EMBEDDING_MODEL, USE_HF_EMBEDDINGS
 
     # 1. Warm-up embed
-    try:
-        requests.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": EMBEDDING_MODEL, "input": "warmup"},
-            timeout=60,
-        )
-        logger.info("Warmup embed OK")
-    except Exception as e:
-        logger.warning(f"Warmup embed échoué : {e}")
+    if USE_HF_EMBEDDINGS:
+        # HF embeddings : charger le modèle sentence-transformers directement.
+        # Ne PAS appeler l'endpoint Ollama embed — ça chargerait mxbai inutilement
+        # dans Ollama (96 Mo VRAM + 601 Mo RAM) alors qu'on ne l'utilise plus depuis Ollama.
+        try:
+            from core.embeddings import get_embeddings
+            get_embeddings().embed_query("warmup")
+            logger.info("Warmup HF embeddings OK")
+        except Exception as e:
+            logger.warning(f"Warmup HF embeddings échoué : {e}")
+    else:
+        try:
+            requests.post(
+                f"{OLLAMA_BASE_URL}/api/embed",
+                json={"model": EMBEDDING_MODEL, "input": "warmup"},
+                timeout=60,
+            )
+            logger.info("Warmup embed OK")
+        except Exception as e:
+            logger.warning(f"Warmup embed échoué : {e}")
 
-    # 2. Warm-up LLM (num_predict=1 pour charger le modèle sans générer)
+    # 2. Warm-up LLM : charge le modèle en mémoire sans générer.
+    # timeout=600 : 10 min max. Évite un thread zombie si Ollama crash définitivement.
+    # Le chargement de llama3.1:8b peut dépasser 5 min sur certaines machines,
+    # un timeout court ferme la connexion et fait abandonner le chargement à Ollama
+    # ("client connection closed before server finished loading").
     try:
         requests.post(
             OLLAMA_API_GENERATE,
-            json={"model": "llama3.1:8b", "prompt": "warmup", "stream": False,
+            json={"model": OLLAMA_MODEL, "prompt": "warmup", "stream": False,
                   "options": {"num_predict": 1}},
-            timeout=120,
+            timeout=600,
         )
         logger.info("Warmup LLM OK")
     except Exception as e:

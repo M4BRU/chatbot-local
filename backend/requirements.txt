@@ -1,3 +1,7 @@
+# Requis par sentence-transformers >= 3.0 pour le chargement des modèles (meta device).
+# Sans accelerate, SentenceTransformer.to(device) lève NotImplementedError sur torch >= 2.x
+accelerate>=0.28.0
+
 # FastAPI and server
 fastapi>=0.128.0
 uvicorn[standard]>=0.30.0

@@ -54,6 +54,22 @@ def check_gpu() -> str:
         return "not_detected"
 
 
+@router.get("/status")
+async def llm_status(settings: Settings = Depends(get_settings)) -> dict:
+    """Check if the LLM model is available in Ollama (lazy-loaded on first request)."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{settings.ollama_url}/api/tags")
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                model_base = settings.ollama_model.split(":")[0]
+                ready = any(model_base in m.get("name", "") for m in models)
+                return {"llm_ready": ready}
+    except Exception:
+        pass
+    return {"llm_ready": False}
+
+
 @router.get("/health")
 async def health_check(settings: Settings = Depends(get_settings)) -> ApiResponse:
     """Check system health.

@@ -72,7 +72,14 @@ METADATA_DIR = Path(os.environ.get("METADATA_DIR", "./documents_metadata"))
 # Réduit les erreurs de retrieval de ~67% (technique Anthropic).
 # Désactivé par défaut : nécessite N appels Ollama par document à l'ingest.
 USE_CONTEXTUAL_RETRIEVAL = os.environ.get("USE_CONTEXTUAL_RETRIEVAL", "false").lower() == "true"
-CONTEXTUAL_MAX_WORKERS = int(os.environ.get("CONTEXTUAL_MAX_WORKERS", "3"))  # 3 = bon compromis Ollama
+CONTEXTUAL_MAX_WORKERS = int(os.environ.get("CONTEXTUAL_MAX_WORKERS", "4"))
+# Service Ollama dédié au contextual retrieval (CPU uniquement — ne touche pas à la VRAM du LLM principal)
+CONTEXTUAL_OLLAMA_URL = os.environ.get(
+    "CONTEXTUAL_OLLAMA_URL",
+    os.environ.get("OLLAMA_URL", "http://localhost:11434")  # fallback sur le principal si pas de service dédié
+)
+CONTEXTUAL_MODEL = os.environ.get("CONTEXTUAL_MODEL", "qwen3:0.6b")
+_CONTEXTUAL_NO_THINK = os.environ.get("ENABLE_NO_THINK", "false").lower() == "true"
 _CONTEXTUAL_PROMPT = (
     "Tu es un assistant technique. Voici un document :\n"
     "<document>\n{document}\n</document>\n\n"
@@ -83,25 +90,184 @@ _CONTEXTUAL_PROMPT = (
 )
 
 
-def _enrichir_chunk_contexte(chunk: str, document_complet: str, ollama_url: str, model: str) -> str:
+def _construire_hierarchie_parents(tous_morceaux_avec_page: list) -> list[list[str]]:
     """
-    Appelle Ollama pour générer un contexte spécifique à ce chunk dans le document.
-    Retourne le chunk préfixé par son contexte, ou le chunk original en cas d'échec.
+    Construit la hiérarchie des parents pour chaque chunk en analysant les labels Docling.
+
+    Retourne une liste de listes : hierarchies[i] = liste des titres parents du chunk i.
+    Exemple : ["CHAPITRE 1", "Article 1.1", "Sous-section A"]
+    """
+    hierarchies = []
+    pile_titres = {}  # niveau -> titre, maintient les titres actuels par niveau
+
+    for page, morceau in tous_morceaux_avec_page:
+        parents_actuels = []
+
+        # Analyser ce chunk pour détecter s'il contient un nouveau titre
+        lignes = morceau.split('\n')[:5]  # Premières lignes seulement
+        nouveau_titre = None
+        nouveau_niveau = None
+
+        for ligne in lignes:
+            ligne = ligne.strip()
+            # Détecter les labels Docling [TITRE-L1], [SECTION-L2], etc.
+            match = re.match(r'^\[(TITRE|SECTION)-L(\d+)\]\s*(.+)', ligne, re.IGNORECASE)
+            if match:
+                label_type, niveau_str, titre_text = match.groups()
+                niveau = int(niveau_str)
+                titre_clean = titre_text.strip()
+                if len(titre_clean) > 3:
+                    nouveau_titre = titre_clean
+                    nouveau_niveau = niveau
+                    break
+
+        # Si on trouve un nouveau titre, mettre à jour la pile
+        if nouveau_titre and nouveau_niveau is not None:
+            # Supprimer tous les niveaux >= au nouveau niveau (fermer les sections)
+            niveaux_a_supprimer = [n for n in pile_titres.keys() if n >= nouveau_niveau]
+            for n in niveaux_a_supprimer:
+                del pile_titres[n]
+
+            # Ajouter le nouveau titre
+            pile_titres[nouveau_niveau] = nouveau_titre
+
+        # Construire la liste des parents actuels (du plus haut niveau au plus bas)
+        for niveau in sorted(pile_titres.keys()):
+            if niveau < (nouveau_niveau or float('inf')):  # Exclure le titre du chunk actuel
+                parents_actuels.append(pile_titres[niveau])
+
+        hierarchies.append(parents_actuels)
+
+    return hierarchies
+
+
+def _enrichir_chunk_contexte(chunk: str, document_complet: str) -> str:
+    """
+    Appelle le service Ollama contextuel pour générer un contexte spécifique à ce chunk.
+    Retourne le chunk suffixé par son contexte, ou le chunk original en cas d'échec.
     """
     prompt = _CONTEXTUAL_PROMPT.format(document=document_complet[:6000], chunk=chunk)
     try:
         resp = requests.post(
-            f"{ollama_url}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0}},
-            timeout=60,
+            f"{CONTEXTUAL_OLLAMA_URL}/api/generate",
+            json={
+                "model": CONTEXTUAL_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "think": False,  # paramètre API officiel Ollama — désactive le reasoning proprement
+                "options": {"temperature": 0, "num_predict": 200},
+            },
+            timeout=120,
         )
         resp.raise_for_status()
         contexte = resp.json().get("response", "").strip()
-        if contexte:
-            return f"[{contexte}]\n\n{chunk}"
+        if contexte and len(contexte) >= 20:
+            return f"{chunk}\n\n[{contexte}]"
     except Exception as e:
         logger.warning(f"Contextual retrieval chunk échoué : {e}")
     return chunk
+
+def detect_hierarchy_patterns(text: str) -> list[dict]:
+    """
+    Détecte les patterns hiérarchiques dans le texte avec validation IA flexible.
+
+    Returns:
+        list[dict]: [{"level": str, "title": str, "line_num": int, "validated": bool}, ...]
+    """
+    import re
+
+    # Patterns génériques
+    patterns = [
+        (r'^(\d+\.)\s+(.+)', 'numbered_section'),
+        (r'^(\d+\.\d+\.)\s*(.*)$', 'numbered_subsection'),
+        (r'^(\d+\.\d+\.\d+\.)\s+(.+)', 'numbered_subsubsection'),
+        (r'^-(\d+)\s+(.+)', 'numbered_bullet'),
+        (r'^\s*-\s+(.+)', 'bullet'),
+        (r'^\s*▪\s+(.+)', 'sub_bullet'),
+    ]
+
+    hierarchy = []
+    lines = text.split('\n')
+    total_lines = len(lines)
+
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        if not line_clean or len(line_clean) < 3:
+            continue
+
+        # D'abord vérifier les patterns explicites (numérotés, bullets)
+        matched_explicit = False
+        for pattern, level in patterns:
+            match = re.match(pattern, line_clean)
+            if match:
+                title = match.group(2).strip() if len(match.groups()) >= 2 else match.group(1).strip()
+                hierarchy.append({
+                    'level': level,
+                    'title': title,
+                    'line_num': i,
+                    'pattern': match.group(0),
+                    'validated': True
+                })
+                matched_explicit = True
+                break
+
+        # Si pas de pattern explicite, vérifier si c'est un titre potentiel
+        if not matched_explicit and _is_potential_title(line_clean, i, total_lines):
+            context_before = '\n'.join(lines[max(0, i-2):i]) if i > 0 else ""
+            context_after = '\n'.join(lines[i+1:min(len(lines), i+3)]) if i < len(lines)-1 else ""
+
+            is_title = _validate_title_with_ai(line_clean, context_before, context_after)
+            if is_title:
+                hierarchy.append({
+                    'level': 'section_title',
+                    'title': line_clean,
+                    'line_num': i,
+                    'pattern': line_clean,
+                    'validated': True
+                })
+
+    return hierarchy
+
+
+def _is_potential_title(text: str, line_num: int, total_lines: int) -> bool:
+    """Critères larges pour détecter un titre potentiel."""
+    clean_text = text.strip()
+
+    return (
+        len(clean_text) >= 3 and
+        len(clean_text) <= 60 and           # Titres pas trop longs
+        not clean_text.endswith('.') and    # Pas une phrase complète
+        not clean_text.endswith(',') and    # Pas au milieu d'une phrase
+        len(clean_text.split()) <= 8 and    # Max 8 mots (titre concis)
+        not clean_text.lower().startswith(('le ', 'la ', 'les ', 'des ', 'un ', 'une '))  # Pas début d'article
+    )
+
+
+def _validate_title_with_ai(text: str, context_before: str, context_after: str) -> bool:
+    """Utilise le LLM contextuel pour valider si un texte est un titre de section."""
+    prompt = f'"{text}" - TITRE ou TEXTE ?'
+
+    if _CONTEXTUAL_NO_THINK:
+        prompt = "/no_think\n\n" + prompt
+
+    try:
+        resp = requests.post(
+            f"{CONTEXTUAL_OLLAMA_URL}/api/generate",
+            json={
+                "model": CONTEXTUAL_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 10},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        response = resp.json().get("response", "").strip().upper()
+        return "TITRE" in response
+    except Exception:
+        # Si validation IA échoue, on considère que c'est un titre (fail-safe)
+        return True
+
 
 # Noms de machines VLM Robotics à détecter dans les noms de fichiers
 _MACHINES = ["GEMINI", "SOLO", "COMPAQT", "HYMANCO"]
@@ -194,19 +360,27 @@ class DocumentManager:
             try:
                 from langchain_experimental.text_splitter import SemanticChunker
                 from core.embeddings import get_embeddings
-                self.splitter = SemanticChunker(
-                    get_embeddings(),
-                    breakpoint_threshold_type="percentile",
-                    breakpoint_threshold_amount=SEMANTIC_BREAKPOINT_THRESHOLD,
-                )
+                # Structure-aware semantic chunking avec seuils adaptatifs
+                # VARIABLE AJUSTABLE : self.base_threshold contrôle la cohésion sémantique
+                # - Plus haut (80-95%) = chunks plus gros, plus conservateur
+                # - Plus bas (40-60%) = chunks plus petits, plus fragmentés
+                # - Actuellement 75% = bon compromis entre cohésion et granularité
+                # Dans le chunking adaptatif : 30% près des titres, 75% ailleurs
+                self.base_embeddings = get_embeddings()
+                self.base_threshold = 75  # Seuil de base structure-aware (était 60% avant)
+                self.splitter = self._recursive_splitter  # Fallback toujours disponible
                 logger.info(
-                    f"Semantic chunking activé (seuil percentile={SEMANTIC_BREAKPOINT_THRESHOLD})"
+                    f"Structure-aware semantic chunking activé (seuil base={self.base_threshold}%)"
                 )
             except Exception as e:
                 logger.warning(f"SemanticChunker indisponible ({e}) — fallback RecursiveCharacterTextSplitter")
                 self.splitter = self._recursive_splitter
+                self.base_embeddings = None
+                self.base_threshold = None
         else:
             self.splitter = self._recursive_splitter
+            self.base_embeddings = None
+            self.base_threshold = None
 
     def _metadata_path(self, nom_collection: str) -> Path:
         return METADATA_DIR / f"{nom_collection}.json"
@@ -275,12 +449,7 @@ class DocumentManager:
 
         # Contextual retrieval : texte complet du document pour le contexte Ollama
         document_complet = ""
-        ollama_url = ""
-        ollama_model = ""
         if USE_CONTEXTUAL_RETRIEVAL:
-            from core.embeddings import OLLAMA_MODEL
-            ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-            ollama_model = OLLAMA_MODEL
             document_complet = "\n\n".join(p.texte for p in pages)
 
         # Collecter tous les morceaux de toutes les pages d'abord
@@ -299,6 +468,25 @@ class DocumentManager:
             morceaux = morceaux_proteges
             morceaux_par_page.append((page, morceaux))
 
+        # ── chunk_idx + has_continuation ──────────────────────────────────────
+        # Calculé sur le texte RAW (avant enrichissement contextuel) :
+        # le préfixe contextuel ajouté ensuite masquerait les patterns de liste.
+        # has_continuation=True si chunk N et N+1 sont dans la même liste :
+        #   N finit par un item de liste  ET  N+1 commence par un item de liste
+        #   ET même fichier source (pas de continuation entre deux documents).
+        tous_raw = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
+        _BULLET = re.compile(r'^[\s]*[▪\-•\*–]\s+\S', re.MULTILINE)
+        continuation_flags: list[bool] = []
+        for i, (page_i, morceau_i) in enumerate(tous_raw):
+            if i + 1 < len(tous_raw):
+                page_j, morceau_j = tous_raw[i + 1]
+                meme_source = (page_i.source == page_j.source)
+                ends_bullet = bool(re.search(r'\n[\s]*[▪\-•\*–]\s+\S[^\n]*$', morceau_i))
+                starts_bullet = bool(_BULLET.match(morceau_j))
+                continuation_flags.append(meme_source and ends_bullet and starts_bullet)
+            else:
+                continuation_flags.append(False)
+
         # Enrichissement contextuel en parallèle si activé
         if USE_CONTEXTUAL_RETRIEVAL and document_complet:
             tous_morceaux = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
@@ -313,7 +501,7 @@ class DocumentManager:
             with ThreadPoolExecutor(max_workers=CONTEXTUAL_MAX_WORKERS) as executor:
                 futures = {
                     executor.submit(
-                        _enrichir_chunk_contexte, morceau, document_complet, ollama_url, ollama_model
+                        _enrichir_chunk_contexte, morceau, document_complet
                     ): idx
                     for idx, (_, morceau) in enumerate(tous_morceaux)
                 }
@@ -330,16 +518,34 @@ class DocumentManager:
             morceaux_par_page = morceaux_par_page_enrichis
             logger.info(f"Contextual retrieval terminé : {nb_total} chunks enrichis")
 
+        # Construire la hiérarchie des parents pour chaque chunk
+        tous_morceaux_avec_page = [(page, morceau) for page, morceaux in morceaux_par_page for morceau in morceaux]
+        hierarchies = _construire_hierarchie_parents(tous_morceaux_avec_page)
+
+        chunk_global_idx = 0
         for page, morceaux in morceaux_par_page:
             for morceau in morceaux:
                 cid = str(uuid.uuid4())
                 chunk_ids.append(cid)
                 textes.append(morceau)
-                metadonnees.append({
+
+                # Récupérer la hiérarchie de ce chunk
+                hierarchy_parents = hierarchies[chunk_global_idx]
+
+                metadata_chunk = {
                     "source": page.source,
                     "page":   page.page,
+                    "chunk_idx": chunk_global_idx,
+                    "has_continuation": continuation_flags[chunk_global_idx],
                     **meta_fichier,
-                })
+                }
+
+                # Sérialiser hierarchy_parents en JSON string — ChromaDB refuse les listes
+                if hierarchy_parents:
+                    metadata_chunk["hierarchy_parents"] = json.dumps(hierarchy_parents)
+
+                metadonnees.append(metadata_chunk)
+                chunk_global_idx += 1
 
         # Supprimer les anciens chunks de ce document si re-indexation
         metadata = self._charger_metadata(nom_collection)
@@ -365,10 +571,21 @@ class DocumentManager:
         }
         self._sauvegarder_metadata(nom_collection, metadata)
 
+        # Détecter si un fallback parser a été utilisé (pas de labels structurels)
+        parsers_used = {p.parser for p in pages}
+        warnings = []
+        if "pymupdf" in parsers_used:
+            warnings.append(
+                "Docling a échoué pour ce fichier — fallback PyMuPDF utilisé. "
+                "Les chunks n'ont pas de labels structurels ([SECTION], [TEXT], etc.). "
+                "Qualité de retrieval potentiellement réduite."
+            )
+
         return {
             "status": "indexed",
             "chunks": len(chunk_ids),
             "message": f"{chemin.name} : {len(chunk_ids)} chunks indexés ({len(pages)} pages)",
+            "warnings": warnings,
         }
 
     def supprimer_document(self, nom_collection: str, nom_fichier: str) -> bool:

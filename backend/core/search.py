@@ -14,6 +14,10 @@ import requests
 from core.collection_manager import CollectionManager
 from core.embeddings import OLLAMA_API_GENERATE, OLLAMA_MODEL
 
+# Qwen3 : désactive le mode raisonnement (chain-of-thought) pour les réponses RAG.
+# Sans ce flag, Qwen3 génère un bloc <think>...</think> avant chaque réponse (+latence).
+ENABLE_NO_THINK = os.environ.get("ENABLE_NO_THINK", "false").lower() == "true"
+
 logger = logging.getLogger(__name__)
 
 # Prompt par défaut générique
@@ -46,7 +50,9 @@ Consignes de réponse :
 - Cite toujours la source (nom de la machine, référence brochure, numéro de page).
 - Si le contexte permet de recommander une machine spécifique, explique pourquoi elle convient au besoin.
 - Si l'information n'est pas dans le contexte fourni, dis-le clairement : « Je n'ai pas trouvé cette information dans la documentation disponible. »
-- Ne jamais inventer de spécifications techniques."""
+- Ne jamais inventer de spécifications techniques.
+- Reproduis les listes du contexte de manière exhaustive : cite TOUS les éléments sans en omettre, abréger ou résumer aucun.
+- N'ajoute jamais d'explications ou de phrases qui ne sont pas explicitement dans le contexte fourni."""
 
 # Prompts nommés disponibles
 PROMPTS = {
@@ -57,7 +63,8 @@ PROMPTS = {
 
 NB_CHUNKS_RECHERCHE = 6   # fallback si collection vide
 CHUNK_SIZE_APPROX = 1000  # doit correspondre à document_manager.CHUNK_SIZE
-NUM_CTX_MIN = 4096
+NUM_CTX_MIN = 4096   # 4096 : Qwen3:8b a 37 layers (~4.5 Go VRAM) + KV cache q8_0 306 Mo = ~5.0 Go GPU
+                     # 8192 ctx = 612 Mo KV → dépasse les ~5.4 Go dispo sur RTX 3060 Laptop 6 Go
 NUM_CTX_MAX = 32768
 
 # ── Metadata filtering ────────────────────────────────────────────────────────
@@ -77,70 +84,6 @@ _reranker_instance = None
 USE_COLBERT = os.environ.get("USE_COLBERT", "false").lower() == "true"
 COLBERT_MODEL = os.environ.get("COLBERT_MODEL", "colbert-ir/colbertv2.0")
 _colbert_instance = None
-
-# ── Session scoping ───────────────────────────────────────────────────────────
-SCOPING_BOOST = 2.0   # Facteur multiplicatif appliqué aux sources identifiées
-
-# Mots exclus du scoping : noms de machines VLM + mots courants FR/EN tout-caps
-_MOTS_EXCLUS_SCOPING = {
-    "GEMINI", "SOLO", "COMPAQT", "HYMANCO",           # machines VLM
-    "PLAN", "OFFRE", "POUR", "DANS", "AVEC", "NOUS",  # FR communs
-    "VOUS", "SONT", "SERA", "LEUR", "CETTE", "AUSSI",
-    "LISTE", "GENIE", "CIVIL", "LASER", "TECHNIQUE",
-    "USER", "ASSISTANT", "FROM", "WITH", "THAT",       # EN communs
-    "THIS", "WHAT", "ABOUT", "CONTEXT",
-}
-
-
-def _extraire_identifiants_session(history: str) -> set[str]:
-    """
-    Extrait les identifiants-clés de l'historique conversationnel (noms de clients,
-    codes projets) pour le session scoping.
-
-    Heuristique : tokens entièrement en majuscules de 4+ caractères qui apparaissent
-    dans les réponses de l'assistant (ex : "SAFRAN", "PRISMA", "IREPA").
-
-    Exemples :
-      history contient "à SAFRAN Additive Manufacturing" → {"SAFRAN"}
-      history contient "IREPA LASER" → {"IREPA"}
-    """
-    if not history:
-        return set()
-    tokens = re.findall(r'\b[A-Z]{4,}\b', history)
-    return {t for t in tokens if t not in _MOTS_EXCLUS_SCOPING}
-
-
-def _booster_sources_session(resultats: list, identifiants: set[str]) -> list:
-    """
-    Booste les scores des chunks dont le nom de fichier source contient
-    un identifiant de session (client, projet).
-
-    Le boost est multiplicatif (SCOPING_BOOST × score reranker).
-    Les résultats sont re-triés après boost.
-
-    Exemple :
-      identifiants = {"SAFRAN"}
-      "0093 - SAFRAN - Gémini..." → score × 2.0
-      "00301710 1 Poly_shape..." → score inchangé
-    """
-    if not identifiants:
-        return resultats
-
-    boosted = []
-    for doc, score in resultats:
-        source = doc.metadata.get("source", "").upper()
-        if any(ident in source for ident in identifiants):
-            logger.info(
-                f"Session scoping : boost ×{SCOPING_BOOST} "
-                f"sur '{doc.metadata.get('source')}' (identifiants: {identifiants})"
-            )
-            boosted.append((doc, score * SCOPING_BOOST))
-        else:
-            boosted.append((doc, score))
-
-    boosted.sort(key=lambda x: x[1], reverse=True)
-    return boosted
-
 
 def _deduplicater_pdf_docx(resultats: list) -> list:
     """
@@ -294,10 +237,259 @@ def _rrf_fusion(vector_results: list, bm25_results: list, k_final: int) -> list:
     return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
 
 
+# ── Tail extension (chunk N+1 début) ─────────────────────────────────────────
+# Activé uniquement sur les chunks où has_continuation=True (calculé à l'indexation).
+# Récupère le début du chunk N+1 via chunk_idx — sans heuristique au retrieval.
+TAIL_EXTENSION_CHARS = int(os.environ.get("TAIL_EXTENSION_CHARS", "400"))
+
+
+def _ajouter_tail_suivant(db, resultats: list) -> list:
+    """
+    Pour chaque chunk avec has_continuation=True, récupère les TAIL_EXTENSION_CHARS
+    premiers caractères du chunk suivant (chunk_idx+1, même source) et les ajoute
+    au contexte. Jusqu'à 2 niveaux si la continuation enchaîne.
+
+    has_continuation est calculé à l'indexation sur le texte raw :
+      True ⟺ chunk N finit par un item de liste ET chunk N+1 commence par un item de liste.
+    """
+    if not resultats or TAIL_EXTENSION_CHARS <= 0:
+        return resultats
+
+    from langchain_core.documents import Document
+
+    enrichis = []
+    for doc, score in resultats:
+        if not doc.metadata.get("has_continuation"):
+            enrichis.append((doc, score))
+            continue
+
+        source = doc.metadata.get("source")
+        chunk_idx = doc.metadata.get("chunk_idx")
+        if source is None or chunk_idx is None:
+            enrichis.append((doc, score))
+            continue
+
+        contenu = doc.page_content
+        current_idx = chunk_idx
+
+        for niveau in range(2):  # max 2 niveaux (N+1, éventuellement N+2)
+            try:
+                result = db._collection.get(
+                    where={"$and": [
+                        {"source":    {"$eq": source}},
+                        {"chunk_idx": {"$eq": current_idx + 1}},
+                    ]},
+                    include=["documents", "metadatas"],
+                )
+                next_texts = result.get("documents") or []
+                next_metas = result.get("metadatas") or []
+                if not next_texts:
+                    break
+
+                tail = next_texts[0][:TAIL_EXTENSION_CHARS].strip()
+                if tail:
+                    contenu += "\n" + tail
+                    logger.debug(
+                        f"Tail extension niv.{niveau + 1} : chunk_idx "
+                        f"{current_idx}→{current_idx + 1} ({source})"
+                    )
+
+                # Continuer si N+1 a aussi has_continuation
+                if next_metas and next_metas[0].get("has_continuation"):
+                    current_idx += 1
+                else:
+                    break
+            except Exception as e:
+                logger.debug(f"Tail extension échoué : {e}")
+                break
+
+        if contenu != doc.page_content:
+            enrichis.append((Document(page_content=contenu, metadata=doc.metadata), score))
+        else:
+            enrichis.append((doc, score))
+
+    return enrichis
+
+
+# ── Section retrieval ─────────────────────────────────────────────────────────
+# Extension de section complète quand la question cible un titre spécifique
+def _detecter_section_ciblee(db, question: str, resultats_initiaux: list) -> str | None:
+    """
+    Détecte si la question cible une section spécifique en analysant les métadonnées Docling.
+    Utilise les vrais labels [TITRE-L1], [SECTION-L2] au lieu de deviner avec les majuscules.
+    """
+    if not resultats_initiaux or len(resultats_initiaux) > 3:
+        return None
+
+    # Analyser les métadonnées des résultats pour détecter des patterns de sections
+    sources = set()
+    pages = set()
+    titres_detectes = []
+
+    for doc, score in resultats_initiaux:
+        sources.add(doc.metadata.get("source"))
+        pages.add(doc.metadata.get("page"))
+
+        contenu = doc.page_content
+
+        # Chercher les labels Docling dans le contenu
+        lignes = contenu.split('\n')
+        for ligne in lignes[:5]:  # Premières lignes seulement
+            ligne = ligne.strip()
+
+            # Détecter les labels [TITRE-L1], [SECTION-L2], etc.
+            match = re.match(r'^\[(TITRE|SECTION)-L\d+\]\s*(.+)', ligne, re.IGNORECASE)
+            if match:
+                label_type, titre_text = match.groups()
+                titre_clean = titre_text.strip()
+                if len(titre_clean) > 3 and len(titre_clean) < 100:
+                    titres_detectes.append(titre_clean.lower())
+                    logger.info(f"Titre Docling détecté : [{label_type}] '{titre_clean}'")
+
+    # Si résultats dispersés (multiple sources, pages très éloignées), pas une section
+    if len(sources) > 1 or (len(pages) > 1 and max(pages) - min(pages) > 3):
+        return None
+
+    # Si on trouve des titres avec labels Docling, retourner le premier
+    if titres_detectes:
+        titres_uniques = list(set(titres_detectes))
+        if len(titres_uniques) <= 2:  # Max 2 titres différents
+            titre_cible = titres_uniques[0]
+            logger.info(f"Section ciblée via labels Docling : '{titre_cible}'")
+            return titre_cible
+
+    return None
+
+
+def _recuperer_section_complete(db, titre_recherche: str, k_max: int = 20) -> list:
+    """
+    Récupère tous les chunks d'une section spécifique en cherchant le titre
+    puis tous les chunks suivants jusqu'au prochain titre de même niveau.
+    """
+    from langchain_core.documents import Document
+
+    if not titre_recherche:
+        return []
+
+    logger.info(f"Recherche de section complète pour : '{titre_recherche}'")
+
+    # 1. Chercher des chunks contenant le titre (case-insensitive)
+    titre_patterns = [
+        titre_recherche,
+        titre_recherche.upper(),
+        titre_recherche.lower(),
+        titre_recherche.capitalize()
+    ]
+
+    chunks_titres = []
+    for pattern in titre_patterns:
+        try:
+            result = db._collection.get(
+                where_document={"$contains": pattern},
+                include=["documents", "metadatas"],
+                limit=k_max
+            )
+            texts = result.get("documents") or []
+            metas = result.get("metadatas") or []
+
+            for text, meta in zip(texts, metas):
+                if meta and text:
+                    chunks_titres.append((Document(page_content=text, metadata=meta), 0.9))
+        except Exception as e:
+            logger.debug(f"Recherche titre '{pattern}' échouée : {e}")
+
+    if not chunks_titres:
+        return []
+
+    # 2. Pour chaque chunk titre trouvé, récupérer sa section complète
+    sections_completes = []
+    sources_vues = set()
+
+    for doc_titre, score_titre in chunks_titres:
+        source = doc_titre.metadata.get("source")
+        chunk_idx_titre = doc_titre.metadata.get("chunk_idx")
+
+        if not source or chunk_idx_titre is None:
+            continue
+
+        # Éviter les doublons de source
+        if source in sources_vues:
+            continue
+        sources_vues.add(source)
+
+        # 3. Récupérer tous les chunks de cette source à partir du titre
+        try:
+            result = db._collection.get(
+                where={"source": {"$eq": source}},
+                include=["documents", "metadatas"],
+            )
+            all_texts = result.get("documents") or []
+            all_metas = result.get("metadatas") or []
+
+            # Trier par chunk_idx
+            chunks_source = [(text, meta) for text, meta in zip(all_texts, all_metas) if meta]
+            chunks_source.sort(key=lambda x: x[1].get("chunk_idx", 0))
+
+            # Trouver l'index du titre dans les chunks triés
+            titre_idx = None
+            for i, (text, meta) in enumerate(chunks_source):
+                if meta.get("chunk_idx") == chunk_idx_titre:
+                    titre_idx = i
+                    break
+
+            if titre_idx is None:
+                continue
+
+            # 4. Prendre le titre + chunks suivants jusqu'au prochain titre Docling de même niveau
+            section_chunks = [chunks_source[titre_idx]]  # Commencer par le titre
+
+            # Déterminer le niveau du titre de départ
+            titre_text, titre_meta = chunks_source[titre_idx]
+            niveau_titre_cible = None
+            first_lines = titre_text.split('\n')[:3]
+            for line in first_lines:
+                match = re.match(r'^\[(TITRE|SECTION)-L(\d+)\]', line.strip())
+                if match:
+                    niveau_titre_cible = int(match.group(2))
+                    break
+
+            for i in range(titre_idx + 1, min(len(chunks_source), titre_idx + 15)):  # Max 15 chunks par section
+                text, meta = chunks_source[i]
+
+                # Arrêter si on trouve un autre titre Docling de même niveau ou supérieur
+                first_lines = text.split('\n')[:3]
+                for line in first_lines:
+                    match = re.match(r'^\[(TITRE|SECTION)-L(\d+)\]', line.strip())
+                    if match:
+                        niveau_nouveau = int(match.group(2))
+                        # Arrêter si même niveau ou niveau supérieur (plus proche de la racine)
+                        if niveau_titre_cible is None or niveau_nouveau <= niveau_titre_cible:
+                            logger.debug(f"Arrêt section : nouveau titre niveau {niveau_nouveau} détecté")
+                            break
+                else:
+                    # Pas de titre trouvé dans ce chunk → continuer
+                    section_chunks.append((text, meta))
+                    continue
+                # Break trouvé dans le for interne → arrêter la section
+                break
+
+            # Convertir en format (Document, score)
+            for text, meta in section_chunks:
+                sections_completes.append((Document(page_content=text, metadata=meta), 0.8))
+
+            logger.info(f"Section '{titre_recherche}' : {len(section_chunks)} chunks récupérés ({source})")
+
+        except Exception as e:
+            logger.warning(f"Erreur récupération section complète ({source}) : {e}")
+            continue
+
+    return sections_completes[:k_max]  # Limiter au cas où
+
+
 # ── Keyword fallback (where_document) ─────────────────────────────────────────
 # Seuil en dessous duquel le keyword fallback est déclenché.
 # Reranker normalisé [0,1] : < 0.1 = aucune correspondance sémantique.
-KEYWORD_FALLBACK_THRESHOLD = float(os.environ.get("KEYWORD_FALLBACK_THRESHOLD", "0.1"))
+KEYWORD_FALLBACK_THRESHOLD = float(os.environ.get("KEYWORD_FALLBACK_THRESHOLD", "0.01"))
 
 _STOPWORDS_FALLBACK = {
     # FR
@@ -400,12 +592,16 @@ def _get_reranker():
     if not USE_RERANKER:
         return None
     try:
-        import torch
         from FlagEmbedding import FlagReranker
-        # use_fp16=True cause "meta tensor" error sur CPU — on n'utilise fp16 que si GPU dispo
-        use_fp16 = torch.cuda.is_available()
-        _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=use_fp16)
-        logger.info(f"Reranker initialisé : {RERANKER_MODEL} (fp16={use_fp16})")
+        # use_fp16=False → reranker forcé sur CPU.
+        # Sur RTX 3060 Laptop 6 Go, Qwen3:8b occupe déjà ~5.0 Go GPU.
+        # Le reranker sur GPU (~570 Mo fp16) dépasse le budget VRAM disponible,
+        # ralentit ou fait échouer le chargement du LLM.
+        # Sur CPU : cross-encoding de ~6-18 paires ≈ 1-2s de plus, imperceptible.
+        # devices="cpu" : seul moyen fiable en FlagEmbedding >= 1.3 de forcer CPU.
+        # use_fp16=False seul déclenche un "meta tensor" error (device_map="auto" interne).
+        _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=False, devices="cpu")
+        logger.info(f"Reranker initialisé : {RERANKER_MODEL} (CPU, fp32)")
         return _reranker_instance
     except Exception as e:
         logger.warning(f"Reranker indisponible ({e}) — désactivé")
@@ -498,7 +694,7 @@ def _reformuler_question(question: str, history: str) -> str:
 
     Si le rewriting échoue (timeout, erreur), retourne la question originale.
     """
-    if not history:
+    if not history or history.count("User:") <= 1:
         return question
 
     prompt = (
@@ -512,15 +708,25 @@ def _reformuler_question(question: str, history: str) -> str:
         "Requête de recherche :"
     )
 
+    # Qwen3 : désactive le mode raisonnement pour le query rewriting aussi.
+    # Sans /no_think, Qwen3 génère <think>...</think> qui pollue la requête vectorielle.
+    if ENABLE_NO_THINK:
+        prompt = "/no_think\n\n" + prompt
+
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.0, "num_ctx": 2048},
+        # num_ctx aligné sur NUM_CTX_MIN pour éviter un rechargement du modèle
+        # entre le query rewriting (ce call) et la génération principale (KvSize doit être identique).
+        "options": {"temperature": 0.0, "num_ctx": NUM_CTX_MIN},
     }
 
     try:
-        resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=15)
+        # timeout=120 : survit au chargement de Qwen3:8b (~45-50s) sans avorter.
+        # Avec timeout=15, le QR abandonnait pendant le chargement → double rechargement
+        # (QR annule le load en cours, puis la génération relance un 2e load de zéro).
+        resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=120)
         resp.raise_for_status()
         rewritten = resp.json().get("response", "").strip()
         if rewritten:
@@ -755,7 +961,7 @@ class RAGEngine:
         colbert = _get_colbert()
         if colbert and len(resultats) > k:
             resultats = _appliquer_colbert(colbert, question, resultats, top_k=k)
-        elif reranker and len(resultats) > k:
+        elif reranker and resultats:
             resultats = _appliquer_reranker(reranker, question, resultats, top_k=k)
 
         # 5b. Keyword fallback — si le reranker (ou la RRF sans reranker) ne trouve
@@ -796,13 +1002,33 @@ class RAGEngine:
         # 7. Déduplication PDF/DOCX
         resultats = _deduplicater_pdf_docx(resultats)
 
+        # 7b. Tail extension — complète les chunks qui s'arrêtent au milieu d'une liste
+        resultats = _ajouter_tail_suivant(self.db, resultats)
+
+        # 7c. Section complète — détection intelligente via analyse des résultats initiaux
+        titre_cible = _detecter_section_ciblee(self.db, question, resultats)
+        if titre_cible:
+            logger.info(f"Section ciblée détectée : '{titre_cible}' → recherche section complète")
+            section_complete = _recuperer_section_complete(self.db, titre_cible, k_max=k*2)
+            if section_complete and len(section_complete) > len(resultats):
+                # Remplacer seulement si on a plus de contenu
+                resultats = section_complete
+                logger.info(f"Section complète récupérée : {len(section_complete)} chunks (remplace {len(resultats)} résultats)")
+
         # 8. Formater les résultats
         contexte_parts = []
         sources = []
         sources_vues = set()
 
         for doc, score in resultats:
-            contexte_parts.append(doc.page_content)
+            content = doc.page_content
+            # Le préfixe contextuel "[résumé]\n\n" est ajouté à l'indexation pour enrichir
+            # l'embedding. On le déplace en fin de chunk pour que le LLM lise le contenu
+            # complet en premier (sinon il répond avec le résumé au lieu du détail).
+            m = re.match(r'^(\[[^\n\]]+\])\n\n(.+)', content, re.DOTALL)
+            if m:
+                content = m.group(2) + "\n\n" + m.group(1)
+            contexte_parts.append(content)
             cle_source = f"{doc.metadata.get('source', 'Inconnu')} - p.{doc.metadata.get('page', '?')}"
             if cle_source not in sources_vues:
                 sources_vues.add(cle_source)
@@ -814,6 +1040,90 @@ class RAGEngine:
 
         contexte = "\n\n---\n\n".join(contexte_parts)
         return contexte, sources
+
+    def rechercher_debug(self, question: str, history: str = "") -> dict:
+        """
+        Retourne les données brutes du pipeline de retrieval pour debug frontend.
+
+        Retourne :
+          {
+            "original_question": str,
+            "rewritten_query": str,
+            "chunks": [
+              {
+                "rank": int,
+                "score": float,
+                "source": str,
+                "page": str|int,
+                "chunk_idx": int,
+                "machine": str,
+                "sections": list[str],   # hierarchy_parents désérialisé
+                "content": str,          # contenu complet
+                "content_preview": str,  # 300 premiers chars
+              }
+            ]
+          }
+        """
+        k, _ = self._adapter_parametres()
+        history_text = history if history else ""
+
+        rewritten_query = _reformuler_question(question, history_text)
+        _, sources_list = self.rechercher(rewritten_query, k=k, history=history_text)
+
+        # Re-run pour récupérer les docs complets (rechercher() retourne contexte str + sources)
+        # On refait le pipeline directement ici pour avoir les docs avec contenu
+        filtre = _extraire_filtre_question(rewritten_query)
+        reranker = _get_reranker()
+        k_candidats = min(k * RERANKER_CANDIDATS_MULT, RERANKER_CANDIDATS_MAX) if reranker else k
+
+        try:
+            resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats, filter=filtre)
+            if not resultats and filtre:
+                resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats)
+        except Exception:
+            resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats)
+
+        bm25_index = _get_or_build_bm25(self.db, self.nom_collection)
+        if bm25_index:
+            bm25_results = bm25_index.search(rewritten_query, k=k_candidats, filtre=filtre)
+            resultats = _rrf_fusion(resultats, bm25_results, k_final=k_candidats)
+
+        colbert = _get_colbert()
+        if colbert and len(resultats) > k:
+            resultats = _appliquer_colbert(colbert, rewritten_query, resultats, top_k=k)
+        elif reranker and resultats:
+            resultats = _appliquer_reranker(reranker, rewritten_query, resultats, top_k=k)
+
+        resultats = _deduplicater_pdf_docx(resultats)
+        resultats = _ajouter_tail_suivant(self.db, resultats)
+
+        chunks = []
+        for rank, (doc, score) in enumerate(resultats, 1):
+            meta = doc.metadata or {}
+            # Désérialiser hierarchy_parents (stocké en JSON string)
+            sections_raw = meta.get("hierarchy_parents", "[]")
+            try:
+                sections = json.loads(sections_raw) if isinstance(sections_raw, str) else sections_raw
+            except Exception:
+                sections = []
+
+            chunks.append({
+                "rank": rank,
+                "score": round(score, 4),
+                "source": meta.get("source", "?"),
+                "page": meta.get("page", "?"),
+                "chunk_idx": meta.get("chunk_idx"),
+                "machine": meta.get("machine"),
+                "sections": sections,
+                "content": doc.page_content,
+                "content_preview": doc.page_content[:300],
+            })
+
+        return {
+            "original_question": question,
+            "rewritten_query": rewritten_query,
+            "chunks": chunks,
+        }
 
     def generer_avec_sources(self, question: str, stream: bool = True, history: str = "") -> dict:
         """
@@ -845,6 +1155,9 @@ class RAGEngine:
         Si stream=False, retourne la réponse complète (str).
         num_ctx est calculé dynamiquement par _adapter_parametres().
         """
+        if ENABLE_NO_THINK:
+            prompt = "/no_think\n\n" + prompt
+
         payload = {
             "model": OLLAMA_MODEL,
             "prompt": prompt,
@@ -861,7 +1174,7 @@ class RAGEngine:
                 OLLAMA_API_GENERATE,
                 json=payload,
                 stream=stream,
-                timeout=300,
+                timeout=600,  # 10 minutes au lieu de 5
             )
             reponse.raise_for_status()
         except requests.ConnectionError:
@@ -891,13 +1204,21 @@ class RAGEngine:
             return data.get("response", "")
 
         def _stream_tokens():
-            for ligne in reponse.iter_lines():
-                if ligne:
-                    donnees = json.loads(ligne)
-                    token = donnees.get("response", "")
-                    if token:
-                        yield token
-                    if donnees.get("done", False):
-                        break
+            try:
+                for ligne in reponse.iter_lines():
+                    if ligne:
+                        try:
+                            donnees = json.loads(ligne)
+                        except json.JSONDecodeError:
+                            continue
+                        token = donnees.get("response", "")
+                        if token:
+                            yield token
+                        if donnees.get("done", False):
+                            break
+            except requests.exceptions.ChunkedEncodingError as e:
+                logger.warning(f"Stream interrompu : {e}")
+            finally:
+                reponse.close()
 
         return _stream_tokens()

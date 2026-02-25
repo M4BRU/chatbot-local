@@ -27,25 +27,44 @@ services:
       - OLLAMA_EMBED_MODEL=mxbai-embed-large
       - EMBED_HF_MODEL=mixedbread-ai/mxbai-embed-large-v1
       - TOKENIZERS_PARALLELISM=false
+      - HF_HUB_OFFLINE=1
       - USE_DOCLING=true
       - DOCLING_OCR=false
       - DOCLING_TABLE_MODE=accurate
       - USE_RERANKER=true
       - RERANKER_MODEL=BAAI/bge-reranker-v2-m3
       - USE_HYBRID_SEARCH=true
-      - USE_CONTEXTUAL_RETRIEVAL=false
+      - USE_CONTEXTUAL_RETRIEVAL=true
+      - CONTEXTUAL_OLLAMA_URL=http://ollama-contextual:11434
+      - CONTEXTUAL_MODEL=qwen3:0.6b
       - CONTEXTUAL_MAX_WORKERS=3
       - USE_SEMANTIC_CHUNKING=true
-      - SEMANTIC_BREAKPOINT_THRESHOLD=95
+      - SEMANTIC_BREAKPOINT_THRESHOLD=60
       - USE_COLBERT=false
       - COLBERT_MODEL=colbert-ir/colbertv2.0
       - USE_HF_EMBEDDINGS=true
+      - OLLAMA_MODEL=qwen3:8b
+      # /no_think désactive le mode raisonnement de Qwen3 pour les réponses RAG
+      - ENABLE_NO_THINK=true
     volumes:
+      - ./backend:/app/backend  # Code source en temps réel
       - documents_store:/app/documents
       - hf_cache:/root/.cache/huggingface
     depends_on:
       - ollama
+      - ollama-contextual
       - chromadb
+    networks:
+      - chatbot-network
+
+  ollama-contextual:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - CUDA_VISIBLE_DEVICES=    # Cache le GPU — force le CPU uniquement
+      - OLLAMA_NUM_THREADS=4
+    volumes:
+      - ollama_contextual_models:/root/.ollama
     networks:
       - chatbot-network
 
@@ -55,6 +74,13 @@ services:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
+    environment:
+      # Donne 15 min à Ollama pour charger le modèle en mémoire.
+      # Défaut Ollama = 5 min — insuffisant pour llama3.1:8b sur certaines machines.
+      - OLLAMA_LOAD_TIMEOUT=900
+      # KV cache en 8-bit : réduit la VRAM du cache de ~50% → permet 8192 tokens de contexte
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      - OLLAMA_FLASH_ATTENTION=1
     deploy:
       resources:
         reservations:
@@ -85,4 +111,5 @@ volumes:
   chroma_data:
   documents_store:
   ollama_models:
+  ollama_contextual_models:
   hf_cache:

@@ -55,9 +55,89 @@ export async function* streamChat(
   }
 }
 
+export async function fetchLLMStatus(): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_URL}/api/v1/status`);
+    if (!response.ok) return false;
+    const data = await response.json();
+    return data.llm_ready === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchCollections(): Promise<string[]> {
   const response = await fetch(`${API_URL}/api/collections`);
   if (!response.ok) return [];
   const data = await response.json();
   return data.collections || [];
+}
+
+export interface DebugChunk {
+  rank: number;
+  score: number;
+  source: string;
+  page: string | number;
+  chunk_idx: number | null;
+  machine: string | null;
+  sections: string[];
+  content: string;
+  content_preview: string;
+}
+
+export interface DebugResult {
+  original_question: string;
+  rewritten_query: string;
+  chunks: DebugChunk[];
+}
+
+export interface BrowseChunk {
+  source: string;
+  page: string | number;
+  chunk_idx: number | null;
+  machine: string | null;
+  sections: string[];
+  content: string;
+  content_preview: string;
+}
+
+export interface BrowseResult {
+  total: number;
+  offset: number;
+  limit: number;
+  chunks: BrowseChunk[];
+}
+
+export async function fetchChunks(
+  collectionName: string,
+  offset: number = 0,
+  limit: number = 50
+): Promise<BrowseResult> {
+  const response = await fetch(
+    `${API_URL}/api/collections/${collectionName}/chunks?offset=${offset}&limit=${limit}`
+  );
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+export async function debugRAG(
+  message: string,
+  collectionName: string,
+  promptName: string = "defaut"
+): Promise<DebugResult> {
+  const response = await fetch(`${API_URL}/api/chat/debug`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      collection_name: collectionName,
+      prompt_name: promptName,
+      history: [],
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
 }

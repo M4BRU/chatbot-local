@@ -19,7 +19,7 @@ export default function AdminPage() {
   const [newCollectionName, setNewCollectionName] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
-  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [message, setMessage] = useState<{ type: "success" | "error" | "warning"; text: string } | null>(null);
 
   // Fetch collections
   const fetchCollections = async () => {
@@ -108,6 +108,7 @@ export default function AdminPage() {
 
     const successes: string[] = [];
     const errors: string[] = [];
+    const warnings: string[] = [];
 
     for (let i = 0; i < files.length; i++) {
       setUploadProgress({ current: i + 1, total: files.length });
@@ -122,6 +123,9 @@ export default function AdminPage() {
         const data = await res.json();
         if (res.ok) {
           successes.push(files[i].name);
+          if (data.warnings?.length) {
+            warnings.push(`${files[i].name} : ${data.warnings.join(" ")}`);
+          }
         } else {
           errors.push(`${files[i].name} : ${data.detail || "erreur"}`);
         }
@@ -135,10 +139,14 @@ export default function AdminPage() {
     e.target.value = "";
     fetchDocuments(selectedCollection);
 
-    if (errors.length === 0) {
-      setMessage({ type: "success", text: `${successes.length} fichier(s) indexé(s) avec succès` });
-    } else if (successes.length === 0) {
+    if (errors.length > 0 && successes.length === 0) {
       setMessage({ type: "error", text: `Échec : ${errors.join(", ")}` });
+    } else if (warnings.length > 0) {
+      const base = `${successes.length} fichier(s) indexé(s)`;
+      const errPart = errors.length > 0 ? ` — Erreurs : ${errors.join(", ")}` : "";
+      setMessage({ type: "warning", text: `${base}${errPart} — Avertissement : ${warnings.join(" | ")}` });
+    } else if (errors.length === 0) {
+      setMessage({ type: "success", text: `${successes.length} fichier(s) indexé(s) avec succès` });
     } else {
       setMessage({ type: "success", text: `${successes.length} indexé(s) — Erreurs : ${errors.join(", ")}` });
     }
@@ -175,7 +183,7 @@ export default function AdminPage() {
         {message && (
           <div
             className={`mb-4 p-3 rounded ${
-              message.type === "success" ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"
+              message.type === "success" ? "bg-green-100 text-green-800" : message.type === "warning" ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
             }`}
           >
             {message.text}

@@ -11,8 +11,8 @@ def get_settings() -> Settings:
     return Settings()
 
 
-# Port implementations will be registered here as adapters are implemented
-# Example:
-# def get_llm_port() -> LlmPort:
-#     settings = get_settings()
-#     return OllamaAdapter(settings.ollama_url)
+@lru_cache(maxsize=1)
+def get_collection_manager():
+    """Singleton CollectionManager — une seule connexion HTTP vers ChromaDB."""
+    from core.collection_manager import CollectionManager
+    return CollectionManager()

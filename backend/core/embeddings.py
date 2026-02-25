@@ -17,6 +17,7 @@ Mode embeddings :
 
 import os
 import urllib.request
+from functools import lru_cache
 
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
@@ -40,7 +41,9 @@ _defaults = _DEFAULT_PREFIXES.get(EMBEDDING_MODEL, ("", ""))
 EMBED_DOC_PREFIX = os.environ.get("OLLAMA_EMBED_DOC_PREFIX", _defaults[0])
 EMBED_QUERY_PREFIX = os.environ.get("OLLAMA_EMBED_QUERY_PREFIX", _defaults[1])
 
-_MAX_CHARS = 500  # ~250 tokens max, couvre le pire cas tabulaire (2 chars/token)
+_MAX_CHARS = 700  # ~490 tokens max — couvre chunks de 450 tokens même en tableau Docling
+                  # (450 tokens × 1.4 char/token = 630 chars, arrondi 700 pour sécurité)
+                  # Ancienne valeur 350 tronquait silencieusement ~50% du contenu
 
 
 def verifier_ollama() -> bool:
@@ -78,26 +81,24 @@ class HFEmbeddings(Embeddings):
     """
 
     def __init__(self) -> None:
-        from langchain_huggingface import HuggingFaceEmbeddings
-        self._model = HuggingFaceEmbeddings(
-            model_name=HF_EMBED_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(HF_EMBED_MODEL, device="cpu")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         texts = [t[:_MAX_CHARS] if len(t) > _MAX_CHARS else t for t in texts]
         if EMBED_DOC_PREFIX:
             texts = [f"{EMBED_DOC_PREFIX}{t}" for t in texts]
-        return self._model.embed_documents(texts)
+        return self._model.encode(texts, normalize_embeddings=True).tolist()
 
     def embed_query(self, text: str) -> list[float]:
-        return self._model.embed_query(f"{EMBED_QUERY_PREFIX}{text}")
+        return self._model.encode(f"{EMBED_QUERY_PREFIX}{text}", normalize_embeddings=True).tolist()
 
 
+@lru_cache(maxsize=1)
 def get_embeddings() -> Embeddings:
     """
-    Retourne l'instance d'embeddings selon USE_HF_EMBEDDINGS :
+    Retourne l'instance d'embeddings selon USE_HF_EMBEDDINGS (singleton via lru_cache).
+    Sans cache, HuggingFaceEmbeddings rechargerait ~700 Mo depuis le disque à chaque requête.
       - false (défaut) : NomicEmbeddings via Ollama (GPU)
       - true           : HFEmbeddings via sentence-transformers (CPU)
     """

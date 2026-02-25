@@ -1,13 +1,14 @@
 """Documents management API routes."""
 
+import asyncio
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from backend.api.dependencies import get_settings
+from backend.api.dependencies import get_collection_manager, get_settings
 
 router = APIRouter(prefix="/api/collections/{collection_name}/documents", tags=["documents"])
 
@@ -35,15 +36,15 @@ class IndexResult(BaseModel):
     status: str
     chunks: int
     message: str
+    warnings: list[str] = []
 
 
 @router.get("", response_model=DocumentListResponse)
 async def list_documents(collection_name: str) -> DocumentListResponse:
     """List all documents in a collection."""
-    from core.collection_manager import CollectionManager
     from core.document_manager import DocumentManager
 
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if not cm.collection_existe(collection_name):
         raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
 
@@ -63,28 +64,32 @@ async def upload_document(
 
     Supported formats: PDF, TXT, MD, DOCX
     """
-    from core.collection_manager import CollectionManager
     from core.document_manager import DocumentManager
 
-    cm = CollectionManager()
+    cm = get_collection_manager()
 
     # Create collection if it doesn't exist
     if not cm.collection_existe(collection_name):
         cm.creer_collection(collection_name)
 
-    # Save uploaded file temporarily
-    suffix = Path(file.filename or "document").suffix
+    # Sanitize filename pour éviter le path traversal
+    # PurePosixPath.name extrait uniquement le nom de fichier, sans répertoire
+    raw_name = file.filename or "document"
+    safe_name = PurePosixPath(raw_name).name
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "document"
+
+    suffix = Path(safe_name).suffix
     with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
 
+    final_path = tmp_path.parent / safe_name
     try:
-        # Rename to original filename for better metadata
-        final_path = tmp_path.parent / (file.filename or "document")
         tmp_path.rename(final_path)
 
         dm = DocumentManager(cm)
-        result = dm.ajouter_document(collection_name, final_path, force=force)
+        result = await asyncio.to_thread(dm.ajouter_document, collection_name, final_path, force)
         return IndexResult(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -98,10 +103,9 @@ async def upload_document(
 @router.delete("/{document_name}", status_code=204)
 async def delete_document(collection_name: str, document_name: str) -> None:
     """Delete a document from a collection."""
-    from core.collection_manager import CollectionManager
     from core.document_manager import DocumentManager
 
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if not cm.collection_existe(collection_name):
         raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
 

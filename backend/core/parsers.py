@@ -31,6 +31,7 @@ class ParsedPage:
     texte: str
     source: str
     page: int
+    parser: str = "docling"  # "docling" | "pymupdf" | "docx" | "text" | "csv" | "excel"
 
 
 # Extensions supportées et leur parser associé
@@ -123,35 +124,98 @@ def _get_docling_converter():
     return _docling_converter
 
 
+def _df_to_prose(df) -> str:
+    """
+    Convertit un DataFrame en phrases lisibles pour améliorer l'embedding.
+
+    Exemple :
+      | Fonction    | Basculeur | Plateau |
+      | Charge maxi | 4.5T      | 3T      |
+    →  "Charge maxi : Basculeur = 4.5T, Plateau = 3T."
+    """
+    lines = []
+    col_names = [str(c).strip() for c in df.columns]
+
+    for _, row in df.iterrows():
+        vals = [str(v).strip() for v in row]
+        # Ignorer les lignes entièrement vides ou NaN
+        non_empty = [v for v in vals if v and v.lower() not in ("nan", "none", "")]
+        if not non_empty:
+            continue
+
+        first = vals[0] if vals[0].lower() not in ("nan", "none", "") else ""
+        parts = []
+        for col, val in zip(col_names[1:], vals[1:]):
+            if val and val.lower() not in ("nan", "none", ""):
+                parts.append(f"{col} = {val}")
+
+        if parts:
+            prefix = f"{first} : " if first else ""
+            lines.append(f"{prefix}{', '.join(parts)}.")
+        elif first:
+            lines.append(first + ".")
+
+    return "\n".join(lines)
+
+
 def _docling_result_to_pages(result, chemin: Path) -> list[ParsedPage]:
     """
     Convertit un résultat Docling en liste de ParsedPage groupée par numéro de page.
 
-    Utilise la provenance (prov) de chaque item pour récupérer le numéro de page.
-    Les tableaux sont exportés en Markdown pour préserver leur structure.
+    AMÉLIORATION : Préserve les métadonnées de structure (labels, niveaux)
+    pour une meilleure détection des titres et sections.
     """
     from collections import defaultdict
-    from docling_core.types.doc import TableItem, TextItem
+    from docling_core.types.doc import TableItem, TextItem, DocItemLabel
 
     doc = result.document
     pages_content: dict[int, list[str]] = defaultdict(list)
+    last_section = ""  # titre de la dernière section rencontrée (parent immédiat)
 
-    for item, _level in doc.iterate_items():
+    for item, level in doc.iterate_items():
         text = None
+        metadata_prefix = ""
 
         if isinstance(item, TableItem):
-            # Tableau → Markdown avec headers (meilleur pour le LLM)
+            # Tableau → Markdown (LLM lit et reproduit le tableau)
+            #           + prose  (embedding trouve le chunk de façon fiable)
             try:
                 df = item.export_to_dataframe(doc=doc)
-                text = df.to_markdown(index=False)
+                markdown = df.to_markdown(index=False)
+                prose = _df_to_prose(df)
+                # Légende du tableau si disponible (ex: "Tableau 3 : Caractéristiques du vireur")
+                caption = item.caption_text(doc).strip() if hasattr(item, "caption_text") else ""
+                parts = []
+                if caption:
+                    parts.append(caption)
+                parts.append(markdown)
+                if prose:
+                    parts.append(prose)
+                text = "\n\n".join(parts)
+                section_ref = f"[{last_section}] " if last_section else ""
+                metadata_prefix = f"[TABLE-L{level}]{section_ref}"
             except Exception:
                 try:
                     text = item.export_to_html(doc=doc)
+                    section_ref = f"[{last_section}] " if last_section else ""
+                    metadata_prefix = f"[TABLE-L{level}]{section_ref}"
                 except Exception:
                     pass
 
         elif isinstance(item, TextItem):
             text = item.text
+
+            # Enrichir avec les métadonnées de structure
+            label = getattr(item, 'label', None)
+            if label:
+                if label in [DocItemLabel.TITLE, DocItemLabel.SECTION_HEADER]:
+                    # Mettre à jour le parent immédiat (tronqué à 40 chars)
+                    last_section = text.strip()[:40]
+                    tag = "TITRE" if label == DocItemLabel.TITLE else "SECTION"
+                    metadata_prefix = f"[{tag}-L{level}] "
+                else:
+                    section_ref = f"[{last_section}]" if last_section else ""
+                    metadata_prefix = f"[{label.value.upper()}-L{level}]{section_ref} "
 
         if not text or not text.strip():
             continue
@@ -161,7 +225,9 @@ def _docling_result_to_pages(result, chemin: Path) -> list[ParsedPage]:
         if hasattr(item, "prov") and item.prov:
             page_no = item.prov[0].page_no
 
-        pages_content[page_no].append(text.strip())
+        # Ajouter le texte avec ses métadonnées
+        enriched_text = f"{metadata_prefix}{text.strip()}"
+        pages_content[page_no].append(enriched_text)
 
     if not pages_content:
         # Fallback : export markdown complet
@@ -226,6 +292,7 @@ def _parser_pdf_pymupdf(chemin: Path) -> list[ParsedPage]:
                 texte=texte.strip(),
                 source=chemin.name,
                 page=num_page,
+                parser="pymupdf",
             ))
 
     return pages
@@ -347,12 +414,16 @@ def _parser_excel_pandas(chemin: Path) -> list[ParsedPage]:
             # Diviser en blocs de ROWS_PER_BLOCK lignes avec headers répétés
             for i in range(0, len(df), ROWS_PER_BLOCK):
                 bloc = df.iloc[i: i + ROWS_PER_BLOCK]
-                texte = f"# Feuille: {sheet_name} (lignes {i + 1}-{i + len(bloc)})\n\n"
-                texte += bloc.to_markdown(index=False)
+                header = f"# Feuille: {sheet_name} (lignes {i + 1}-{i + len(bloc)})\n\n"
+                prose = _df_to_prose(bloc)
+                texte = header + bloc.to_markdown(index=False)
+                if prose:
+                    texte += "\n\n" + prose
                 pages.append(ParsedPage(
                     texte=texte.strip(),
                     source=f"{chemin.name} (Feuille: {sheet_name})",
                     page=len(pages) + 1,
+                    parser="excel",
                 ))
 
     except Exception as e:

@@ -3,6 +3,8 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from backend.api.dependencies import get_collection_manager
+
 router = APIRouter(prefix="/api/collections", tags=["collections"])
 
 
@@ -28,18 +30,14 @@ class CollectionListResponse(BaseModel):
 @router.get("", response_model=CollectionListResponse)
 async def list_collections() -> CollectionListResponse:
     """List all available collections."""
-    from core.collection_manager import CollectionManager
-
-    cm = CollectionManager()
+    cm = get_collection_manager()
     return CollectionListResponse(collections=cm.lister_collections())
 
 
 @router.post("", response_model=CollectionInfo, status_code=201)
 async def create_collection(request: CollectionCreate) -> CollectionInfo:
     """Create a new collection."""
-    from core.collection_manager import CollectionManager
-
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if cm.collection_existe(request.name):
         raise HTTPException(status_code=409, detail=f"Collection '{request.name}' already exists")
 
@@ -50,9 +48,7 @@ async def create_collection(request: CollectionCreate) -> CollectionInfo:
 @router.get("/{name}", response_model=CollectionInfo)
 async def get_collection(name: str) -> CollectionInfo:
     """Get collection information."""
-    from core.collection_manager import CollectionManager
-
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if not cm.collection_existe(name):
         raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
 
@@ -66,12 +62,53 @@ async def get_collection(name: str) -> CollectionInfo:
     return CollectionInfo(name=name, document_count=count)
 
 
+@router.get("/{name}/chunks")
+async def list_chunks(name: str, offset: int = 0, limit: int = 50) -> dict:
+    """Liste les chunks d'une collection avec pagination."""
+    cm = get_collection_manager()
+    if not cm.collection_existe(name):
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    db = cm.get_collection(name)
+    try:
+        import json as _json
+        total = db._collection.count()
+        result = db._collection.get(
+            include=["documents", "metadatas"],
+            limit=limit,
+            offset=offset,
+        )
+        texts = result.get("documents") or []
+        metas = result.get("metadatas") or []
+
+        chunks = []
+        for text, meta in zip(texts, metas):
+            meta = meta or {}
+            sections_raw = meta.get("hierarchy_parents", "[]")
+            try:
+                sections = _json.loads(sections_raw) if isinstance(sections_raw, str) else sections_raw
+            except Exception:
+                sections = []
+            chunks.append({
+                "source": meta.get("source", "?"),
+                "page": meta.get("page", "?"),
+                "chunk_idx": meta.get("chunk_idx"),
+                "machine": meta.get("machine"),
+                "sections": sections,
+                "content": text,
+                "content_preview": text[:300] if text else "",
+            })
+
+        chunks.sort(key=lambda c: (c["source"], c["chunk_idx"] or 0))
+        return {"total": total, "offset": offset, "limit": limit, "chunks": chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/{name}", status_code=204)
 async def delete_collection(name: str) -> None:
     """Delete a collection."""
-    from core.collection_manager import CollectionManager
-
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if not cm.collection_existe(name):
         raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
 
