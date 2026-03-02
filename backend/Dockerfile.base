@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Image de base ML — à rebuilder UNIQUEMENT quand requirements-ml.txt change.
+#
+# Build :  docker build -f backend/Dockerfile.base -t chatbot-local-ml-base .
+# Puis le Dockerfile principal utilise FROM chatbot-local-ml-base
+#
+# Cette image contient torch + docling + FlagEmbedding (~9GB).
+# Elle n'est jamais modifiée pour de simples changements de code.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libxcb1 \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements-ml.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --user -r requirements-ml.txt
+
+ENV PATH=/root/.local/bin:$PATH

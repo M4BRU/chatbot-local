@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.dependencies import get_settings
-from backend.api.routes import chat_router, collections_router, documents_router, health_router
+from backend.api.routes import chat_router, collections_router, conversations_router, devis_router, documents_router, health_router
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,11 @@ def _warmup_all() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lance le pre-warm Ollama + reranker en arrière-plan au démarrage."""
+    # Init SQLite DBs
+    from backend.api.dependencies import get_conversation_manager, get_catalog_adapter
+    get_conversation_manager().init_db()
+    get_catalog_adapter().init_db()  # creates devis_paniers table
+
     loop = asyncio.get_event_loop()
     logger.info("Démarrage pre-warm modèles (arrière-plan)…")
     loop.run_in_executor(None, _warmup_all)
@@ -107,7 +112,9 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(collections_router)
+app.include_router(conversations_router)
 app.include_router(documents_router)
+app.include_router(devis_router)
 
 
 @app.get("/")

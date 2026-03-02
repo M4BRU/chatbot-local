@@ -1,0 +1,100 @@
+{
+  "documents": {
+    "COMPAQT.pdf": {
+      "sha256": "b5ba101b7178b7c38a2b4dd025219b5f6937aa2b0b6c8a086bad2357b7811781",
+      "date": "2026-02-17T15:19:12.611928",
+      "chunk_ids": [
+        "b93ffacf-d744-4014-b3b9-c2f9ab8fbadf",
+        "745c7128-638f-4da9-8d75-2fa8ee3af57b",
+        "ef1bab1e-fbf7-46c4-8c71-aab6849e2a30",
+        "f6af0176-ba44-4dbc-a041-820bcb4243c6"
+      ],
+      "nb_chunks": 4,
+      "nb_pages": 2
+    },
+    "HYMANCO.pdf": {
+      "sha256": "4b6ab7c2c468a29a7fd2d39bd858785eace2b50e5d9d59e6e606456a7ff3f054",
+      "date": "2026-02-17T15:19:14.266318",
+      "chunk_ids": [
+        "7a117dbc-9114-4e38-9103-7708b3733f35",
+        "ac79d18f-f9d5-4422-8de7-36cb5a5d8973"
+      ],
+      "nb_chunks": 2,
+      "nb_pages": 2
+    },
+    "Plaquette-FR-GEMINI.pdf": {
+      "sha256": "20a66dc8dff1f084d711a61357885649f3de4a0bfb41906d76b8701ce6db06fb",
+      "date": "2026-02-17T15:19:20.030319",
+      "chunk_ids": [
+        "9845709f-029f-44c2-b4d6-509f35ecb427",
+        "11dfe343-7e5d-458f-9049-6a13ac05ccc2",
+        "3204cbb9-fec0-47fa-bffe-5fe9b9be42c9",
+        "e6e844f2-c002-4e5c-b0fe-483ec95e6065",
+        "d5902ab1-b0b1-4c05-bc2d-330db668269c"
+      ],
+      "nb_chunks": 5,
+      "nb_pages": 2
+    },
+    "Preparation_VLM_Response _RFI_SAMC.docx": {
+      "sha256": "b9c2baa84d3647daf1e07d803b15c4941629509378acd6ef62578fa29afcb48d",
+      "date": "2026-02-17T15:19:27.624770",
+      "chunk_ids": [
+        "712d9af6-da6f-4374-80df-47021a0701cd",
+        "ac0f8c27-d592-4033-9fed-77f8dd064070",
+        "743a066b-b2fe-45ff-84de-e7286811609b",
+        "a0d9f239-6270-45e9-a830-2b740c8390ce",
+        "55acbf29-508e-4fb0-96f1-532743ca619a",
+        "b8e47d10-dfe4-413f-959d-4a2fbdab8c14",
+        "9b101627-3bab-4b21-b263-bf3d400c5c4f",
+        "199764bf-e205-440f-bfaf-8ceff0225657",
+        "f0bf8040-69a0-4a7c-a5c1-486d25063a5b",
+        "da9843ad-5424-470b-9623-1f3f00c52594",
+        "5078cfbb-933a-4027-9f7b-196792f82826",
+        "e3812a42-8558-475d-b913-d3453525a557",
+        "0a938059-8c7f-4dc9-bc61-09cd78f7f8be",
+        "b4b72199-6c5f-4872-9ca2-a05a5d99b829",
+        "c52fd14e-835d-4cc4-9215-e60968f246e2",
+        "927d6a0b-d0e8-4722-866a-bd445aa11a50",
+        "11a834e5-c58e-4127-b47c-d11fae2cde6a"
+      ],
+      "nb_chunks": 17,
+      "nb_pages": 1
+    },
+    "SOLO.pdf": {
+      "sha256": "be6e8ce1c7865e7d78b851b0f32ee80e32905c69b7567b1b01bbfa7b5bd30d56",
+      "date": "2026-02-17T15:19:33.056958",
+      "chunk_ids": [
+        "ff5e39d7-5eb9-4d40-9e5d-659543b6b812",
+        "f4712798-5b8c-4601-bf7b-4a27dd5c0e38",
+        "54680414-77e4-43d0-9715-23080dbb4422",
+        "c5007c9a-e095-4b1f-a939-0af8754d0ebe",
+        "ddaebe15-2936-4585-a10a-3fccc5214d89"
+      ],
+      "nb_chunks": 5,
+      "nb_pages": 2
+    },
+    "VLM-Robotics-Synthese-Gamme.md": {
+      "sha256": "082602a4840b649b46a3fa2b3e053f841b98d54eb1a31f9bc1e259a7a5a2d081",
+      "date": "2026-02-17T15:19:42.196624",
+      "chunk_ids": [
+        "6e293745-a0c6-49ca-b87a-ebdf90815a7b",
+        "734164b5-7d2e-411c-bb9b-6238f954d797",
+        "ec248594-3e0e-493f-b7c7-05d20e913bf6",
+        "5fa9d2ce-64cd-4157-a73c-4ddecd9af15e",
+        "39d68d4c-a4dc-43dc-b75f-b7abbaefa870",
+        "452aa8a9-0d58-411f-a504-cc13245448c1",
+        "a825bdbd-8fdb-410a-b5b1-077e0f55d03b",
+        "e661318f-450c-4e0c-9856-fcc242214b9e",
+        "862061a0-27f0-4cae-98c1-665533a608e8",
+        "ee84e208-4da6-4012-a9ee-864f63103352",
+        "f073d20f-8333-4778-ba8f-327eaec3208a",
+        "b6356fad-9293-4722-a647-c43eb41c6c7c",
+        "e96daa14-1209-4ba8-9135-7e1ff7254a33",
+        "de621ca9-2d6e-4f49-80c6-a17514947b40",
+        "ceae3751-874b-4e76-af32-e4647640ff03"
+      ],
+      "nb_chunks": 15,
+      "nb_pages": 1
+    }
+  }
+}

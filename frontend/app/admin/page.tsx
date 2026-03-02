@@ -20,6 +20,8 @@ export default function AdminPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const [message, setMessage] = useState<{ type: "success" | "error" | "warning"; text: string } | null>(null);
+  const [catalogStatus, setCatalogStatus] = useState<{ loaded: boolean; rows: number; unique_postes: number } | null>(null);
+  const [catalogUploading, setCatalogUploading] = useState(false);
 
   // Fetch collections
   const fetchCollections = async () => {
@@ -43,8 +45,19 @@ export default function AdminPage() {
     }
   };
 
+  const fetchCatalogStatus = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/catalog/status`);
+      const data = await res.json();
+      setCatalogStatus({ loaded: data.loaded, rows: data.rows, unique_postes: data.unique_postes ?? 0 });
+    } catch {
+      setCatalogStatus(null);
+    }
+  };
+
   useEffect(() => {
     fetchCollections();
+    fetchCatalogStatus();
   }, []);
 
   useEffect(() => {
@@ -152,6 +165,30 @@ export default function AdminPage() {
     }
   };
 
+  // Upload catalog Excel
+  const handleCatalogUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setCatalogUploading(true);
+    setMessage(null);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/catalog/upload`, { method: "POST", body: formData });
+      const data = await res.json();
+      if (res.ok) {
+        setMessage({ type: "success", text: `Catalogue chargé : ${data.rows} lignes · ${data.unique_postes ?? 0} postes distincts détectés` });
+        fetchCatalogStatus();
+      } else {
+        setMessage({ type: "error", text: data.detail || "Erreur upload catalogue" });
+      }
+    } catch {
+      setMessage({ type: "error", text: "Erreur de connexion" });
+    }
+    setCatalogUploading(false);
+    e.target.value = "";
+  };
+
   // Delete document
   const handleDeleteDocument = async (docName: string) => {
     if (!selectedCollection || !confirm(`Supprimer "${docName}" ?`)) return;
@@ -189,6 +226,40 @@ export default function AdminPage() {
             {message.text}
           </div>
         )}
+
+        {/* Catalogue Devis */}
+        <div className="bg-white rounded-lg shadow p-6 mb-6">
+          <h2 className="text-lg font-semibold mb-1">Catalogue — Mode Devis</h2>
+          <p className="text-sm text-gray-500 mb-4">
+            Fichier Excel (.xlsx/.xls) utilisé pour la recherche de postes et l&apos;enrichissement prix/fournisseur dans le mode Devis.
+          </p>
+          <div className="flex items-center gap-4">
+            <label className="flex-1">
+              <input
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={handleCatalogUpload}
+                disabled={catalogUploading}
+                className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100 disabled:opacity-50"
+              />
+            </label>
+            {catalogStatus && (
+              <div className="flex items-center gap-2">
+                <span className={`text-sm font-medium px-3 py-1.5 rounded-full ${catalogStatus.loaded ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-500"}`}>
+                  {catalogStatus.loaded ? `✓ ${catalogStatus.rows} lignes chargées` : "Non chargé"}
+                </span>
+                {catalogStatus.loaded && catalogStatus.unique_postes > 0 && (
+                  <span className="text-sm font-medium px-3 py-1.5 rounded-full bg-blue-100 text-blue-700">
+                    {catalogStatus.unique_postes} postes distincts
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+          {catalogUploading && (
+            <p className="text-sm text-blue-600 mt-2">Chargement en cours…</p>
+          )}
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {/* Collections Panel */}
