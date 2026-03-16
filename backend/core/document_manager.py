@@ -31,6 +31,16 @@ CHUNK_SIZE_TOKENS = int(os.environ.get("CHUNK_SIZE_TOKENS", "450"))
 CHUNK_OVERLAP_TOKENS = int(os.environ.get("CHUNK_OVERLAP_TOKENS", "67"))  # ~15%
 MAX_CHUNK_TOKENS = 490  # seuil de protection (< 512 limite modèle)
 
+# ── Parent/Child chunking (Group B, opt-in) ────────────────────────────────────
+# Child : petit chunk précis pour l'embedding et le retrieval
+# Parent : section plus large envoyée au LLM (meilleur contexte)
+# Le LLM reçoit le parent, l'embedding se fait sur le child.
+USE_PARENT_CHILD = os.environ.get("USE_PARENT_CHILD", "false").lower() == "true"
+CHILD_CHUNK_SIZE_TOKENS = int(os.environ.get("CHILD_CHUNK_SIZE_TOKENS", "250"))
+CHILD_CHUNK_OVERLAP_TOKENS = int(os.environ.get("CHILD_CHUNK_OVERLAP_TOKENS", "37"))   # ~15%
+PARENT_CHUNK_SIZE_TOKENS = int(os.environ.get("PARENT_CHUNK_SIZE_TOKENS", "1000"))
+PARENT_CHUNK_OVERLAP_TOKENS = int(os.environ.get("PARENT_CHUNK_OVERLAP_TOKENS", "100"))  # ~10%
+
 # Modèle HuggingFace pour le tokenizer (doit correspondre à OLLAMA_EMBED_MODEL)
 _EMBED_HF_MODEL = os.environ.get("EMBED_HF_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
 
@@ -67,6 +77,35 @@ SEMANTIC_BREAKPOINT_THRESHOLD = int(os.environ.get("SEMANTIC_BREAKPOINT_THRESHOL
 # Répertoire de stockage des metadata (séparé de ChromaDB)
 METADATA_DIR = Path(os.environ.get("METADATA_DIR", "./documents_metadata"))
 
+# ── Pipeline versioning ────────────────────────────────────────────────────────
+# Version du parser — bumper manuellement si changement majeur (nouveau format, algo chunking)
+PARSER_VERSION = "v2"
+
+# Sévérité selon le paramètre modifié
+_REQUIRED_KEYS = {"embed_model"}           # vecteurs incompatibles → ré-indexation obligatoire
+_RECOMMENDED_KEYS = {"use_parent_child", "use_contextual", "use_semantic_chunking"}
+_OPTIONAL_KEYS = {"docling_table_mode", "parser_version"}
+
+
+def build_pipeline_fingerprint() -> dict:
+    """
+    Construit le fingerprint du pipeline d'indexation actuel.
+    Retourne {"hash": "a3f8c91d", "config": {...}}
+    Le hash est un SHA256[:8] de la config JSON sérialisée (sort_keys=True).
+    """
+    config = {
+        "embed_model": _EMBED_HF_MODEL,
+        "use_parent_child": USE_PARENT_CHILD,
+        "use_contextual": USE_CONTEXTUAL_RETRIEVAL,
+        "use_semantic_chunking": USE_SEMANTIC_CHUNKING,
+        "docling_table_mode": os.environ.get("DOCLING_TABLE_MODE", "fast"),
+        "parser_version": PARSER_VERSION,
+    }
+    config_str = json.dumps(config, sort_keys=True)
+    pipeline_hash = hashlib.sha256(config_str.encode()).hexdigest()[:8]
+    return {"hash": pipeline_hash, "config": config}
+
+
 # ── Contextual Retrieval ──────────────────────────────────────────────────────
 # Enrichit chaque chunk avec son contexte dans le document avant indexation.
 # Réduit les erreurs de retrieval de ~67% (technique Anthropic).
@@ -88,6 +127,68 @@ _CONTEXTUAL_PROMPT = (
     "Génère en 1-2 phrases le contexte de cet extrait : quelle machine est concernée, "
     "quel sujet ou quelle section. Réponds uniquement avec ce contexte, sans introduction."
 )
+
+
+# Regex pour détecter les labels structurels Docling en début de ligne
+_RE_DOCLING_LABEL = re.compile(
+    r'^\[(?P<type>[A-Z_]+)-L\d+\]\s*(?:\[[^\]]{0,150}\]\s*)?',
+    re.IGNORECASE,
+)
+
+# Regex pour les frontières de sections L1 et L2 (section-aware parent chunking)
+# Lookahead zero-width : conserve le label dans chaque section après split
+_RE_SECTION_L1 = re.compile(r'(?=^\[(?:SECTION|TITRE)-L1\])', re.IGNORECASE | re.MULTILINE)
+_RE_SECTION_L2 = re.compile(r'(?=^\[(?:SECTION|TITRE)-L2\])', re.IGNORECASE | re.MULTILINE)
+
+
+def _nettoyer_labels_docling(texte: str) -> str:
+    """
+    Supprime les labels structurels Docling du texte pour optimiser les tokens.
+
+    - [SECTION-L1] TITRE         → TITRE
+    - [TEXT-L1][breadcrumb] txt  → txt
+    - [LIST_ITEM-L2][bc] - item  → - item
+    - [TABLE-L1] contenu         → [Tableau]\ncontenu
+    - Autres labels              → texte résiduel conservé
+
+    La breadcrumb Docling (ex: [Notre offre est basée...]) est toujours supprimée
+    car couverte par le préfixe section + contextual retrieval.
+    """
+    lignes = texte.split('\n')
+    cleaned = []
+    for ligne in lignes:
+        stripped = ligne.strip()
+        m = _RE_DOCLING_LABEL.match(stripped)
+        if not m:
+            cleaned.append(ligne)
+            continue
+        label_type = m.group('type').upper()
+        reste = stripped[m.end():].strip()
+        if 'TABLE' in label_type:
+            cleaned.append('[Tableau]')
+            if reste:
+                cleaned.append(reste)
+        elif reste:
+            cleaned.append(reste)
+    result = '\n'.join(cleaned)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
+
+def _preparer_texte_chunk(texte: str, hierarchy_parents: list[str] | None = None) -> str:
+    """
+    Pipeline commune children ET parent :
+      1. Supprime les labels Docling ([SECTION-L1], [TEXT-L1], etc.)
+      2. Ajoute le préfixe [Section: ...] si hierarchy_parents fourni (children uniquement)
+
+    Parents : appelé sans hierarchy_parents → label cleaning seulement.
+    Children : appelé avec hierarchy_parents → label cleaning + section prefix.
+    """
+    texte_propre = _nettoyer_labels_docling(texte)
+    if hierarchy_parents:
+        section = " > ".join(hierarchy_parents)
+        return f"[Section: {section}]\n{texte_propre}"
+    return texte_propre
 
 
 def _construire_hierarchie_parents(tous_morceaux_avec_page: list) -> list[list[str]]:
@@ -116,7 +217,8 @@ def _construire_hierarchie_parents(tous_morceaux_avec_page: list) -> list[list[s
                 label_type, niveau_str, titre_text = match.groups()
                 niveau = int(niveau_str)
                 titre_clean = titre_text.strip()
-                if len(titre_clean) > 3:
+                # Valider que c'est un vrai titre (pas une phrase mislabellisée par Docling)
+                if len(titre_clean) > 3 and _is_potential_title(titre_clean, 0, 1):
                     nouveau_titre = titre_clean
                     nouveau_niveau = niveau
                     break
@@ -139,6 +241,63 @@ def _construire_hierarchie_parents(tous_morceaux_avec_page: list) -> list[list[s
         hierarchies.append(parents_actuels)
 
     return hierarchies
+
+
+def _split_par_sections(texte: str, max_tokens: int = PARENT_CHUNK_SIZE_TOKENS) -> list[str]:
+    """
+    Découpe le texte aux frontières de sections Docling (section-aware parent chunking).
+
+    Algorithme hiérarchique L1 → L2 → RecursiveSplitter :
+      1. Coupe aux [SECTION-L1] / [TITRE-L1]
+      2. Section L1 > max_tokens ET contient [SECTION-L2] → coupe aux L2
+      3. Section L1 > max_tokens ET pas de L2 → RecursiveSplitter (overlap=0)
+
+    Retourne [] si aucun label L1 détecté → fallback RecursiveSplitter dans l'appelant.
+    Retourne du texte RAW (labels conservés) pour compatibilité avec
+    _construire_hierarchie_parents() qui nécessite [SECTION-L1] pour les breadcrumbs.
+    """
+    if not _RE_SECTION_L1.search(texte):
+        return []
+
+    # Étape 1 : split aux frontières L1
+    sections_l1 = [s.strip() for s in _RE_SECTION_L1.split(texte) if s.strip()]
+    if not sections_l1:
+        return []
+
+    _sous_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_tokens,
+        chunk_overlap=0,
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=_count_tokens,
+    )
+
+    resultat: list[str] = []
+    for section in sections_l1:
+        taille = _count_tokens(section)
+        if taille <= max_tokens:
+            # Section OK telle quelle
+            resultat.append(section)
+        elif _RE_SECTION_L2.search(section):
+            # Étape 2 : section trop grande ET contient des L2 → split aux L2
+            sous_sections = [s.strip() for s in _RE_SECTION_L2.split(section) if s.strip()]
+            for ss in sous_sections:
+                if _count_tokens(ss) > max_tokens:
+                    # L2 elle-même trop grande → RecursiveSplitter
+                    resultat.extend(_sous_splitter.split_text(ss))
+                else:
+                    resultat.append(ss)
+            logger.debug(
+                f"Section L1 {taille}t → {len(sous_sections)} sous-sections L2"
+            )
+        else:
+            # Étape 3 : section trop grande sans L2 → RecursiveSplitter
+            sous = _sous_splitter.split_text(section)
+            resultat.extend(sous)
+            logger.debug(
+                f"Section L1 {taille}t sans L2 → {len(sous)} chunks RecursiveSplitter"
+            )
+
+    return resultat
 
 
 def _enrichir_chunk_contexte(chunk: str, document_complet: str) -> str:
@@ -452,21 +611,66 @@ class DocumentManager:
         if USE_CONTEXTUAL_RETRIEVAL:
             document_complet = "\n\n".join(p.texte for p in pages)
 
-        # Collecter tous les morceaux de toutes les pages d'abord
-        morceaux_par_page: list[tuple[object, list[str]]] = []
-        for page in pages:
-            morceaux = self.splitter.split_text(page.texte)
-            # Protection : re-découpe tout chunk dépassant MAX_CHUNK_TOKENS (< 512 limite mxbai).
-            # Appliqué toujours (SemanticChunker ET RecursiveCharacterTextSplitter peuvent
-            # produire des chunks trop grands sur du texte technique dense sans séparateur).
-            morceaux_proteges = []
-            for m in morceaux:
-                if _count_tokens(m) > MAX_CHUNK_TOKENS:
-                    morceaux_proteges.extend(self._recursive_splitter.split_text(m))
+        # ── Parent/child chunking (USE_PARENT_CHILD=true) ────────────────────────
+        # Child : 250 tokens pour l'embedding/retrieval précis
+        # Parent : 1000 tokens envoyé au LLM comme contexte (stocké dans metadata du child)
+        # Quand désactivé : chunking standard (450 tokens).
+        parent_info_flat: list[tuple[str, str]] = []  # [(parent_id, parent_text), ...] indexé comme tous_raw
+
+        if USE_PARENT_CHILD:
+            _child_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=CHILD_CHUNK_SIZE_TOKENS,
+                chunk_overlap=CHILD_CHUNK_OVERLAP_TOKENS,
+                separators=["\n\n", "\n", ". ", " ", ""],
+                length_function=_count_tokens,
+            )
+            _parent_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=PARENT_CHUNK_SIZE_TOKENS,
+                chunk_overlap=PARENT_CHUNK_OVERLAP_TOKENS,
+                separators=["\n\n", "\n", ". ", " ", ""],
+                length_function=_count_tokens,
+            )
+            morceaux_par_page: list[tuple[object, list[str]]] = []
+            nb_parents_total = 0
+            for page in pages:
+                sections = _split_par_sections(page.texte, PARENT_CHUNK_SIZE_TOKENS)
+                if sections:
+                    parents = sections
                 else:
-                    morceaux_proteges.append(m)
-            morceaux = morceaux_proteges
-            morceaux_par_page.append((page, morceaux))
+                    # Fallback : pas de labels Docling (PyMuPDF, TXT, DOCX sans structure)
+                    parents = _parent_splitter.split_text(page.texte)
+                    logger.debug(f"Page {page.page} : fallback RecursiveSplitter (pas de labels L1)")
+                nb_parents_total += len(parents)
+                page_morceaux: list[str] = []
+                for parent_text in parents:
+                    p_id = str(uuid.uuid4())
+                    children = _child_splitter.split_text(parent_text) or [parent_text]
+                    parent_text_clean = _preparer_texte_chunk(parent_text)
+                    for child_text in children:
+                        page_morceaux.append(child_text)
+                        parent_info_flat.append((p_id, parent_text_clean))
+                morceaux_par_page.append((page, page_morceaux))
+            logger.info(
+                f"Parent/child chunking (section-aware) : "
+                f"{sum(len(m) for _, m in morceaux_par_page)} children "
+                f"issus de {nb_parents_total} parents"
+            )
+        else:
+            # Collecter tous les morceaux de toutes les pages d'abord
+            morceaux_par_page: list[tuple[object, list[str]]] = []
+            for page in pages:
+                morceaux = self.splitter.split_text(page.texte)
+                # Protection : re-découpe tout chunk dépassant MAX_CHUNK_TOKENS (< 512 limite mxbai).
+                # Appliqué toujours (SemanticChunker ET RecursiveCharacterTextSplitter peuvent
+                # produire des chunks trop grands sur du texte technique dense sans séparateur).
+                morceaux_proteges = []
+                for m in morceaux:
+                    if _count_tokens(m) > MAX_CHUNK_TOKENS:
+                        morceaux_proteges.extend(self._recursive_splitter.split_text(m))
+                    else:
+                        morceaux_proteges.append(m)
+                morceaux = morceaux_proteges
+                morceaux_par_page.append((page, morceaux))
 
         # ── chunk_idx + has_continuation ──────────────────────────────────────
         # Calculé sur le texte RAW (avant enrichissement contextuel) :
@@ -487,7 +691,21 @@ class DocumentManager:
             else:
                 continuation_flags.append(False)
 
-        # Enrichissement contextuel en parallèle si activé
+        # ── Hiérarchie sur morceaux RAW (avant nettoyage) ─────────────────────
+        # _construire_hierarchie_parents détecte les titres via les labels Docling
+        # ([SECTION-L1], [TITRE-L1]…) — doit tourner AVANT le nettoyage des labels.
+        tous_raw_hierarchie = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
+        hierarchies = _construire_hierarchie_parents(tous_raw_hierarchie)
+
+        # ── Nettoyage labels avant enrichissement contextuel ──────────────────
+        # Les labels sont supprimés ici pour que le LLM contextuel reçoive du
+        # texte propre → résumé contextuel sans [SECTION-L1] ni [TEXT-L1].
+        morceaux_par_page = [
+            (page, [_nettoyer_labels_docling(m) for m in morceaux])
+            for page, morceaux in morceaux_par_page
+        ]
+
+        # ── Enrichissement contextuel en parallèle si activé ──────────────────
         if USE_CONTEXTUAL_RETRIEVAL and document_complet:
             tous_morceaux = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
             nb_total = len(tous_morceaux)
@@ -495,8 +713,6 @@ class DocumentManager:
                 f"Contextual retrieval : {nb_total} chunks à enrichir "
                 f"({CONTEXTUAL_MAX_WORKERS} workers parallèles)…"
             )
-            # Dispatch parallèle — même principe qu'un compute shader :
-            # chaque worker traite un chunk indépendamment, on collecte dans l'ordre d'origine
             enrichis: dict[int, str] = {}
             with ThreadPoolExecutor(max_workers=CONTEXTUAL_MAX_WORKERS) as executor:
                 futures = {
@@ -508,7 +724,6 @@ class DocumentManager:
                 for future in as_completed(futures):
                     enrichis[futures[future]] = future.result()
 
-            # Reconstruire morceaux_par_page avec les chunks enrichis dans le bon ordre
             idx = 0
             morceaux_par_page_enrichis: list[tuple[object, list[str]]] = []
             for page, morceaux in morceaux_par_page:
@@ -518,31 +733,37 @@ class DocumentManager:
             morceaux_par_page = morceaux_par_page_enrichis
             logger.info(f"Contextual retrieval terminé : {nb_total} chunks enrichis")
 
-        # Construire la hiérarchie des parents pour chaque chunk
-        tous_morceaux_avec_page = [(page, morceau) for page, morceaux in morceaux_par_page for morceau in morceaux]
-        hierarchies = _construire_hierarchie_parents(tous_morceaux_avec_page)
-
+        fingerprint = build_pipeline_fingerprint()
         chunk_global_idx = 0
         for page, morceaux in morceaux_par_page:
             for morceau in morceaux:
                 cid = str(uuid.uuid4())
                 chunk_ids.append(cid)
-                textes.append(morceau)
 
                 # Récupérer la hiérarchie de ce chunk
                 hierarchy_parents = hierarchies[chunk_global_idx]
+
+                textes.append(_preparer_texte_chunk(morceau, hierarchy_parents or None))
 
                 metadata_chunk = {
                     "source": page.source,
                     "page":   page.page,
                     "chunk_idx": chunk_global_idx,
                     "has_continuation": continuation_flags[chunk_global_idx],
+                    "pipeline_hash": fingerprint["hash"],
                     **meta_fichier,
                 }
 
                 # Sérialiser hierarchy_parents en JSON string — ChromaDB refuse les listes
                 if hierarchy_parents:
                     metadata_chunk["hierarchy_parents"] = json.dumps(hierarchy_parents)
+
+                # B3 — parent/child : stocker parent_text + parent_id dans les metadata du child
+                if parent_info_flat and chunk_global_idx < len(parent_info_flat):
+                    p_id, p_text = parent_info_flat[chunk_global_idx]
+                    metadata_chunk["parent_id"] = p_id
+                    metadata_chunk["parent_text"] = p_text
+                    metadata_chunk["chunk_level"] = "child"
 
                 metadonnees.append(metadata_chunk)
                 chunk_global_idx += 1
@@ -568,7 +789,9 @@ class DocumentManager:
             "chunk_ids": chunk_ids,
             "nb_chunks": len(chunk_ids),
             "nb_pages": len(pages),
+            "pipeline_hash": fingerprint["hash"],
         }
+        metadata["pipeline"] = fingerprint  # top-level : lecture rapide sans scanner tous les docs
         self._sauvegarder_metadata(nom_collection, metadata)
 
         # Détecter si un fallback parser a été utilisé (pas de labels structurels)
@@ -621,3 +844,66 @@ class DocumentManager:
                 "sha256": info.get("sha256", ""),
             })
         return docs
+
+    def verifier_versions_toutes_collections(self) -> list[dict]:
+        """
+        Compare le pipeline actuel avec celui stocké dans chaque collection.
+        Lit uniquement les metadata.json (pas la vector DB — instantané).
+
+        Retourne une liste :
+          {"name", "status": "ok"|"stale"|"unknown",
+           "severity": None|"required"|"recommended"|"optional",
+           "changed": [...keys...],
+           "hash_stored": str|None, "hash_current": str}
+        """
+        current = build_pipeline_fingerprint()
+        result = []
+
+        for nom in self.cm.lister_collections():
+            meta = self._charger_metadata(nom)
+            stored = meta.get("pipeline")
+
+            if not stored:
+                result.append({
+                    "name": nom,
+                    "status": "unknown",
+                    "severity": None,
+                    "changed": [],
+                    "hash_stored": None,
+                    "hash_current": current["hash"],
+                })
+                continue
+
+            if stored["hash"] == current["hash"]:
+                result.append({
+                    "name": nom,
+                    "status": "ok",
+                    "severity": None,
+                    "changed": [],
+                    "hash_stored": stored["hash"],
+                    "hash_current": current["hash"],
+                })
+                continue
+
+            # Calcul de la sévérité
+            config_stored = stored.get("config", {})
+            config_current = current["config"]
+            changed = [k for k in config_current if config_current.get(k) != config_stored.get(k)]
+
+            if any(k in _REQUIRED_KEYS for k in changed):
+                severity = "required"
+            elif any(k in _RECOMMENDED_KEYS for k in changed):
+                severity = "recommended"
+            else:
+                severity = "optional"
+
+            result.append({
+                "name": nom,
+                "status": "stale",
+                "severity": severity,
+                "changed": changed,
+                "hash_stored": stored["hash"],
+                "hash_current": current["hash"],
+            })
+
+        return result

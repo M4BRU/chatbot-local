@@ -1,0 +1,26 @@
+# Dépendances infrastructure — C/Rust natif, sans torch.
+# Rebuild: docker build -f backend/Dockerfile.base -t chatbot-local-ml-base .
+# Temps estimé (cold) : 5–10 min (Layer 1 ML resté en cache)
+
+# Vector databases
+chromadb>=1.0.0           # Rust extension + onnxruntime (C++)
+qdrant-client>=1.7.0      # grpcio (C++)
+
+# LangChain integrations (pulls leur vector DB respective)
+langchain-chroma>=0.2.0
+langchain-ollama>=0.3.0
+langchain-qdrant>=0.2.0
+langchain-text-splitters>=0.3.0
+langchain-experimental>=0.3.0
+
+# Document parsing (C/C++ extensions)
+pymupdf4llm>=0.0.17       # PyMuPDF → MuPDF (C/C++)
+
+# Data manipulation
+pandas>=2.2.0             # numpy (C extension)
+openpyxl>=3.1.0           # xlsx (pure Python mais stable, placé ici)
+xlrd>=2.0.0               # xls (pure Python mais stable)
+
+# Search
+rank-bm25>=0.2.2          # Pure Python mais stable, jamais changé
+nltk>=3.9.0               # Pure Python mais stable

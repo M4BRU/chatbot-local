@@ -63,36 +63,34 @@ def _norm(name: str) -> str:
     return name.strip().lower().replace(" ", "_").replace("-", "_")
 
 
-# ── In-memory BM25 catalog index ───────────────────────────────────────────────
+# ── Per-column BM25 indexes ────────────────────────────────────────────────────
 
-class _CatalogBM25Index:
-    """BM25 index over catalog rows for stemmed full-text search."""
+class _CatalogBM25Indexes:
+    """One BM25 index per searchable column.
+
+    Searching a specific column (e.g. nom_poste) only scores against that
+    column's text — no cross-column noise (e.g. 'armoire' in elements no
+    longer pollutes a nom_poste search).
+    """
 
     def __init__(self, rows: list[dict]) -> None:
         from rank_bm25 import BM25Okapi
 
         self._rows = rows
-        texts = [
-            " ".join(
-                str(r.get(c) or "")
-                for c in _FTS_COLS
-            )
-            for r in rows
-        ]
-        tokenized = [_tokenize(t) for t in texts]
-        self._bm25 = BM25Okapi(tokenized)
+        self._indexes: dict[str, Any] = {}
+        for col in _FTS_COLS:
+            texts = [str(r.get(col) or "") for r in rows]
+            tokenized = [_tokenize(t) for t in texts]
+            self._indexes[col] = BM25Okapi(tokenized)
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
+    def search(self, query: str, column: str = "nom_poste", limit: int = 10) -> list[dict]:
+        bm25 = self._indexes.get(column) or self._indexes.get("nom_poste")
         tokens = _tokenize(query)
-        scores = self._bm25.get_scores(tokens)
+        scores = bm25.get_scores(tokens)
         ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        # Relative threshold: only keep results with score >= 30% of the best score.
-        # This prevents weakly-related items (score near 0) from appearing in results.
-        max_score = scores[ranked[0]] if ranked else 0
-        min_threshold = max_score * 0.50 if max_score > 0 else 0
         results = []
         for idx in ranked[:limit]:
-            if scores[idx] > 0 and scores[idx] >= min_threshold:
+            if scores[idx] > 0:
                 results.append(self._rows[idx])
         return results
 
@@ -100,7 +98,7 @@ class _CatalogBM25Index:
 class CatalogAdapter:
     def __init__(self, db_path: Path = CATALOG_DB_PATH) -> None:
         self.db_path = db_path
-        self._bm25_index: _CatalogBM25Index | None = None
+        self._bm25_indexes: _CatalogBM25Indexes | None = None
 
     # ── Startup ────────────────────────────────────────────────────────────────
 
@@ -130,11 +128,30 @@ class CatalogAdapter:
                     created_at      TEXT NOT NULL
                 )
             """)
+            # Devis settings: global coefficient + coef_final per conversation
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS devis_settings (
+                    conversation_id TEXT PRIMARY KEY,
+                    coefficient      REAL DEFAULT 0.0,
+                    coef_final       REAL DEFAULT 0.0
+                )
+            """)
+            # Task list: ordered list of postes the LLM planned to add
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS devis_task_lists (
+                    conversation_id TEXT PRIMARY KEY,
+                    tasks           TEXT NOT NULL DEFAULT '[]'
+                )
+            """)
             # Migrations: add columns if upgrading from older schema
             for _migration in [
                 "ALTER TABLE devis_paniers ADD COLUMN num_poste TEXT",
                 "ALTER TABLE devis_paniers ADD COLUMN item_type TEXT NOT NULL DEFAULT 'poste'",
                 "ALTER TABLE devis_affaire_locks ADD COLUMN search_all INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE devis_paniers ADD COLUMN nbre_jours_etude   INTEGER DEFAULT 0",
+                "ALTER TABLE devis_paniers ADD COLUMN nbre_jours_atelier INTEGER DEFAULT 0",
+                "ALTER TABLE devis_paniers ADD COLUMN nbre_jours_client  INTEGER DEFAULT 0",
+                "ALTER TABLE devis_paniers ADD COLUMN is_option          INTEGER DEFAULT 0",
             ]:
                 try:
                     conn.execute(_migration)
@@ -180,6 +197,71 @@ class CatalogAdapter:
             ).fetchone()
             return bool(row and row[0])
 
+    # ── Task list (multi-poste planning) ──────────────────────────────────────
+
+    def set_task_list(self, conversation_id: str, items: list[str]) -> None:
+        """Store the LLM's planned task list (list of poste queries to add)."""
+        import json
+        tasks = [{"query": q, "done": False} for q in items]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO devis_task_lists (conversation_id, tasks)
+                VALUES (?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET tasks = excluded.tasks
+                """,
+                [conversation_id, json.dumps(tasks, ensure_ascii=False)],
+            )
+            conn.commit()
+
+    def get_task_list(self, conversation_id: str) -> list[dict]:
+        """Return the task list [{query, done}, ...] or [] if none."""
+        import json
+        if not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT tasks FROM devis_task_lists WHERE conversation_id = ?",
+                [conversation_id],
+            ).fetchone()
+            if not row:
+                return []
+            try:
+                return json.loads(row[0]) or []
+            except Exception:
+                return []
+
+    def complete_task_item(self, conversation_id: str, nom_poste: str) -> None:
+        """Mark the first pending task whose query matches nom_poste as done."""
+        import json, re as _re
+        tasks = self.get_task_list(conversation_id)
+        if not tasks:
+            return
+        nom_words = set(_re.findall(r"\w{3,}", nom_poste.lower()))
+        for task in tasks:
+            if task.get("done"):
+                continue
+            q_words = set(_re.findall(r"\w{3,}", task["query"].lower()))
+            # Match if any query word appears in nom_poste or vice-versa
+            if nom_words & q_words:
+                task["done"] = True
+                break
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE devis_task_lists SET tasks = ? WHERE conversation_id = ?",
+                [json.dumps(tasks, ensure_ascii=False), conversation_id],
+            )
+            conn.commit()
+
+    def clear_task_list(self, conversation_id: str) -> None:
+        """Remove the task list for a conversation."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM devis_task_lists WHERE conversation_id = ?",
+                [conversation_id],
+            )
+            conn.commit()
+
     # ── Excel loading ──────────────────────────────────────────────────────────
 
     def load_from_excel(self, excel_path: Path) -> dict:
@@ -215,13 +297,13 @@ class CatalogAdapter:
                 )
             conn.commit()
 
-        # Build in-memory BM25 index (handles plurals via Snowball stemmer)
+        # Build per-column BM25 indexes (one index per searchable column)
         rows = df.to_dict(orient="records")
         try:
-            self._bm25_index = _CatalogBM25Index(rows)
-            logger.info("BM25 catalogue : index construit (%d lignes)", len(rows))
+            self._bm25_indexes = _CatalogBM25Indexes(rows)
+            logger.info("BM25 catalogue : index par colonne construit (%d lignes)", len(rows))
         except Exception as exc:
-            self._bm25_index = None
+            self._bm25_indexes = None
             logger.warning("BM25 catalogue indisponible (%s) — fallback FTS5/LIKE", exc)
 
         # Count unique nom_poste values (col G from row 2)
@@ -239,38 +321,38 @@ class CatalogAdapter:
         }
 
     def _rebuild_bm25_if_needed(self) -> None:
-        """Rebuild BM25 index from SQLite if not in memory (e.g. after server restart)."""
-        if self._bm25_index is not None or not self.db_path.exists():
+        """Rebuild per-column BM25 indexes from SQLite if not in memory (e.g. after server restart)."""
+        if self._bm25_indexes is not None or not self.db_path.exists():
             return
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = [dict(r) for r in conn.execute("SELECT * FROM catalogue").fetchall()]
             if rows:
-                self._bm25_index = _CatalogBM25Index(rows)
+                self._bm25_indexes = _CatalogBM25Indexes(rows)
                 logger.info("BM25 catalogue : index reconstruit depuis SQLite (%d lignes)", len(rows))
         except Exception as exc:
             logger.warning("BM25 catalogue : reconstruction échouée (%s)", exc)
 
     # ── Search ─────────────────────────────────────────────────────────────────
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
+    def search(self, query: str, limit: int = 10, column: str = "nom_poste") -> list[dict]:
         """
-        Search catalog rows using BM25 (Snowball-stemmed, handles plurals).
-        Falls back to SQLite FTS5, then LIKE if BM25 index is unavailable.
+        Search catalog rows using per-column BM25 (Snowball-stemmed, handles plurals).
+        Searches only in the specified column — no cross-column noise.
+        Falls back to SQLite FTS5, then LIKE if BM25 indexes are unavailable.
         """
         if not self.db_path.exists():
             return []
 
-        # ── Priority 1: BM25 (stemmed — handles plurals like orbiteurs/orbiteur) ──
+        # ── Priority 1: per-column BM25 ────────────────────────────────────────
         self._rebuild_bm25_if_needed()
-        if self._bm25_index is not None:
-            results = self._bm25_index.search(query, limit=limit)
+        if self._bm25_indexes is not None:
+            results = self._bm25_indexes.search(query, column=column, limit=limit)
             if results:
-                logger.debug("search_catalog BM25 → %d résultats pour %r", len(results), query)
+                logger.info("search BM25[%s] → %d résultats pour %r", column, len(results), query)
                 return results
-            # No BM25 hits (all scores = 0) → fall through to FTS5/LIKE
-            logger.debug("search_catalog BM25 score=0 pour %r — fallback FTS5", query)
+            logger.debug("search BM25[%s] score=0 pour %r — fallback FTS5", column, query)
 
         # ── Priority 2: FTS5 (exact token match, no stemming) ─────────────────
         with sqlite3.connect(self.db_path) as conn:
@@ -280,14 +362,14 @@ class CatalogAdapter:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='catalogue_fts'"
             ).fetchone()
 
-            if fts_ok:
+            if fts_ok and column in _FTS_COLS:
                 try:
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT c.*
                         FROM   catalogue c
                         JOIN   catalogue_fts fts ON c.rowid = fts.row_id
-                        WHERE  catalogue_fts MATCH ?
+                        WHERE  fts.{column} MATCH ?
                         ORDER  BY rank
                         LIMIT  ?
                         """,
@@ -298,20 +380,19 @@ class CatalogAdapter:
                 except sqlite3.OperationalError:
                     pass
 
-            # ── Priority 3: LIKE fallback ──────────────────────────────────────
-            pattern = f"%{query}%"
-            available = [
-                r[1]
+            # ── Priority 3: LIKE fallback on the target column only ────────────
+            col_exists = any(
+                r[1] == column
                 for r in conn.execute("PRAGMA table_info(catalogue)").fetchall()
-                if r[1] in _FTS_COLS
-            ]
-            if not available:
+            )
+            if not col_exists:
                 return []
-
-            conditions = " OR ".join(f'"{c}" LIKE ?' for c in available)
+            # Use Snowball stem for LIKE to handle plurals (armoir% → armoire/armoires)
+            stem = _tokenize(query)
+            pattern = f"%{stem[0]}%" if stem else f"%{query}%"
             rows = conn.execute(
-                f"SELECT * FROM catalogue WHERE {conditions} LIMIT ?",
-                [pattern] * len(available) + [limit],
+                f'SELECT * FROM catalogue WHERE "{column}" LIKE ? LIMIT ?',
+                [pattern, limit],
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -504,7 +585,10 @@ class CatalogAdapter:
                 "SELECT * FROM devis_paniers WHERE conversation_id = ? ORDER BY created_at",
                 [conversation_id],
             ).fetchall()
-            return [dict(r) for r in rows]
+            result = [dict(r) for r in rows]
+            for item in result:
+                item["is_option"] = bool(item.get("is_option", 0))
+            return result
 
     def add_to_panier(self, conversation_id: str, postes: list[dict]) -> dict:
         """
@@ -525,6 +609,13 @@ class CatalogAdapter:
 
         seen_in_call: set[str] = set()
 
+        # Build set of nom_postes already in the panier (case-insensitive) to prevent duplicates
+        existing_panier = self.get_panier(conversation_id)
+        already_in_panier: set[str] = {
+            (p.get("nom_poste") or "").strip().lower()
+            for p in existing_panier
+        }
+
         with sqlite3.connect(self.db_path) as conn:
             for poste in postes:
                 # Defensive: LLM occasionally sends a plain string instead of a dict.
@@ -542,12 +633,15 @@ class CatalogAdapter:
                     continue
 
                 # Safety: skip duplicate nom_poste within the same add_to_panier call.
-                # The catalog has multiple rows per poste (one per element/sub-component).
-                # If the LLM passes the same nom_poste multiple times, keep only the first.
                 if nom_poste in seen_in_call:
                     logger.info("add_to_panier: doublon ignoré nom_poste=%r", nom_poste)
                     continue
                 seen_in_call.add(nom_poste)
+
+                # Safety: skip if already in panier (LLM retry / double add protection)
+                if nom_poste.lower() in already_in_panier:
+                    logger.info("add_to_panier: déjà dans le panier, ignoré nom_poste=%r", nom_poste)
+                    continue
 
                 # Affaire consistency: reject if different from established affaire
                 if (
@@ -586,20 +680,27 @@ class CatalogAdapter:
                     "fourniture": price_data.get("fourniture"),
                     "num_affaire": str(price_data.get("num_affaire") or ""),
                     "nom_affaire": confirmed_affaire,
+                    "nbre_jours_etude":   int(poste.get("nbre_jours_etude", 0) or 0),
+                    "nbre_jours_atelier": int(poste.get("nbre_jours_atelier", 0) or 0),
+                    "nbre_jours_client":  int(poste.get("nbre_jours_client", 0) or 0),
+                    "is_option":          bool(poste.get("is_option", False)),
                     "created_at": now,
                 }
                 conn.execute(
                     """
                     INSERT INTO devis_paniers
                       (id, conversation_id, nom_poste, num_poste, ensemble, quantite,
-                       fournisseur, fourniture, num_affaire, nom_affaire, item_type, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       fournisseur, fourniture, num_affaire, nom_affaire, item_type, created_at,
+                       nbre_jours_etude, nbre_jours_atelier, nbre_jours_client, is_option)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     [
                         item["id"], item["conversation_id"], item["nom_poste"],
                         item["num_poste"], item["ensemble"], item["quantite"],
                         item["fournisseur"], item["fourniture"],
                         item["num_affaire"], item["nom_affaire"], "poste", item["created_at"],
+                        item["nbre_jours_etude"], item["nbre_jours_atelier"],
+                        item["nbre_jours_client"], int(item["is_option"]),
                     ],
                 )
                 added.append(item)
@@ -631,6 +732,35 @@ class CatalogAdapter:
                 JOIN   pairs ON TRIM(COALESCE(c.num_poste, ''))  = pairs.np
                             AND LOWER(TRIM(c.nom_affaire))        = pairs.na
                 GROUP  BY c.num_poste, c.nom_affaire, c.nom_poste
+                """,
+                flat_params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_postes_aggregated_by_name(self, pairs: list[tuple[str, str]]) -> list[dict]:
+        """
+        Like get_postes_aggregated but keyed by (nom_poste, nom_affaire) instead of
+        (num_poste, nom_affaire). Safer because num_poste is not always unique per
+        poste within an affaire.
+        Pairs should be pre-normalized: nom_poste stripped, nom_affaire lowercased+stripped.
+        """
+        if not pairs or not self.db_path.exists():
+            return []
+        values_sql = ",".join("(?,?)" for _ in pairs)
+        flat_params = [v for p in pairs for v in p]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                WITH pairs(np, na) AS (VALUES {values_sql})
+                SELECT c.nom_poste, c.nom_affaire, c.num_poste, c.num_affaire,
+                       c.num_ensemble, c.ensemble,
+                       ROUND(SUM(CAST(COALESCE(c.fourniture, 0) AS REAL)), 2) AS prix_total,
+                       COUNT(*) AS nb_elements
+                FROM   catalogue c
+                JOIN   pairs ON LOWER(TRIM(c.nom_poste))   = LOWER(pairs.np)
+                            AND LOWER(TRIM(c.nom_affaire))  = pairs.na
+                GROUP  BY c.nom_poste, c.nom_affaire
                 """,
                 flat_params,
             ).fetchall()
@@ -700,6 +830,65 @@ class CatalogAdapter:
             conn.execute(
                 "DELETE FROM devis_paniers WHERE conversation_id = ? AND id = ?",
                 [conversation_id, item_id],
+            )
+            conn.commit()
+
+    def update_panier_item(self, conversation_id: str, item_id: str, fields: dict) -> dict:
+        """Partial update. Allowed keys: nbre_jours_etude, nbre_jours_atelier, nbre_jours_client, is_option.
+        Validates nbre_jours_* >= 0. Raises ValueError if item not found or doesn't belong to conversation.
+        Returns updated item dict."""
+        allowed = {"nbre_jours_etude", "nbre_jours_atelier", "nbre_jours_client", "is_option"}
+        update_fields = {k: v for k, v in fields.items() if k in allowed}
+        if not update_fields:
+            raise ValueError("No updatable fields provided")
+        for key in ("nbre_jours_etude", "nbre_jours_atelier", "nbre_jours_client"):
+            if key in update_fields and update_fields[key] is not None and int(update_fields[key]) < 0:
+                raise ValueError(f"{key} must be >= 0")
+        if "is_option" in update_fields:
+            update_fields["is_option"] = int(bool(update_fields["is_option"]))
+        set_clause = ", ".join(f"{k} = ?" for k in update_fields)
+        values = list(update_fields.values()) + [conversation_id, item_id]
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"UPDATE devis_paniers SET {set_clause} WHERE conversation_id = ? AND id = ?",
+                values,
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"Item {item_id} not found in conversation {conversation_id}")
+            conn.commit()
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM devis_paniers WHERE id = ?", [item_id]).fetchone()
+        if row is None:
+            raise ValueError(f"Item {item_id} not found after update")
+        item = dict(row)
+        item["is_option"] = bool(item.get("is_option", 0))
+        return item
+
+    def get_devis_settings(self, conversation_id: str) -> dict:
+        """Return {"coefficient": float, "coef_final": float}. Returns defaults if no row exists."""
+        defaults = {"coefficient": 0.0, "coef_final": 0.0}
+        if not self.db_path.exists():
+            return defaults
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT coefficient, coef_final FROM devis_settings WHERE conversation_id = ?",
+                    [conversation_id],
+                ).fetchone()
+                return dict(row) if row else defaults
+        except Exception:
+            return defaults
+
+    def set_devis_settings(self, conversation_id: str, coefficient: float, coef_final: float) -> None:
+        """INSERT OR REPLACE into devis_settings."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO devis_settings (conversation_id, coefficient, coef_final)
+                VALUES (?, ?, ?)
+                """,
+                [conversation_id, coefficient, coef_final],
             )
             conn.commit()
 

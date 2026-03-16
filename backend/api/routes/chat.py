@@ -34,7 +34,7 @@ def _format_history(history: list) -> str:
 
 
 async def _stream_rag_response(
-    message: str, collection_name: str, prompt_name: str, history: list
+    message: str, collection_name: str, prompt_name: str, history: list, conv_id: str | None = None
 ) -> AsyncGenerator[str, None]:
     """Stream RAG response as SSE events.
 
@@ -59,9 +59,42 @@ async def _stream_rag_response(
             """Exécute le pipeline RAG dans un thread pour ne pas bloquer l'event loop."""
             try:
                 result = rag.generer_avec_sources(message, stream=True, history=history_text)
+                answer_parts: list[str] = []
                 for token in result["reponse"]:
+                    answer_parts.append(token)
                     loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
-                loop.call_soon_threadsafe(queue.put_nowait, ("done", result["sources"]))
+
+                # Stocker dans eval_queue pour évaluation différée
+                metrics = result.get("metrics", {})
+                try:
+                    from backend.core.evaluator import enqueue_eval
+                    enqueue_eval(
+                        collection=collection_name,
+                        pipeline_hash=metrics.get("pipeline_hash", "unknown"),
+                        search_hash=metrics.get("search_hash", "unknown"),
+                        question=message,
+                        answer="".join(answer_parts),
+                        context_chunks=result.get("context_chunks", []),
+                        retrieval_ms=metrics.get("retrieval_ms", 0),
+                    )
+                except Exception:
+                    pass
+
+                # Persistance backend (résiste aux déconnexions SSE)
+                if conv_id:
+                    try:
+                        from backend.core.conversation_manager import ConversationManager
+                        cm = ConversationManager()
+                        cm.add_message(conv_id, "user", message)
+                        if answer_parts:
+                            cm.add_message(conv_id, "assistant", "".join(answer_parts))
+                    except Exception:
+                        pass
+
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", {
+                    "sources": result["sources"],
+                    "metrics": metrics,
+                }))
             except Exception as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
 
@@ -69,11 +102,17 @@ async def _stream_rag_response(
         thread.start()
 
         while True:
-            kind, data = await queue.get()
+            try:
+                kind, data = await asyncio.wait_for(queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                # Keepalive SSE : évite que le browser ferme la connexion pendant
+                # le chargement du modèle Ollama (cold start pouvant dépasser 60s)
+                yield ": keepalive\n\n"
+                continue
             if kind == "token":
                 yield f"data: {json.dumps({'token': data})}\n\n"
             elif kind == "done":
-                yield f"data: {json.dumps({'sources': data, 'done': True})}\n\n"
+                yield f"data: {json.dumps({'sources': data['sources'], 'metrics': data.get('metrics'), 'done': True})}\n\n"
                 break
             elif kind == "error":
                 yield f"data: {json.dumps({'error': data})}\n\n"
@@ -98,7 +137,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             request.message,
             request.collection_name,
             request.prompt_name,
-            request.history
+            request.history,
+            request.conv_id,
         ),
         media_type="text/event-stream",
         headers={

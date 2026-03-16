@@ -17,6 +17,7 @@ class ChatRequest(BaseModel):
     collection_name: str = Field(..., min_length=1, description="ChromaDB collection to search")
     prompt_name: str = Field(default="defaut", description="Prompt template name")
     history: list[ChatMessage] = Field(default=[], description="Previous messages for context")
+    conv_id: str | None = Field(default=None, description="Conversation ID for backend persistence")
 
 
 class ChatSource(BaseModel):

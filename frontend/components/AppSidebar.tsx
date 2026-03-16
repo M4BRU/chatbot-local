@@ -3,7 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FileText, MessageSquare, Mic, Plus, Trash2 } from "lucide-react";
+import { Bot, FileText, MessageSquare, Mic, Plus, Trash2 } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -21,6 +21,7 @@ import { useConversation } from "@/app/providers";
 const MODES = [
   { label: "Chat", href: "/", icon: MessageSquare },
   { label: "Devis", href: "/devis", icon: FileText },
+  { label: "Agent", href: "/agent", icon: Bot },
   { label: "Transcription", href: "/transcription", icon: Mic },
 ];
 

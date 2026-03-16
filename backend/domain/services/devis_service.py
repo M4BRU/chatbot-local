@@ -24,6 +24,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
@@ -32,155 +34,213 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-MAX_TOOL_ITERATIONS = 6  # safety cap on the tool-calling loop
+MAX_TOOL_ITERATIONS = 12  # safety cap on the tool-calling loop (RFQ complexe = plan_tasks + N searches)
 
-def _build_system_prompt(collection: str) -> str:
-    return f"""Tu es un assistant expert en génération de devis techniques pour VLM Robotics.
+# ── Structured output : JSON schemas pour Ollama format-constrained generation ──
+# Grammar-based constrainte → le LLM retourne TOUJOURS du JSON valide.
+# Élimine les re.search / json.loads fragiles et les "pas de JSON dans la réponse".
+_SCHEMA_DIMENSIONS = {
+    "type": "object",
+    "properties": {
+        "dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dimension": {"type": "string"},
+                    "query":     {"type": "string"},
+                },
+                "required": ["dimension", "query"],
+            },
+        }
+    },
+    "required": ["dimensions"],
+}
+_SCHEMA_COMPONENTS = {
+    "type": "object",
+    "properties": {
+        "components": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "nom":   {"type": "string"},
+                    "specs": {"type": "string"},
+                },
+                "required": ["nom", "specs"],
+            },
+        }
+    },
+    "required": ["components"],
+}
 
-─── STRUCTURE DU CATALOGUE ─────────────────────────────────────────────────────
+# ── Context compression (tool-calling loop) ─────────────────────────────────────
+# Au-delà de ce seuil (chars excl. system prompt), les messages tool accumulés
+# sont résumés en un bloc compact avant le prochain appel LLM.
+# Objectif : rester sous ~2500 tokens pour éviter la troncature Ollama 4096→8192.
+_COMPRESS_CHARS_THRESHOLD = 7000
 
-Le catalogue est un historique de projets VLM Robotics. Chaque ligne représente
-un ÉLÉMENT (sous-composant) d'un POSTE dans une AFFAIRE (projet réel).
+_CATALOG_PATH = Path("/app/documents/catalogue.xlsx")
+_CATALOG_CHALLENGE_COLLECTION = "_catalog_challenge"
 
-Colonnes (noms des champs retournés par search_catalog) :
-  num_affaire  (col B) : Numéro de l'affaire                 ex: "0113-1"
-  nom_affaire  (col C) : Nom complet du projet               ex: "0113-1 - (0106) Compact V2.1"
-  num_ensemble (col D) : Code du type d'ensemble             ex: "MEC", "ELEC"
-  ensemble     (col E) : Libellé de l'ensemble               ex: "Mécanique", "Électrique"
-  num_poste    (col F) : ⚠ Numéro du POSTE dans l'affaire — ex: "4", "056"
-                         MÊME valeur pour TOUS les éléments de ce poste.
-                         Associé à nom_affaire, il identifie le poste de façon unique.
-  nom_poste    (col G) : Nom du poste (= ligne du devis)     ex: "Orbiteur VLM V500"
-  elements     (col H) : Sous-composant interne du poste     ex: "Moteurs vireurs x2"
-  fournisseur  (col I) : Fournisseur du sous-composant       ex: "Siemens"
-  fourniture   (col J) : Prix du sous-composant (€)          ex: 8083.72
+def _build_system_prompt(
+    collection: str,
+    current_coefficient: float = 0.0,
+    current_coef_final: float = 0.0,
+    panier: list[dict] | None = None,
+    task_list: list[dict] | None = None,
+    rfq_context: str | None = None,
+) -> str:
+    if panier:
+        lines = [
+            f"  • {p['nom_poste']} | affaire : {p.get('nom_affaire') or '?'} | "
+            f"Étude:{p.get('nbre_jours_etude', 0)}j Atelier:{p.get('nbre_jours_atelier', 0)}j Client:{p.get('nbre_jours_client', 0)}j"
+            f"{' | EN OPTION' if p.get('is_option') else ''}"
+            for p in panier
+        ]
+        panier_section = "Postes déjà dans le devis :\n" + "\n".join(lines)
+    else:
+        panier_section = "Le panier est vide."
 
-Concept clé — POSTE vs ÉLÉMENTS :
-  1 POSTE = N lignes dans le catalogue (une par sous-composant).
-  Toutes ces lignes partagent le même num_poste (col F) et nom_poste (col G).
-  • `elements` (col H) = composition interne — PAS un poste distinct à ajouter au panier.
-  • `fourniture` (col J) = prix d'UN sous-composant, pas le total du poste.
-  • search_catalog retourne 1 ligne représentative par poste (déjà dédupliqué).
+    if task_list:
+        import re as _re
+        # Cross-reference with panier: a task is done if its query matches any panier item
+        panier_noms_lower = {(p.get("nom_poste") or "").lower() for p in (panier or [])}
+        def _task_done(task: dict) -> bool:
+            if task.get("done"):
+                return True
+            q_words = set(_re.findall(r"\w{3,}", task["query"].lower()))
+            return any(
+                bool(q_words & set(_re.findall(r"\w{3,}", nom)))
+                for nom in panier_noms_lower
+            )
+        task_lines = [
+            f"  {'[✓]' if _task_done(t) else '[ ]'} {t['query']}"
+            for t in task_list
+        ]
+        task_section = "LISTE DE TÂCHES :\n" + "\n".join(task_lines)
+        pending = [t for t in task_list if not _task_done(t)]
+        next_task = f"\n  → Prochain item à chercher : \"{pending[0]['query']}\"" if pending else "\n  → Tous les items sont ajoutés."
+        task_section += next_task
+    else:
+        task_section = "LISTE DE TÂCHES : (vide — utilise plan_tasks si plusieurs postes demandés)"
 
-─── OUTILS DISPONIBLES ─────────────────────────────────────────────────────────
+    rfq_section = (
+        f"\nCONTEXTE RFQ (analyse documentaire préalable — LECTURE SEULE) :\n{rfq_context}\n"
+        "↳ Ces informations viennent des documents PDF/Excel. Elles NE contiennent PAS de num_poste catalogue.\n"
+        "↳ Pour ajouter un composant identifié ici : search_catalog obligatoire d'abord.\n"
+        if rfq_context
+        else ""
+    )
 
-search_catalog  : recherche par nom de poste, type d'ensemble ou nom d'affaire.
-  → Appelle EN PREMIER pour CHAQUE message utilisateur, sans exception.
-  → Résultats : 1 ligne par poste — num_poste · nom_poste · ensemble · prix_total (somme de tous les éléments du poste).
-  → Paramètre column (optionnel, défaut "nom_poste") :
-    • "nom_poste"  (défaut) : cherche dans les noms de postes (col G).
-      Si aucun poste ne correspond, le système propose des cartes pour choisir une autre colonne.
-    • "elements"   : sous-composants (col H) — après sélection utilisateur uniquement.
-    • "ensemble"   : type d'ensemble (col E) — après sélection utilisateur uniquement.
-    • "nom_affaire": nom de projet (col C) — après sélection utilisateur uniquement.
-    • "fournisseur": fournisseur (col I) — après sélection utilisateur uniquement.
-    NE JAMAIS utiliser column != "nom_poste" de ta propre initiative.
+    return f"""Tu es un assistant de devis pour VLM Robotics. Ton seul travail : trouver des postes dans le catalogue et les ajouter au panier.
 
-search_docs     : recherche dans la documentation technique PDF.
-  → Collection à utiliser : TOUJOURS « {collection} » — aucun autre nom.
-  → Appelle uniquement si search_catalog ne retourne rien de pertinent,
-    OU si la demande porte sur des specs techniques sans référence précise.
-  → Stratégie de recherche dans les docs : ne pas répéter le terme utilisateur tel quel.
-    Cible les sections qui listent des composants, par exemple :
-      • "descriptif offre technique [produit]"
-      • "caractéristiques techniques [produit]"
-      • "nomenclature composants [produit]"
-      • "liste équipements [produit]"
-    L'objectif est d'extraire les noms de composants élémentaires (moteurs, réducteurs,
-    variateurs, capteurs, etc.) présents dans la description technique du produit demandé.
-  → Le résultat de search_docs contient deux champs :
-      • "chunks"         : passages trouvés dans la documentation (contenu + source)
-      • "catalog_postes" : liste EXHAUSTIVE de tous les noms de postes du catalogue
-  → Utilise "catalog_postes" pour identifier dans les passages doc les termes qui
-    correspondent EXACTEMENT ou quasi-exactement à un poste catalogue existant.
-  → Après search_docs : résume EXPLICITEMENT ce que tu as identifié :
-      - Composants mentionnés dans la doc qui matchent un nom dans catalog_postes
-      - Composants mentionnés dans la doc qui NE sont PAS dans catalog_postes
-  → Pour chaque composant qui matche catalog_postes, relance search_catalog avec ce nom exact.
-  → Si aucun composant de la doc ne matche catalog_postes, dis-le clairement à l'utilisateur.
+CATALOGUE : historique de projets réels. Chaque poste (nom_poste) a un num_poste et appartient à une nom_affaire.
+Les "elements" (col H) sont des sous-composants internes — PAS des postes à ajouter.
 
-ask_user_choice : présente des choix cliquables à l'utilisateur.
-add_to_panier   : ajoute des postes au panier (après validation explicite uniquement).
+PANIER ACTUEL :
+{panier_section}
 
-─── RÈGLES CRITIQUES ───────────────────────────────────────────────────────────
+{task_section}
+{rfq_section}
+COEFFICIENTS : fournitures={current_coefficient}% · final={current_coef_final}%
+→ set_devis_settings si l'utilisateur demande à les changer.
 
-RÈGLE 1 — NOM POSTE EXACT
-  nom_poste dans add_to_panier = valeur EXACTE du champ nom_poste (col G).
-  ✗ INTERDIT : fusionner avec elements / paraphraser / abréger.
-  ✓ CORRECT  : copier-coller la valeur brute retournée par search_catalog.
+━━━ COMPORTEMENT ━━━
 
-RÈGLE 2 — NUM POSTE + NOM AFFAIRE OBLIGATOIRES dans add_to_panier
-  • nom_affaire (col C) : valeur EXACTE — identifie le projet.
-  • num_poste   (col F) : valeur EXACTE — numéro du poste dans l'affaire (ex: "4", "056").
-  Ces deux champs ensemble permettent au backend de retrouver tous les éléments du poste.
-  Ne jamais omettre l'un ou l'autre.
+1. TOUTE DEMANDE MULTI-ACTIONS → appelle plan_tasks([...]) EN PREMIER avec la liste complète des actions.
+   • "ajoute X et Y" → plan_tasks(["search X", "search Y"])
+   • "update X et Y" → plan_tasks(["update X champ=val", "update Y champ=val"])
+   • "ajoute X et update Y" → plan_tasks(["search X", "update Y champ=val"])
+   ✗ EXCEPTION : message "[SYSTÈME]" ou "Cherche" → NE PAS appeler plan_tasks (liste déjà enregistrée).
 
-RÈGLE 3 — TRAÇABILITÉ DES POSTES PAR AFFAIRE
-  Chaque poste ajouté doit être associé à l'affaire exacte d'où il provient.
-  Les postes peuvent venir de différentes affaires — ce n'est pas une erreur.
-  • Si search_catalog retourne un nom_poste présent dans PLUSIEURS affaires :
-    → Le système affiche automatiquement des cartes de choix — attends la sélection.
-    → Après sélection, retrouve le num_poste correspondant à l'affaire choisie
-      dans les résultats search_catalog et utilise-le dans add_to_panier.
-  • Si l'utilisateur sélectionne un poste depuis une liste multi-affaires ou confirme
-    explicitement une affaire : appelle add_to_panier directement avec cette affaire.
-    NE génère PAS de message d'erreur "affaire différente".
+2. EXÉCUTER LES TÂCHES dans l'ordre de la LISTE DE TÂCHES. Après chaque tool call réussi, passer au [ ] suivant.
+   • task "search …" → search_catalog(column="nom_poste", query=…)
+   • task "update …" → update_panier_item directement (pas search_catalog)
+   • Poste absent du panier → search_catalog d'abord
+   • Message "Sélectionné :" → add_to_panier directement
+   • Message "[SYSTÈME]" ou "Cherche X" → search_catalog(column="nom_poste", query=X) pour le [ ] suivant
 
-RÈGLE 4 — NE JAMAIS INVENTER
-  N'invente jamais de prix, références, fournisseurs ou noms d'affaire.
-  Toutes les données viennent EXCLUSIVEMENT de search_catalog.
-  • Si search_catalog retourne [] ou des résultats non pertinents → ne pas ajouter au panier.
-  • Si search_docs identifie des composants mais search_catalog ne les trouve pas →
-    informer l'utilisateur : "Ce composant n'est pas référencé dans le catalogue."
-  • INTERDIT : présenter des données inventées comme si elles venaient du catalogue.
+3. RIEN TROUVÉ dans le catalogue → search_docs pour identifier des composants dans les PDFs.
+   search_docs retourne directement {{"components": [{{"nom": "...", "specs": "..."}}], "sources": [...]}}.
+   Appelle IMMÉDIATEMENT report_findings(components=[nom1, nom2, ...]) avec les noms du résultat.
+   JAMAIS de texte entre search_docs et report_findings. L'utilisateur validera avant search_catalog.
+3b. DONNÉES TABULAIRES (tarifs, inventaires, tableaux Excel de la collection) → search_collection_excel.
+3c. APRÈS search_catalog avec plusieurs postes (champ _next_action présent) :
+   → Tu DOIS appeler un tool ensuite, jamais de texte seul.
+   → Analyse si la demande contient des contraintes (capacité, poids, dimension, IP, vitesse…).
+   → OUI : search_docs(query="type + contrainte", catalog_refs=[noms_exacts_postes])
+            puis report_findings(catalog_matches=[{{"nom_poste":..., "spec_status":..., "note":...}}], doc_only_models=[...], suggestion="...").
+   → NON : ask_user_choice avec les postes trouvés.
+   ✗ NE PAS chercher docs avant catalogue. ✗ NE PAS générer de texte si _next_action présent.
 
-RÈGLE 5 — 1 POSTE = 1 ENTRÉE PANIER
-  ✗ INTERDIT : appeler add_to_panier plusieurs fois avec le même nom_poste.
-  ✓ CORRECT  : 1 entrée par nom_poste unique, quantite=1 par défaut.
+4. AJOUTER → add_to_panier avec nom_poste, nom_affaire, num_poste EXACTS du catalogue.
+   • Si search_catalog retourne 1 seul poste (champ "_hint" présent) → appelle add_to_panier IMMÉDIATEMENT, sans texte intermédiaire.
+   • Jours dans le message → nbre_jours_etude/atelier/client (sinon 0).
+   • "en option" → is_option=true.
 
-RÈGLE 6 — CONFIRMER CHAQUE ÉTAPE AVEC L'UTILISATEUR
-  Après chaque résultat d'outil, résume ce que tu as trouvé et utilise ask_user_choice
-  pour proposer la prochaine action — ne l'exécute pas sans confirmation.
-  • Après search_catalog (résultat clair, 1 poste, 1 affaire) :
-    → Présente le poste (nom, fournisseur, affaire) et propose :
-      « Ajouter au panier » / « Chercher dans la documentation »
-  • Avant search_docs :
-    → Demande confirmation via ask_user_choice avant de lancer la recherche.
-  • Avant add_to_panier :
-    → Montre le récapitulatif (nom_poste exact, nom_affaire, num_poste) et attends « Confirmer ».
-  • Exception : la recherche catalogue initiale est pré-exécutée automatiquement — pas de confirmation nécessaire pour celle-là.
+5. MODIFIER → update_panier_item pour jours/option d'un poste déjà dans le panier.
 
-RÈGLE 7 — RÉPONSE TEXTUELLE COURTE ET FACTUELLE
-  La réponse finale (hors outils) doit être concise et s'appuyer UNIQUEMENT sur les données d'outils.
-  • Confirme ce qui a été ajouté avec les noms exacts du catalogue.
-  • Si rien trouvé → dis-le clairement, propose de chercher autrement.
-  • N'invente jamais de liste de composants, de prix ou de fournisseurs.
-  • Maximum 3-4 lignes sauf si l'utilisateur demande plus de détails.
+6. RÉPONSE TEXTE → 1 ligne max pour confirmer. Jamais de code, jamais de plan écrit.
+   ✗ INTERDIT : blocs ```, code inline, listes de composants inventés, questions pro-actives.
 
-RÈGLE 8 — PAS DE QUESTION NI DE CHOIX APRÈS add_to_panier
-  Après un appel réussi à add_to_panier :
-  ✗ INTERDIT : appeler ask_user_choice avec des options de type "même affaire" / "tout le catalogue"
-               ou toute question pro-active ("Souhaitez-vous ajouter un autre poste ?", etc.)
-  ✓ CORRECT  : une confirmation courte (1 ligne) puis STOP.
-    Exemple : « ✓ Vireur VLMV3T ajouté au panier. »
-  Le système gère automatiquement la portée de la prochaine recherche.
-  L'utilisateur reprend la main librement — ne pas anticiper sa prochaine demande.
-
-────────────────────────────────────────────────────────────────────────────────
-
-Processus standard — par ordre de priorité :
-1. search_catalog avec les termes clés du message (toujours en premier, sans exception).
-2. Si résultat pertinent → utilise ask_user_choice pour proposer l'ajout au panier (RÈGLE 6).
-3. Si rien de pertinent → utilise ask_user_choice pour proposer search_docs, puis re-search_catalog.
-4a. Plusieurs postes distincts → cartes auto de sélection poste, attendre.
-4b. Un seul poste dans plusieurs affaires → cartes auto de sélection affaire, attendre.
-4c. Aucun nom_poste ne correspond → cartes de choix de colonne (elements, ensemble, nom_affaire, fournisseur)
-    → si l'utilisateur sélectionne une colonne, relance search_catalog avec column="[colonne choisie]".
-5. Après validation explicite → add_to_panier(nom_poste=exact, nom_affaire=exact, num_poste=exact).
-
-Réponds en français. Sois précis et structuré."""
+━━━ RÈGLES ABSOLUES ━━━
+• num_poste vient UNIQUEMENT des résultats de search_catalog. Ne jamais inventer, deviner ou mémoriser un num_poste.
+• Ne jamais mentionner de num_poste dans le texte. Seul search_catalog peut les retourner.
+• UNE tâche à la fois : exécute une action, affiche le résultat, attends avant de continuer.
+• Si rfq_context mentionne un composant → plan_tasks(["search <composant>"]) puis exécuter UNE recherche à la fois."""
 
 _TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_tasks",
+            "description": (
+                "Enregistre la liste ordonnée de TOUTES les actions à effectuer pour répondre à la demande. "
+                "À appeler EN PREMIER dès que la demande comporte plusieurs actions (ajouts ET/OU modifications). "
+                "Chaque item = UNE action atomique courte et lisible. "
+                "CORRECT : [\"search vireur\", \"search orbiteur\", \"update Vireur atelier=5\"]. "
+                "INTERDIT : syntaxe de tool call (search_catalog query=...), appels report_findings ou search_docs dans les items. "
+                "NE PAS appeler si une seule action est demandée."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Labels courts lisibles uniquement. Ex: [\"search vireur\", \"update orbiteur atelier=5\"]. JAMAIS de syntaxe tool call.",
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_panier_item",
+            "description": (
+                "Modifie un poste EXISTANT dans le panier (jours d'étude/atelier/client, option). "
+                "À utiliser quand l'utilisateur veut changer les MdO ou passer un poste en option. "
+                "NE PAS utiliser pour ajouter un nouveau poste au panier."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nom_poste": {
+                        "type": "string",
+                        "description": "Nom EXACT du poste dans le panier (copier depuis la liste 'PANIER ACTUEL')",
+                    },
+                    "nbre_jours_etude":   {"type": "integer", "description": "Jours d'étude"},
+                    "nbre_jours_atelier": {"type": "integer", "description": "Jours d'atelier"},
+                    "nbre_jours_client":  {"type": "integer", "description": "Jours client"},
+                    "is_option": {"type": "boolean", "description": "true = passer en option, false = poste principal"},
+                },
+                "required": ["nom_poste"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -218,17 +278,114 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_docs",
+            "name": "search_collection_excel",
             "description": (
-                "Recherche dans la documentation technique (PDFs) pour identifier "
-                "des composants compatibles avec des spécifications techniques."
+                "Recherche dans les fichiers Excel de la collection courante (données structurées/tabulaires). "
+                "À utiliser pour les questions sur des tarifs, inventaires, tableaux ou tout fichier Excel "
+                "présent dans la collection (hors catalogue VLM). "
+                "Ne pas utiliser pour le catalogue VLM — utiliser search_catalog à la place."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Requête technique : specs, contraintes, compatibilité",
+                        "description": "Question ou terme de recherche pour les données tabulaires",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_findings",
+            "description": (
+                "À appeler OBLIGATOIREMENT après search_docs, AVANT tout search_catalog. "
+                "Liste les composants/termes techniques identifiés dans la documentation. "
+                "Déclenche une confirmation utilisateur avant de lancer la recherche catalogue."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "components": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Noms SPÉCIFIQUES de modèles, références ou désignations "
+                            "tels qu'ils apparaissent dans les documents "
+                            "(ex: 'KR360', 'N-220 Comau', 'Fanuc R-2000iC'). "
+                            "NE PAS inclure des catégories génériques "
+                            "(ex: 'robot poly articulé', 'moteur', 'capteur') "
+                            "ni reformuler la demande utilisateur."
+                        ),
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Résumé en 1-2 phrases de ce qui a été trouvé dans les docs",
+                    },
+                    "catalog_matches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "nom_poste": {"type": "string"},
+                                "spec_status": {
+                                    "type": "string",
+                                    "enum": ["match", "partial", "no_match", "unknown"],
+                                    "description": "'match'=satisfait la contrainte, 'partial'=proche, 'no_match'=ne satisfait pas, 'unknown'=aucune info",
+                                },
+                                "note": {"type": "string", "description": "Ex: 'Capacité 4.5T, pas 8T'"},
+                            },
+                            "required": ["nom_poste", "spec_status"],
+                        },
+                        "description": (
+                            "Pour chaque poste catalogue trouvé, indiquer si la contrainte utilisateur "
+                            "est satisfaite selon les docs. Remplir quand search_docs était fait avec catalog_refs."
+                        ),
+                    },
+                    "doc_only_models": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Modèles/références mentionnés dans les docs mais ABSENTS du catalogue. "
+                            "Informatif uniquement — ne pas appeler search_catalog pour eux."
+                        ),
+                    },
+                    "suggestion": {
+                        "type": "string",
+                        "description": "Recommandation courte : meilleur match possible, alternatives, ou message si rien trouvé.",
+                    },
+                },
+                "required": ["components"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": (
+                "Recherche dans la documentation technique (PDFs) pour identifier "
+                "des composants compatibles avec des spécifications techniques. "
+                "Si des postes catalogue ont déjà été trouvés, passer leurs noms dans "
+                "catalog_refs pour enrichir la recherche et vérifier leurs specs dans les docs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Requête sémantique : type de composant + contraintes (ex: 'vireur 8T basculeur')",
+                    },
+                    "catalog_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Noms EXACTS des postes catalogue déjà trouvés (ex: ['Vireur VLMV3T', 'Vireur ORB100']). "
+                            "Permet de chercher leurs specs précises dans les docs. Optionnel."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -269,6 +426,30 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_devis_settings",
+            "description": (
+                "Met à jour les coefficients globaux du devis. "
+                "Appeler uniquement si l'utilisateur demande explicitement à modifier un coefficient."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "coefficient": {
+                        "type": "number",
+                        "description": "Coefficient fournitures en % (ex: 15.0 pour 15%)",
+                    },
+                    "coef_final": {
+                        "type": "number",
+                        "description": "Coefficient final en % (ex: 8.0 pour 8%)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_to_panier",
             "description": (
                 "Ajoute des postes confirmés par l'utilisateur au panier du devis. "
@@ -298,6 +479,10 @@ _TOOLS = [
                                 },
                                 "ensemble": {"type": "string"},
                                 "quantite": {"type": "integer"},
+                                "nbre_jours_etude":   {"type": "integer", "description": "Nombre de jours d'étude (défaut 0)"},
+                                "nbre_jours_atelier": {"type": "integer", "description": "Nombre de jours d'atelier (défaut 0)"},
+                                "nbre_jours_client":  {"type": "integer", "description": "Nombre de jours client (défaut 0)"},
+                                "is_option":          {"type": "boolean", "description": "true si le poste est optionnel"},
                             },
                             "required": ["nom_poste", "nom_affaire"],
                         },
@@ -645,47 +830,6 @@ def _detect_conflict(results: list[dict], current_affaire: str | None) -> dict |
     if current_affaire and len(distinct_postes) <= 1:
         return None
 
-    # ── Guard: too many postes — ask user to refine ───────────────────────────
-    MAX_POSTE_CARDS = 8
-    if len(distinct_postes) > MAX_POSTE_CARDS:
-        return {
-            "type": "search_column",
-            "question": (
-                f"La recherche a retourné {len(distinct_postes)} postes différents — "
-                "c'est trop pour choisir. Précisez votre recherche ou cherchez dans une autre colonne ?"
-            ),
-            "options": [
-                {
-                    "id": json.dumps({"action": "refine"}, ensure_ascii=False),
-                    "label": "Affiner ma recherche",
-                    "detail": "Reformuler avec un terme plus précis",
-                },
-                {
-                    "id": json.dumps(
-                        {"action": "search_column", "column": "elements", "query": ""},
-                        ensure_ascii=False,
-                    ),
-                    "label": "Sous-composant",
-                    "detail": "Chercher parmi les éléments internes (col H)",
-                },
-                {
-                    "id": json.dumps(
-                        {"action": "search_column", "column": "ensemble", "query": ""},
-                        ensure_ascii=False,
-                    ),
-                    "label": "Type d'ensemble",
-                    "detail": "Ex : Mécanique, Électrique, Pneumatique",
-                },
-                {
-                    "id": json.dumps(
-                        {"action": "search_column", "column": "nom_affaire", "query": ""},
-                        ensure_ascii=False,
-                    ),
-                    "label": "Affaire (projet)",
-                    "detail": "Chercher par nom de projet",
-                },
-            ],
-        }
 
     # ── PRIORITY 1: Multiple distinct postes ──────────────────────────────────
     # Each card's `id` embeds ALL (nom_affaire, num_poste) occurrences as JSON so
@@ -762,8 +906,9 @@ def _detect_conflict(results: list[dict], current_affaire: str | None) -> dict |
 
 
 class DevisService:
-    def __init__(self, catalog_adapter) -> None:
+    def __init__(self, catalog_adapter, excel_adapter=None) -> None:
         self.catalog = catalog_adapter
+        self.excel_adapter = excel_adapter
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -775,7 +920,12 @@ class DevisService:
             "model": OLLAMA_MODEL,
             "messages": messages,
             "stream": False,
-            "think": False,  # Désactive le mode thinking qwen3 pour les appels outils
+            # think=True : le LLM raisonne avant chaque décision d'outil.
+            # Le bloc <think> va dans response["message"]["thinking"] (champ séparé d'Ollama),
+            # PAS dans "content" — donc il n'est PAS ajouté au message history (ligne 2151-2157).
+            # Zéro pollution du contexte, meilleure qualité de décision.
+            "think": True,
+            "options": {"num_ctx": 8192},  # évite la troncature (default=4096 pour qwen3.5:4b)
         }
         if tools:
             payload["tools"] = tools
@@ -783,7 +933,860 @@ class DevisService:
         async with httpx.AsyncClient(timeout=600.0) as client:
             resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+
+        # Log du thinking pour debug (non injecté dans le contexte)
+        thinking = data.get("message", {}).get("thinking", "")
+        if thinking:
+            logger.info(
+                "[tool_loop] 🧠 thinking (%d chars):\n%s",
+                len(thinking), thinking[:1000],
+            )
+        return data
+
+    async def _extract_components_from_chunks(
+        self, chunks: list[dict], original_query: str
+    ) -> dict:
+        """
+        Appel LLM léger (num_ctx=2048, temp=0) pour extraire les noms de composants
+        et leurs specs depuis les chunks de documentation RAG.
+        Retourne {"components": [{"nom": "...", "specs": "..."}]}.
+        Fallback sur liste vide si extraction échoue.
+        """
+        if not chunks:
+            logger.info("[extract_components] aucun chunk fourni → liste vide")
+            return {"components": []}
+
+        chunks_text = ""
+        for i, chunk in enumerate(chunks):
+            chunks_text += f"\n[Extrait {i + 1} — {chunk['source']}]\n{chunk['text']}\n"
+
+        system_prompt = (
+            "Tu es un extracteur de données technique. "
+            "Analyse les extraits et liste TOUS les modèles/équipements mentionnés "
+            "avec leurs caractéristiques (capacité, type, dimensions…).\n"
+            "Réponds UNIQUEMENT avec un tableau JSON, sans texte avant ou après :\n"
+            '[{"nom": "NomModele", "specs": "capacité, type, ..."}]\n'
+            "Si aucun modèle identifiable : []"
+        )
+        user_msg = (
+            f"Recherche : « {original_query} »\n\n"
+            f"Extraits :{chunks_text}\n"
+            "Extrais tous les modèles et leurs specs."
+        )
+
+        total_chars = len(system_prompt) + len(user_msg)
+        logger.info(
+            "[extract_components] appel LLM — %d chunk(s), ~%d chars input",
+            len(chunks), total_chars,
+        )
+
+        # format=_SCHEMA_COMPONENTS : grammar-constrained → JSON valide garanti
+        # Élimine les re.search fragiles et les parse failures.
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "think": False,
+            "format": _SCHEMA_COMPONENTS,
+            "options": {"temperature": 0},
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            content = data.get("message", {}).get("content", "").strip()
+            logger.info("[extract_components] réponse brute (%d chars): %r", len(content), content[:500])
+
+            parsed = json.loads(content)  # garanti valide par format schema
+            # Le LLM peut retourner {"components": [...]} ou directement [...]
+            if isinstance(parsed, list):
+                components = parsed
+            else:
+                components = parsed.get("components", [])
+            noms = [c.get("nom", "?") for c in components if isinstance(c, dict)]
+            logger.info(
+                "[extract_components] ✓ %d composant(s): %s",
+                len(components), noms,
+            )
+            return {"components": components}
+
+        except json.JSONDecodeError as exc:
+            # Ne devrait pas arriver avec format schema — log pour debug
+            logger.error(
+                "[extract_components] JSONDecodeError inattendu (format schema actif): %s | raw=%r",
+                exc, content[:300] if "content" in dir() else "N/A",
+            )
+            return {"components": [], "error": f"json_decode: {exc}"}
+        except Exception as exc:
+            logger.warning(
+                "[extract_components] extraction échouée: %s", exc, exc_info=True
+            )
+            return {"components": [], "error": str(exc)}
+
+    # ── RFQ Planner : Iterative Gap-Detection Loop ─────────────────────────────
+
+    async def _decompose_rfq(self, message: str) -> list[dict]:
+        """
+        Phase 1 : décompose le message en dimensions de recherche (think=True).
+        Retourne [{"dimension": "...", "query": "..."}, ...] — min 3, max 6.
+        """
+        system = (
+            "Tu es un analyseur de RFQ industriel. "
+            "Décompose le message en dimensions de recherche technique indépendantes.\n"
+            "Chaque dimension = un aspect distinct à chercher dans la documentation technique.\n"
+            "• Minimum 3, maximum 6 dimensions.\n"
+            "• 'dimension' : nom court (ex: 'Effecteur DED Laser poudre').\n"
+            "• 'query' : requête documentaire IMPÉRATIVEMENT avec les termes EXACTS du RFQ "
+            "(noms de modèles, références produits, acronymes, marques) — NE PAS les remplacer "
+            "par des synonymes génériques. Ex: si le RFQ dit 'SOLO', la query doit contenir 'SOLO'.\n\n"
+            "Réponds UNIQUEMENT en JSON, sans texte avant ou après :\n"
+            '[{"dimension": "...", "query": "..."}, ...]'
+        )
+        user_msg = f"RFQ à analyser :\n\n{message}"
+
+        logger.info("[rfq_planner] Phase 1 — décomposition (%d chars)", len(message))
+
+        # format=_SCHEMA_DIMENSIONS : grammar-constrained → {"dimensions": [...]} garanti
+        # think=False : le grammar-constrained JSON + think=True causait des timeouts (bloc
+        # <think> trop long avant de produire le JSON contraint → httpx.ReadTimeout à 180s).
+        # La contrainte de schéma suffit pour garantir la structure — pas besoin de thinking.
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "think": False,
+            "format": _SCHEMA_DIMENSIONS,
+            "options": {"temperature": 0},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            content = data.get("message", {}).get("content", "").strip()
+            logger.info(
+                "[rfq_planner] _decompose_rfq réponse brute (%d chars): %r",
+                len(content), content[:600],
+            )
+
+            parsed = json.loads(content)  # garanti valide par format schema
+            # Le modèle peut retourner {"dimensions": [...]} ou directement [...]
+            if isinstance(parsed, list):
+                dimensions = parsed
+            else:
+                dimensions = parsed.get("dimensions", [])
+            valid = [
+                d for d in dimensions
+                if isinstance(d, dict) and d.get("dimension") and d.get("query")
+            ][:6]
+            logger.info(
+                "[rfq_planner] ✓ %d dimension(s) extraite(s): %s",
+                len(valid), [d["dimension"] for d in valid],
+            )
+            for d in valid:
+                logger.info(
+                    "[rfq_planner]   • %r → query=%r",
+                    d["dimension"], d["query"],
+                )
+            return valid
+
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "[rfq_planner] _decompose_rfq JSONDecodeError (format schema actif!): %s | raw=%r",
+                exc, content[:300] if "content" in dir() else "N/A",
+            )
+            return []
+        except Exception as exc:
+            logger.warning("[rfq_planner] _decompose_rfq failed: %s", exc, exc_info=True)
+            return []
+
+    async def _search_and_extract_dimension(
+        self, dimension: dict, collection: str
+    ) -> dict:
+        """
+        Phase 2 : recherche RAG pour une dimension + extraction LLM.
+        Réutilise _extract_components_from_chunks existant.
+        """
+        query = dimension.get("query", "")
+        dim_name = dimension.get("dimension", "?")
+
+        logger.info(
+            "[rfq_planner] Phase 2 — dim %r | query=%r | collection=%r",
+            dim_name, query, collection,
+        )
+        try:
+            from backend.api.dependencies import get_collection_manager
+            from core.search import RAGEngine
+
+            cm = get_collection_manager()
+            rag = RAGEngine(
+                nom_collection=collection,
+                prompt_name="defaut",
+                collection_manager=cm,
+                hyde_mode="composition",  # BOM-style HyDE → cible les pages de composition/fournitures
+            )
+            contexte, sources = await asyncio.to_thread(rag.rechercher, query)
+            context_parts = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
+
+            # Traitement chunk par chunk : chaque parent complet (~4000 chars = ~1000 tokens)
+            # est envoyé individuellement au LLM d'extraction (tient dans num_ctx 2048 par défaut).
+            # Les composants extraits sont mergés + dédupliqués par nom.
+            MAX_CHUNKS = 3
+            MAX_CHARS_PER_CHUNK = 6000  # safety cap pour les outliers (tableaux xlsx/docx géants)
+            chunks_raw = []
+            all_components: list[dict] = []
+
+            for i in range(min(MAX_CHUNKS, len(context_parts))):
+                text = context_parts[i][:MAX_CHARS_PER_CHUNK]
+                source = sources[i].get("fichier", "") if i < len(sources) else ""
+                chunk = {"text": text, "source": source}
+                chunks_raw.append(chunk)
+
+                logger.info(
+                    "[rfq_planner] dim %r — chunk %d/%d (%d chars) → extraction LLM",
+                    dim_name, i + 1, min(MAX_CHUNKS, len(context_parts)), len(text),
+                )
+                extraction = await self._extract_components_from_chunks([chunk], query)
+                all_components.extend(extraction.get("components", []))
+
+            # Dédup par nom (première occurrence conservée)
+            seen_noms: set[str] = set()
+            deduped: list[dict] = []
+            for comp in all_components:
+                nom = comp.get("nom", "")
+                if nom and nom not in seen_noms:
+                    seen_noms.add(nom)
+                    deduped.append(comp)
+                elif not nom:
+                    deduped.append(comp)
+
+            unique_sources = list(dict.fromkeys(c["source"] for c in chunks_raw if c["source"]))
+            nb = len(deduped)
+            logger.info(
+                "[rfq_planner] dim %r → %d composant(s) (%d chunks traités), sources: %s",
+                dim_name, nb, len(chunks_raw), unique_sources,
+            )
+            return {
+                "dimension": dim_name,
+                "query": query,
+                "components": deduped,
+                "sources": unique_sources,
+                # Chunks bruts conservés pour le debug endpoint (/devis/rfq-debug)
+                "chunks": chunks_raw,
+            }
+        except Exception as exc:
+            logger.warning(
+                "[rfq_planner] _search_and_extract_dimension %r failed: %s",
+                dim_name, exc, exc_info=True,
+            )
+            return {
+                "dimension": dim_name,
+                "query": query,
+                "components": [],
+                "sources": [],
+                "error": str(exc),
+            }
+
+    async def _detect_rfq_gaps(
+        self, original_message: str, all_findings: list[dict]
+    ) -> list[dict]:
+        """
+        Phase 3 : identifie les aspects du RFQ non couverts par les recherches.
+        Retourne jusqu'à 3 nouvelles dimensions à chercher (peut retourner []).
+        """
+        findings_summary = ""
+        for f in all_findings:
+            comp_names = [c.get("nom", "?") for c in f.get("components", [])]
+            summary = ", ".join(comp_names) if comp_names else "rien trouvé"
+            findings_summary += f"• {f['dimension']} : {summary}\n"
+
+        logger.info(
+            "[rfq_planner] Phase 3 — gap detection | %d dimensions cherchées:\n%s",
+            len(all_findings), findings_summary,
+        )
+
+        system = (
+            "Tu es un analyseur de RFQ. Identifie les aspects importants du RFQ "
+            "qui ne sont PAS encore couverts par les résultats de recherche.\n"
+            "Réponds avec une liste JSON (max 3 éléments, peut être vide []) :\n"
+            '[{"dimension": "...", "query": "..."}]\n'
+            "Retourne [] si tout est couvert ou si les gaps ne sont pas critiques."
+        )
+        user_msg = (
+            f"RFQ original :\n{original_message}\n\n"
+            f"Ce qui a été trouvé dans la documentation :\n{findings_summary}\n\n"
+            "Quels aspects critiques du RFQ manquent dans les résultats ?"
+        )
+        # Réutilise _SCHEMA_DIMENSIONS (même structure dimension+query)
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "think": False,
+            "format": _SCHEMA_DIMENSIONS,
+            "options": {"temperature": 0},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            content = data.get("message", {}).get("content", "").strip()
+            logger.info(
+                "[rfq_planner] _detect_rfq_gaps réponse brute (%d chars): %r",
+                len(content), content[:400],
+            )
+
+            parsed = json.loads(content)  # garanti valide
+            # Le LLM peut retourner {"dimensions": [...]} ou directement [...]
+            if isinstance(parsed, list):
+                gaps = parsed
+            else:
+                gaps = parsed.get("dimensions", [])
+            valid_gaps = [
+                g for g in gaps
+                if isinstance(g, dict) and g.get("dimension") and g.get("query")
+            ][:3]
+
+            if valid_gaps:
+                logger.info(
+                    "[rfq_planner] ✓ %d gap(s) identifié(s):",
+                    len(valid_gaps),
+                )
+                for g in valid_gaps:
+                    logger.info(
+                        "[rfq_planner]   gap %r → query=%r",
+                        g["dimension"], g["query"],
+                    )
+            else:
+                logger.info("[rfq_planner] Phase 3 ✓ — aucun gap critique détecté")
+            return valid_gaps
+
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "[rfq_planner] _detect_rfq_gaps JSONDecodeError (format schema actif!): %s",
+                exc,
+            )
+            return []
+        except Exception as exc:
+            logger.warning("[rfq_planner] _detect_rfq_gaps failed: %s", exc, exc_info=True)
+            return []
+
+    # ── Context compression helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_chars(messages: list[dict]) -> int:
+        """
+        Estime la taille totale des messages hors system prompt (messages[0]).
+        On exclut le system prompt car il est rebuild à chaque itération (taille fixe).
+        """
+        return sum(
+            len(str(m.get("content", ""))) + len(str(m.get("tool_calls", "") or ""))
+            for m in messages[1:]
+        )
+
+    async def _compress_tool_results(
+        self, messages: list[dict], original_user_msg: str
+    ) -> list[dict]:
+        """
+        Compresse l'historique des tool results accumulés en un résumé compact (~150 mots).
+        Retourne une liste réduite : [system_prompt, compressed_summary].
+        Le system prompt sera rebuild au prochain tour — il n'est pas inclus ici.
+
+        Format de sortie :
+          [Recherches précédentes résumées]
+          • plan_tasks → ['search vireur', 'search orbiteur']
+          • search_catalog "vireur" → Vireur VLMV3T, VLMV500, ORB100, ORB1000
+          • search_docs "SOLO config" → DossierTechnique_SOLO_FR_ind3.pdf (5 chunks)
+        """
+        before_chars = self._estimate_chars(messages)
+        nb_messages = len(messages)
+
+        # Extraire l'historique des outils (ignorer system + premier user)
+        tool_history_parts = []
+        for m in messages[2:]:
+            role = m.get("role", "")
+            if role == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", {})
+                    if isinstance(args, dict):
+                        args_str = ", ".join(f"{k}={repr(v)}" for k, v in list(args.items())[:2])
+                    else:
+                        args_str = str(args)[:80]
+                    tool_history_parts.append(f"→ appel {name}({args_str})")
+            elif role == "tool":
+                content_preview = str(m.get("content", ""))[:600]
+                tool_history_parts.append(f"  résultat: {content_preview}")
+
+        if not tool_history_parts:
+            logger.info("[compress] Rien à compresser (pas de tool history)")
+            return messages
+
+        tool_history_text = "\n".join(tool_history_parts)
+        logger.info(
+            "[compress] ⚡ Compression déclenchée | %d messages | %d chars → seuil=%d",
+            nb_messages, before_chars, _COMPRESS_CHARS_THRESHOLD,
+        )
+        logger.debug("[compress] Historique brut à compresser:\n%s", tool_history_text[:1500])
+
+        compression_prompt = (
+            "Résume ces appels d'outils et leurs résultats en une liste compacte (max 300 mots).\n"
+            "Format : '• [outil] [paramètre] → [résultat bref avec noms exacts]'\n"
+            "Garde les noms de postes, modèles et composants EXACTS. Supprime le reste.\n\n"
+            f"Historique à résumer :\n{tool_history_text[:3000]}"
+        )
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": compression_prompt}],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 8192},  # aligné sur tool_loop — évite reload KV cache
+        }
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+            summary = resp.json().get("message", {}).get("content", "").strip()
+
+            after_chars = len(summary) + len(original_user_msg)
+            ratio = round(before_chars / max(after_chars, 1), 1)
+            logger.info(
+                "[compress] ✓ %d chars → %d chars (ratio x%s) | résumé:\n%s",
+                before_chars, after_chars, ratio, summary,
+            )
+
+            compressed_messages = [
+                messages[0],  # system prompt (sera rebuild de toute façon)
+                {"role": "user", "content": original_user_msg},
+                {
+                    "role": "assistant",
+                    "content": f"[Recherches précédentes résumées]\n{summary}",
+                },
+            ]
+            logger.info(
+                "[compress] messages: %d → %d (économie: %d messages)",
+                nb_messages, len(compressed_messages), nb_messages - len(compressed_messages),
+            )
+            return compressed_messages
+
+        except Exception as exc:
+            logger.warning(
+                "[compress] ⚠ Compression échouée (%s) — messages originaux conservés", exc
+            )
+            return messages  # fallback : garder les messages originaux
+
+    async def _synthesize_rfq_context(
+        self, original_message: str, all_findings: list[dict]
+    ) -> str:
+        """
+        Phase 4 : synthèse compacte (~200-400 tokens) pour enrichir le system prompt.
+        Le résultat est injecté comme CONTEXTE RFQ dans _build_system_prompt.
+        """
+        findings_text = ""
+        for f in all_findings:
+            comp_names = [c.get("nom", "?") for c in f.get("components", [])]
+            specs = [c.get("specs", "") for c in f.get("components", []) if c.get("specs")]
+            sources = f.get("sources", [])
+            findings_text += f"\n**{f['dimension']}** :\n"
+            if comp_names:
+                findings_text += f"  Composants : {', '.join(comp_names)}\n"
+                if specs:
+                    findings_text += f"  Specs : {' | '.join(specs[:2])}\n"
+            else:
+                findings_text += "  Aucun composant identifié dans la documentation.\n"
+            if sources:
+                src_names = [s.split("/")[-1] for s in sources]
+                findings_text += f"  Sources : {', '.join(src_names)}\n"
+
+        logger.info(
+            "[rfq_planner] Phase 4 — synthèse de %d dimension(s):\n%s",
+            len(all_findings), findings_text[:800],
+        )
+
+        system = (
+            "Tu es un synthétiseur de résultats de recherche technique. "
+            "Crée un contexte compact (max 250 mots) pour aider un assistant devis "
+            "à traiter une RFQ industrielle.\n"
+            "Format : bullet points par dimension, composants trouvés avec specs clés.\n"
+            "Sois concis et factuel. Utilise uniquement les informations fournies."
+        )
+        user_msg = (
+            f"RFQ :\n{original_message[:500]}\n\n"
+            f"Résultats de recherche documentaire :\n{findings_text}\n\n"
+            "Synthétise en contexte de devis."
+        )
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            synthesis = data.get("message", {}).get("content", "").strip()
+            logger.info(
+                "[rfq_planner] synthèse produite (%d chars):\n%s",
+                len(synthesis), synthesis[:600],
+            )
+            return synthesis
+        except Exception as exc:
+            logger.warning("[rfq_planner] _synthesize_rfq_context failed: %s", exc)
+            # Fallback : synthèse directe depuis les findings sans LLM
+            lines = []
+            for f in all_findings:
+                comp_names = [c.get("nom", "?") for c in f.get("components", [])]
+                lines.append(
+                    f"• {f['dimension']} : "
+                    + (", ".join(comp_names) if comp_names else "non trouvé")
+                )
+            return "\n".join(lines)
+
+    async def _run_rfq_planner(
+        self, message: str, collection: str
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Async generator : Iterative Gap-Detection Loop pour analyser un RFQ complexe.
+
+        4 phases :
+        1. ANALYZING   : décomposition LLM générique (think=True, min 3 max 6 dims)
+        2. SEARCHING   : RAG search + extraction LLM par dimension
+        3. GAP_CHECK   : détection des lacunes (1 cycle, max 3 gaps)
+        4. SYNTHESIZING: synthèse compacte pour enrichir le system prompt devis
+
+        Yields {"rfq_planning": {"status": "...", "step": "...", ...}} events.
+        Dernier event : {"rfq_planning": {"status": "done", "context": "...", "dimensions_found": N}}
+        """
+        logger.info("=" * 60)
+        logger.info("[rfq_planner] ══ DÉMARRAGE RFQPlanner ══")
+        logger.info("[rfq_planner] message: %d chars | collection: %r", len(message), collection)
+        logger.info("=" * 60)
+
+        # Vérifier que la collection existe avant de lancer les appels LLM
+        try:
+            from backend.api.dependencies import get_collection_manager
+            _cm = get_collection_manager()
+            if not _cm.collection_existe(collection):
+                logger.warning(
+                    "[rfq_planner] collection %r inexistante — planner ignoré", collection
+                )
+                yield {"rfq_planning": {"status": "done", "context": "", "dimensions_found": 0}}
+                return
+        except Exception as exc:
+            logger.warning("[rfq_planner] vérif. collection échouée: %s — poursuite", exc)
+
+        all_findings: list[dict] = []
+
+        # ── Phase 1 : Décomposition ──────────────────────────────────────────
+        yield {"rfq_planning": {"status": "analyzing", "step": "Analyse du RFQ en cours…"}}
+        logger.info("[rfq_planner] ── Phase 1 : décomposition")
+
+        dimensions = await self._decompose_rfq(message)
+
+        if not dimensions:
+            logger.warning("[rfq_planner] 0 dimensions extraites — abandon du planner")
+            yield {"rfq_planning": {"status": "done", "context": "", "dimensions_found": 0}}
+            return
+
+        logger.info("[rfq_planner] Phase 1 ✓ — %d dimensions", len(dimensions))
+        yield {
+            "rfq_planning": {
+                "status": "analyzing",
+                "step": f"{len(dimensions)} dimensions identifiées",
+                "dimensions_found": len(dimensions),
+            }
+        }
+
+        # ── Phase 2 : Recherche RAG — séquentielle (Ollama single-GPU) ──────
+        # asyncio.gather parallèle → queue Ollama saturée → timeouts en cascade
+        # Sur RTX 5090 / vLLM multi-instance → repasser en gather
+        logger.info(
+            "[rfq_planner] ── Phase 2 : %d dimensions séquentielles (Ollama single-GPU)",
+            len(dimensions),
+        )
+        for d in dimensions:
+            logger.info(
+                "[rfq_planner]   • %r → query=%r",
+                d.get("dimension", "?"), d.get("query", ""),
+            )
+        yield {
+            "rfq_planning": {
+                "status": "searching",
+                "step": f"Recherche {len(dimensions)} dimensions…",
+                "dimensions_found": len(dimensions),
+            }
+        }
+
+        import time as _time
+        _phase2_start = _time.monotonic()
+        results = []
+        for dim in dimensions:
+            try:
+                result = await self._search_and_extract_dimension(dim, collection)
+            except Exception as exc:
+                result = exc
+            results.append(result)
+        _phase2_elapsed = _time.monotonic() - _phase2_start
+
+        all_findings = []
+        total_components = 0
+        for i, result in enumerate(results):
+            dim_name = dimensions[i].get("dimension", f"Dim {i + 1}")
+            if isinstance(result, Exception):
+                logger.warning(
+                    "[rfq_planner] [%d/%d] %r — exception: %s",
+                    i + 1, len(dimensions), dim_name, result,
+                )
+                all_findings.append({
+                    "dimension": dim_name,
+                    "query": dimensions[i].get("query", ""),
+                    "components": [],
+                    "sources": [],
+                    "error": str(result),
+                })
+            else:
+                nb = len(result.get("components", []))
+                total_components += nb
+                logger.info(
+                    "[rfq_planner] [%d/%d] %r → %d composant(s) | sources: %s",
+                    i + 1, len(dimensions), dim_name, nb, result.get("sources", []),
+                )
+                all_findings.append(result)
+
+        logger.info(
+            "[rfq_planner] Phase 2 ✓ — %d dimensions | %d composants totaux | %.1fs",
+            len(all_findings), total_components, _phase2_elapsed,
+        )
+
+        # ── Phase 3 : Gap Detection (1 cycle max) ────────────────────────────
+        logger.info("[rfq_planner] ── Phase 3 : détection des gaps")
+        yield {
+            "rfq_planning": {
+                "status": "gap_check",
+                "step": "Vérification des lacunes…",
+                "dimensions_found": len(all_findings),
+            }
+        }
+
+        gaps = await self._detect_rfq_gaps(message, all_findings)
+
+        if gaps:
+            logger.info("[rfq_planner] Phase 3 : %d gap(s) → recherche complémentaire", len(gaps))
+            for j, gap in enumerate(gaps):
+                gap_name = gap.get("dimension", f"Gap {j + 1}")
+                logger.info(
+                    "[rfq_planner] Gap [%d/%d]: %r | query: %r",
+                    j + 1, len(gaps), gap_name, gap.get("query", ""),
+                )
+                yield {
+                    "rfq_planning": {
+                        "status": "searching",
+                        "step": f"Complément [{j + 1}/{len(gaps)}] : {gap_name}",
+                        "dimensions_found": len(dimensions) + len(gaps),
+                    }
+                }
+                gap_finding = await self._search_and_extract_dimension(gap, collection)
+                all_findings.append(gap_finding)
+                nb = len(gap_finding.get("components", []))
+                logger.info(
+                    "[rfq_planner] Gap [%d/%d] → %d composant(s)", j + 1, len(gaps), nb
+                )
+        else:
+            logger.info("[rfq_planner] Phase 3 ✓ — aucun gap critique détecté")
+
+        # ── Phase 4 : Synthèse ───────────────────────────────────────────────
+        logger.info("[rfq_planner] ── Phase 4 : synthèse du contexte")
+        yield {
+            "rfq_planning": {
+                "status": "synthesizing",
+                "step": "Synthèse du contexte RFQ…",
+                "dimensions_found": len(all_findings),
+            }
+        }
+
+        rfq_context = await self._synthesize_rfq_context(message, all_findings)
+
+        total_comp = sum(len(f.get("components", [])) for f in all_findings)
+        logger.info("=" * 60)
+        logger.info("[rfq_planner] ══ TERMINÉ ══")
+        logger.info(
+            "[rfq_planner] %d dimensions | %d composants | contexte %d chars",
+            len(all_findings), total_comp, len(rfq_context),
+        )
+        logger.info("[rfq_planner] CONTEXTE FINAL :\n%s", rfq_context)
+        logger.info("=" * 60)
+
+        yield {
+            "rfq_planning": {
+                "status": "done",
+                "step": f"Contexte établi — {len(all_findings)} dimensions",
+                "dimensions_found": len(all_findings),
+                "context": rfq_context,
+            }
+        }
+
+    async def run_rfq_planner_debug(self, message: str, collection: str) -> dict:
+        """
+        Version debug du RFQPlanner : exécute les 4 phases et retourne une structure
+        JSON complète avec les chunks bruts, composants extraits et contexte final.
+        Utilisé par le endpoint GET /api/v1/devis/rfq-debug.
+        """
+        import time as _time
+
+        result: dict = {
+            "phases": {
+                "decomposition": {"dimensions": [], "error": None},
+                "search": {"findings": []},
+                "gaps": {"detected": [], "findings": []},
+                "synthesis": {"rfq_context": ""},
+            },
+            "timing_s": {},
+        }
+
+        # ── Phase 1 ───────────────────────────────────────────────────────────
+        t0 = _time.monotonic()
+        try:
+            dimensions = await self._decompose_rfq(message)
+        except Exception as exc:
+            result["phases"]["decomposition"]["error"] = str(exc)
+            dimensions = []
+        result["phases"]["decomposition"]["dimensions"] = dimensions
+        result["timing_s"]["decompose"] = round(_time.monotonic() - t0, 2)
+
+        if not dimensions:
+            return result
+
+        # ── Phase 2 ───────────────────────────────────────────────────────────
+        t0 = _time.monotonic()
+        search_findings = []
+        for dim in dimensions:
+            try:
+                finding = await self._search_and_extract_dimension(dim, collection)
+            except Exception as exc:
+                finding = {
+                    "dimension": dim.get("dimension", "?"),
+                    "query": dim.get("query", ""),
+                    "components": [],
+                    "sources": [],
+                    "chunks": [],
+                    "error": str(exc),
+                }
+            search_findings.append(finding)
+        result["phases"]["search"]["findings"] = search_findings
+        result["timing_s"]["search"] = round(_time.monotonic() - t0, 2)
+
+        all_findings = list(search_findings)
+
+        # ── Phase 3 ───────────────────────────────────────────────────────────
+        t0 = _time.monotonic()
+        try:
+            gaps = await self._detect_rfq_gaps(message, all_findings)
+        except Exception as exc:
+            gaps = []
+            result["phases"]["gaps"]["error"] = str(exc)
+        result["phases"]["gaps"]["detected"] = gaps
+
+        gap_findings = []
+        for gap in gaps:
+            try:
+                gf = await self._search_and_extract_dimension(gap, collection)
+            except Exception as exc:
+                gf = {
+                    "dimension": gap.get("dimension", "?"),
+                    "query": gap.get("query", ""),
+                    "components": [],
+                    "sources": [],
+                    "chunks": [],
+                    "error": str(exc),
+                }
+            gap_findings.append(gf)
+            all_findings.append(gf)
+        result["phases"]["gaps"]["findings"] = gap_findings
+        result["timing_s"]["gaps"] = round(_time.monotonic() - t0, 2)
+
+        # ── Phase SQL : lookup catalogue pour chaque composant extrait ───────────
+        t0 = _time.monotonic()
+        for finding in all_findings:
+            sql_postes: list[dict] = []
+            for comp in finding.get("components", []):
+                nom = comp.get("nom", "").strip()
+                if not nom:
+                    continue
+                try:
+                    rows = await asyncio.to_thread(self.catalog.search, nom, 5, "nom_poste")
+                    for row in rows:
+                        sql_postes.append({
+                            "composant_nom": nom,
+                            "nom_poste": row.get("nom_poste", ""),
+                            "nom_affaire": row.get("nom_affaire", ""),
+                            "ensemble": row.get("ensemble", ""),
+                            "fournisseur": row.get("fournisseur", ""),
+                            "prix_unitaire": row.get("prix_unitaire"),
+                        })
+                except Exception as exc:
+                    logger.warning("[rfq_debug] SQL lookup failed for %r: %s", nom, exc)
+            finding["sql_postes"] = sql_postes
+        result["timing_s"]["sql_lookup"] = round(_time.monotonic() - t0, 2)
+
+        # ── Contexte structuré brut (sans LLM) ────────────────────────────────
+        structured_lines: list[str] = []
+        for finding in all_findings:
+            dim = finding.get("dimension", "?")
+            comp_names = [c.get("nom", "?") for c in finding.get("components", [])]
+            sql_postes = finding.get("sql_postes", [])
+            structured_lines.append(f"[{dim}]")
+            if comp_names:
+                structured_lines.append(f"  Composants identifiés : {', '.join(comp_names)}")
+            if sql_postes:
+                seen = set()
+                for p in sql_postes:
+                    key = p["nom_poste"]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    affaire = f" ({p['nom_affaire']})" if p.get("nom_affaire") else ""
+                    prix = f" — {p['prix_unitaire']}€" if p.get("prix_unitaire") else ""
+                    structured_lines.append(f"  • {p['nom_poste']}{affaire}{prix}")
+            else:
+                structured_lines.append("  (aucun poste catalogue trouvé)")
+            structured_lines.append("")
+        structured_context = "\n".join(structured_lines).strip()
+        result["phases"]["synthesis"]["structured_context"] = structured_context
+
+        # ── Phase 4 ───────────────────────────────────────────────────────────
+        t0 = _time.monotonic()
+        try:
+            rfq_context = await self._synthesize_rfq_context(message, all_findings)
+        except Exception as exc:
+            rfq_context = f"(erreur synthèse: {exc})"
+        result["phases"]["synthesis"]["rfq_context"] = rfq_context
+        result["timing_s"]["synthesis"] = round(_time.monotonic() - t0, 2)
+
+        return result
 
     async def _execute_tool(
         self,
@@ -791,13 +1794,64 @@ class DevisService:
         tool_args: dict,
         collection: str,
         conversation_id: str,
+        catalog_method: str = "bm25",
     ) -> str:
         """Execute a single tool call and return result as JSON string."""
+        if tool_name == "plan_tasks":
+            items = tool_args.get("items", [])
+            if isinstance(items, list):
+                items = [str(i).strip() for i in items if str(i).strip()]
+            if items:
+                await asyncio.to_thread(
+                    self.catalog.set_task_list, conversation_id, items
+                )
+                logger.info("plan_tasks: liste enregistrée → %r", items)
+                return json.dumps({"planned": items})
+            return json.dumps({"error": "liste vide"})
+
         if tool_name == "search_catalog":
             query = tool_args.get("query", "")
-            logger.info("search_catalog query=%r", query)
-            results = await asyncio.to_thread(self.catalog.search, query, 40)
-            logger.info("search_catalog returned %d results (raw)", len(results))
+            logger.info("search_catalog query=%r catalog_method=%r", query, catalog_method)
+            column = tool_args.get("column", "nom_poste")
+
+            # ── SQL (NL2SQL) path ──────────────────────────────────────────────
+            _use_sql = catalog_method == "sql" and self.excel_adapter is not None
+            if _use_sql:
+                if not self.excel_adapter.has_excel_data(_CATALOG_CHALLENGE_COLLECTION):
+                    if _CATALOG_PATH.exists():
+                        logger.info("search_catalog (SQL): indexation du catalogue…")
+                        await asyncio.to_thread(
+                            self.excel_adapter.ingest, _CATALOG_PATH, _CATALOG_CHALLENGE_COLLECTION
+                        )
+                    else:
+                        logger.warning("search_catalog (SQL): catalogue introuvable, fallback BM25")
+                        _use_sql = False
+
+            if _use_sql and self.excel_adapter.has_excel_data(_CATALOG_CHALLENGE_COLLECTION):
+                sql_result = await asyncio.to_thread(
+                    self.excel_adapter.nl2sql_query, query, _CATALOG_CHALLENGE_COLLECTION
+                )
+                results = sql_result.get("results", [])
+                logger.info(
+                    "search_catalog (SQL) → %d résultats bruts, SQL: %s",
+                    len(results), sql_result.get("sql", "")[:200],
+                )
+                # FTS5 cherche dans toutes les colonnes → post-filtrer sur la colonne cible
+                # pour ne garder que les lignes où la colonne demandée contient réellement la requête
+                if results:
+                    filtered = await asyncio.to_thread(
+                        self.catalog.filter_to_column_matches, query, column, results
+                    )
+                    if filtered:
+                        results = filtered
+                        logger.info(
+                            "search_catalog (SQL) → %d résultats après filtre colonne=%r",
+                            len(results), column,
+                        )
+            else:
+                # ── BM25 path (default) ────────────────────────────────────────
+                results = await asyncio.to_thread(self.catalog.search, query, 40, column)
+                logger.info("search_catalog (BM25) → %d results (raw)", len(results))
 
             # Fetch current affaire context and user's chosen search scope
             current_affaire = await asyncio.to_thread(
@@ -824,97 +1878,159 @@ class DevisService:
                     len(results),
                 )
 
-            # Stash the affaire-filtered results BEFORE column filter so element
-            # detection in chat_stream always has access to the full raw results.
+            # Stash results for element detection in chat_stream.
             self._last_raw_results: list[dict] = results
 
-            # Column filter: restrict results to rows where the requested column
-            # matches the query. Default column="nom_poste" means only postes whose
-            # name matches the query are returned — elements/ensemble/affaire BM25
-            # hits are excluded, avoiding irrelevant poste cards.
-            column = tool_args.get("column", "nom_poste")
-            col_hits = await asyncio.to_thread(
-                self.catalog.filter_to_column_matches, query, column, results
+            # Per-column BM25 already searched the right column — no post-filter needed.
+            # If BM25 returned nothing, results is empty → column choice card will be emitted.
+            logger.info(
+                "search_catalog: column=%r BM25 → %d résultats",
+                column, len(results),
             )
-            if col_hits:
-                results = col_hits
-                logger.info(
-                    "search_catalog: column=%r filter → %d/%d résultats retenus",
-                    column, len(col_hits), len(self._last_raw_results),
-                )
-            elif column == "nom_poste":
-                # No nom_poste match — BM25 matched only in other columns (elements,
-                # ensemble, nom_affaire…). Clear results so chat_stream emits the
-                # column choice card instead of showing irrelevant postes.
-                results = []
-                logger.info(
-                    "search_catalog: no nom_poste match for %r — results cleared",
-                    query,
-                )
 
-            # Extract unique (num_poste, nom_affaire) pairs (normalized) from
-            # filtered results, preserving BM25 ranking order.
+            # Extract unique (nom_poste, nom_affaire) pairs from BM25 results.
+            # Using nom_poste (not num_poste) as key: num_poste is not unique per poste
+            # within an affaire in practice, which caused unrelated postes to appear.
             seen_pairs: set[tuple] = set()
             pairs: list[tuple[str, str]] = []
             for row in results:
-                if not row.get("nom_poste"):
+                nom_p = (row.get("nom_poste") or "").strip()
+                if not nom_p:
                     continue
-                np = str(row.get("num_poste") or "").strip()
                 na = (row.get("nom_affaire") or "").strip().lower()
-                key = (np, na)
+                key = (nom_p, na)
                 if key not in seen_pairs:
                     seen_pairs.add(key)
-                    pairs.append((np, na))
+                    pairs.append((nom_p, na))
 
             # SQL GROUP BY + SUM(fourniture) → prix_total per poste+affaire.
             deduped = await asyncio.to_thread(
-                self.catalog.get_postes_aggregated, pairs
+                self.catalog.get_postes_aggregated_by_name, pairs
             )
 
             # Re-apply BM25 ranking order (SQL GROUP BY doesn't preserve it).
             pair_order = {p: i for i, p in enumerate(pairs)}
             deduped.sort(key=lambda r: pair_order.get(
-                (str(r.get("num_poste") or "").strip(),
+                ((r.get("nom_poste") or "").strip(),
                  (r.get("nom_affaire") or "").strip().lower()),
                 999,
             ))
             logger.info("search_catalog aggregated → %d postes distincts", len(deduped))
 
+            if len(deduped) == 1:
+                # Single unambiguous result: tell LLM to add immediately.
+                deduped[0]["_hint"] = "1 résultat → add_to_panier maintenant."
+            elif len(deduped) > 1:
+                # Multiple postes: LLM must reason before showing choice cards.
+                # Hint on first row only to minimise token overhead.
+                deduped[0]["_next_action"] = (
+                    "N postes trouvés → MUST call tool: "
+                    "specs détectées? search_docs(catalog_refs=[…])+report_findings. "
+                    "Sinon: ask_user_choice. Pas de texte."
+                )
+
             return json.dumps(deduped, ensure_ascii=False, default=str)
+
+        if tool_name == "search_collection_excel":
+            query = tool_args.get("query", "")
+            logger.info("search_collection_excel query=%r collection=%r", query, collection)
+            if self.excel_adapter is None:
+                return json.dumps({"error": "ExcelCollectionAdapter non disponible"})
+            if not self.excel_adapter.has_excel_data(collection):
+                return json.dumps({"error": "Aucun fichier Excel dans cette collection", "results": []})
+            try:
+                sql_result = await asyncio.to_thread(
+                    self.excel_adapter.nl2sql_query, query, collection
+                )
+                logger.info(
+                    "search_collection_excel → %d résultats, SQL: %s",
+                    len(sql_result.get("results", [])), sql_result.get("sql", "")[:200],
+                )
+                return json.dumps(sql_result, ensure_ascii=False, default=str)
+            except Exception as exc:
+                logger.warning("search_collection_excel failed: %s", exc)
+                return json.dumps({"error": str(exc)})
+
+        if tool_name == "report_findings":
+            components = tool_args.get("components", [])
+            context = tool_args.get("context", "")
+            return json.dumps({"found": components, "context": context})
 
         if tool_name == "search_docs":
             query = tool_args.get("query", "")
+            catalog_refs = tool_args.get("catalog_refs") or []
+            # Enrich the RAG query with catalog refs using a structured format so the
+            # multi-query generator understands the search intent (verify specs on specific
+            # models) rather than treating the refs as part of the component description.
+            if catalog_refs:
+                refs_str = " | ".join(catalog_refs)
+                query = (
+                    f"Élément recherché : {query} "
+                    f"| Postes catalogue à vérifier : {refs_str}"
+                )
+                logger.info("search_docs: query enriched with %d catalog_refs", len(catalog_refs))
             # Always use the collection from the request — never trust the LLM's choice
             logger.info("search_docs query=%r collection=%r", query, collection)
             try:
-                from core.collection_manager import CollectionManager
+                from backend.api.dependencies import get_collection_manager
                 from core.search import RAGEngine
 
-                cm = CollectionManager()
+                cm = get_collection_manager()
                 rag = RAGEngine(
                     nom_collection=collection,
                     prompt_name="defaut",
                     collection_manager=cm,
                 )
-                result = await asyncio.to_thread(
-                    rag.rechercher_debug, query, ""
-                )
-                chunks = [
-                    {
-                        "content": c.get("content_preview", c.get("content", "")),
-                        "source": c.get("source", ""),
-                    }
-                    for c in result.get("chunks", [])[:5]
-                ]
-                logger.info("search_docs returned %d chunks", len(chunks))
+                # Pipeline complet : HyDE + multi-query + BM25 + reranker.
+                # USE_PARENT_CHILD=true → retourne parent text (~800-1200 tokens)
+                # pour avoir le contexte complet des tableaux de specs.
+                contexte, sources = await asyncio.to_thread(rag.rechercher, query)
+                context_parts = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
 
-                # Enrich result with all catalog poste names so the LLM can
-                # cross-reference doc content with known catalog items directly.
-                catalog_postes = await asyncio.to_thread(self.catalog.get_all_postes)
-                return json.dumps(
-                    {"chunks": chunks, "catalog_postes": catalog_postes},
-                    ensure_ascii=False,
+                # Traitement chunk par chunk : chaque parent complet (~4000 chars)
+                # est envoyé individuellement au LLM d'extraction.
+                MAX_CHUNKS = 3
+                MAX_CHARS_PER_CHUNK = 6000
+                chunks_raw = []
+                all_components: list[dict] = []
+
+                for i in range(min(MAX_CHUNKS, len(context_parts))):
+                    text = context_parts[i][:MAX_CHARS_PER_CHUNK]
+                    source = sources[i].get("fichier", "") if i < len(sources) else ""
+                    chunk = {"text": text, "source": source}
+                    chunks_raw.append(chunk)
+                    logger.debug(
+                        "search_docs chunk[%d] (%d chars, src=%r): %r",
+                        i, len(text), source, text[:120],
+                    )
+                    chunk_extraction = await self._extract_components_from_chunks([chunk], query)
+                    all_components.extend(chunk_extraction.get("components", []))
+
+                # Dédup par nom
+                seen_noms: set[str] = set()
+                deduped: list[dict] = []
+                for comp in all_components:
+                    nom = comp.get("nom", "")
+                    if nom and nom not in seen_noms:
+                        seen_noms.add(nom)
+                        deduped.append(comp)
+                    elif not nom:
+                        deduped.append(comp)
+
+                unique_sources = list(dict.fromkeys(
+                    c["source"] for c in chunks_raw if c["source"]
+                ))
+                extraction = {"components": deduped, "sources": unique_sources}
+                logger.info(
+                    "search_docs: %d chunk(s) traités → %d composant(s)",
+                    len(chunks_raw), len(deduped),
                 )
+
+                logger.info(
+                    "search_docs: résultat final — %d composant(s), sources: %s",
+                    len(extraction.get("components", [])), unique_sources,
+                )
+                return json.dumps(extraction, ensure_ascii=False)
             except Exception as exc:
                 logger.warning("search_docs failed: %s", exc)
                 return json.dumps({"error": str(exc)})
@@ -949,6 +2065,13 @@ class DevisService:
             added  = result.get("added", [])
             errors = result.get("errors", [])
             current_affaire = result.get("current_affaire")
+            # Auto-complete matching tasks in the task list
+            for added_poste in added:
+                await asyncio.to_thread(
+                    self.catalog.complete_task_item,
+                    conversation_id,
+                    added_poste["nom_poste"],
+                )
             response: dict = {
                 "added": len(added),
                 "postes": [p["nom_poste"] for p in added],
@@ -971,6 +2094,49 @@ class DevisService:
                 )
             return json.dumps(response, ensure_ascii=False, default=str)
 
+        if tool_name == "update_panier_item":
+            nom_poste = tool_args.get("nom_poste", "").strip()
+            panier = await asyncio.to_thread(self.catalog.get_panier, conversation_id)
+            matched = next((p for p in panier if p["nom_poste"] == nom_poste), None)
+            if not matched:
+                matched = next((p for p in panier if p["nom_poste"].lower() == nom_poste.lower()), None)
+            if not matched:
+                matched = next((p for p in panier
+                                if nom_poste.lower() in p["nom_poste"].lower()
+                                or p["nom_poste"].lower() in nom_poste.lower()), None)
+            if not matched:
+                return json.dumps({"error": f"Poste '{nom_poste}' non trouvé dans le panier"})
+            fields: dict = {}
+            for f in ("nbre_jours_etude", "nbre_jours_atelier", "nbre_jours_client"):
+                if f in tool_args:
+                    fields[f] = int(tool_args[f])
+            if "is_option" in tool_args:
+                fields["is_option"] = bool(tool_args["is_option"])
+            if not fields:
+                return json.dumps({"error": "Aucun champ à modifier"})
+            await asyncio.to_thread(
+                self.catalog.update_panier_item, conversation_id, matched["id"], fields
+            )
+            logger.info("update_panier_item: %s → %r", matched["nom_poste"], fields)
+            await asyncio.to_thread(
+                self.catalog.complete_task_item, conversation_id, matched["nom_poste"]
+            )
+            return json.dumps({"updated": matched["nom_poste"], "item_id": matched["id"], "fields": fields})
+
+        if tool_name == "set_devis_settings":
+            coefficient = float(tool_args.get("coefficient", -1))
+            coef_final  = float(tool_args.get("coef_final", -1))
+            # Read current values to fill in the one not supplied
+            current = await asyncio.to_thread(self.catalog.get_devis_settings, conversation_id)
+            if coefficient < 0:
+                coefficient = current.get("coefficient", 0.0)
+            if coef_final < 0:
+                coef_final = current.get("coef_final", 0.0)
+            await asyncio.to_thread(
+                self.catalog.set_devis_settings, conversation_id, coefficient, coef_final
+            )
+            return json.dumps({"coefficient": coefficient, "coef_final": coef_final})
+
         return json.dumps({"error": f"Outil inconnu : {tool_name}"})
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -981,20 +2147,82 @@ class DevisService:
         collection: str,
         conversation_id: str,
         history: list[dict],
+        catalog_method: str = "bm25",
     ) -> AsyncGenerator[dict, None]:
         """
         Async generator yielding SSE events for a devis chat turn.
         Handles the tool-calling loop then streams the final text response.
         """
-        messages: list[dict] = [{"role": "system", "content": _build_system_prompt(collection)}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": message})
+        settings = await asyncio.to_thread(self.catalog.get_devis_settings, conversation_id)
+        current_panier = await asyncio.to_thread(self.catalog.get_panier, conversation_id)
+        current_tasks = await asyncio.to_thread(self.catalog.get_task_list, conversation_id)
 
+        rfq_context: str | None = None
         _add_to_panier_succeeded = False
 
         try:
+            # ── RFQ Planner : analyse documentaire sur le premier message ──────
+            if not history:
+                logger.info(
+                    "[chat_stream] Premier message — lancement RFQPlanner collection=%r",
+                    collection,
+                )
+                async for planner_event in self._run_rfq_planner(message, collection):
+                    if (
+                        "rfq_planning" in planner_event
+                        and planner_event["rfq_planning"].get("status") == "done"
+                    ):
+                        rfq_context = planner_event["rfq_planning"].get("context") or None
+                    yield planner_event
+                logger.info(
+                    "[chat_stream] RFQPlanner terminé — rfq_context: %d chars",
+                    len(rfq_context) if rfq_context else 0,
+                )
+
+            messages: list[dict] = [{"role": "system", "content": _build_system_prompt(
+                collection,
+                current_coefficient=settings.get("coefficient", 0.0),
+                current_coef_final=settings.get("coef_final", 0.0),
+                panier=current_panier,
+                task_list=current_tasks or None,
+                rfq_context=rfq_context,
+            )}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": message})
+
             # ── Tool-calling loop (non-streaming) ─────────────────────────────
-            for _ in range(MAX_TOOL_ITERATIONS):
+            _original_user_msg = message  # gardé pour la compression
+            for _iter in range(MAX_TOOL_ITERATIONS):
+                # ── Context compression : évite la troncature Ollama ──────────
+                _msg_chars = self._estimate_chars(messages)
+                logger.info(
+                    "[tool_loop] iter=%d | messages=%d | chars(excl.sys)=%d | seuil=%d",
+                    _iter, len(messages), _msg_chars, _COMPRESS_CHARS_THRESHOLD,
+                )
+                if _msg_chars > _COMPRESS_CHARS_THRESHOLD:
+                    logger.info(
+                        "[tool_loop] ⚡ Seuil dépassé (%d > %d) → compression",
+                        _msg_chars, _COMPRESS_CHARS_THRESHOLD,
+                    )
+                    messages = await self._compress_tool_results(messages, _original_user_msg)
+
+                # Rebuild system prompt with fresh panier + task list so the LLM
+                # always sees up-to-date state (tasks checked off, new panier items).
+                _panier_now = await asyncio.to_thread(self.catalog.get_panier, conversation_id)
+                _tasks_now  = await asyncio.to_thread(self.catalog.get_task_list, conversation_id)
+                messages[0] = {"role": "system", "content": _build_system_prompt(
+                    collection,
+                    current_coefficient=settings.get("coefficient", 0.0),
+                    current_coef_final=settings.get("coef_final", 0.0),
+                    panier=_panier_now,
+                    task_list=_tasks_now or None,
+                    rfq_context=rfq_context,
+                )}
+                _sys_chars = len(messages[0]["content"])
+                logger.info(
+                    "[tool_loop] system_prompt=%d chars | total_prompt~%d chars (~%d tokens)",
+                    _sys_chars, _sys_chars + _msg_chars, (_sys_chars + _msg_chars) // 4,
+                )
                 response = await self._ollama_chat(messages, tools=_TOOLS)
                 assistant_msg = response.get("message", {})
                 tool_calls = assistant_msg.get("tool_calls") or []
@@ -1033,9 +2261,67 @@ class DevisService:
                         yield {"done": True, "panier": panier}
                         return
 
+                    # report_findings: show component list and ask confirmation before catalog search
+                    if tool_name == "report_findings":
+                        components = tool_args.get("components", [])
+                        context = tool_args.get("context", "")
+                        catalog_matches = tool_args.get("catalog_matches") or []
+                        doc_only_models = tool_args.get("doc_only_models") or []
+                        suggestion = tool_args.get("suggestion", "")
+                        yield {"tool_call": {"name": tool_name, "status": "running"}}
+                        yield {"tool_call": {"name": tool_name, "status": "done"}}
+                        # Build action buttons depending on context
+                        if catalog_matches:
+                            # Spec-aware flow: best match or search anyway
+                            btn_label = suggestion or "Ajouter quand même"
+                            options = [
+                                {
+                                    "id": json.dumps(
+                                        {"action": "confirm_findings", "components": components},
+                                        ensure_ascii=False,
+                                    ),
+                                    "label": btn_label,
+                                    "detail": f"{len(components)} composant(s)",
+                                },
+                                {
+                                    "id": json.dumps({"action": "cancel_findings"}, ensure_ascii=False),
+                                    "label": "Annuler",
+                                },
+                            ]
+                        else:
+                            # Standard flow (docs → catalog)
+                            options = [
+                                {
+                                    "id": json.dumps(
+                                        {"action": "confirm_findings", "components": components},
+                                        ensure_ascii=False,
+                                    ),
+                                    "label": "Chercher dans le catalogue",
+                                    "detail": f"{len(components)} composant(s) à rechercher",
+                                },
+                                {
+                                    "id": json.dumps({"action": "cancel_findings"}, ensure_ascii=False),
+                                    "label": "Annuler",
+                                },
+                            ]
+                        yield {
+                            "choices": {
+                                "type": "findings_confirmation",
+                                "question": context or "Composants identifiés dans la documentation :",
+                                "components": components,
+                                "catalog_matches": catalog_matches,
+                                "doc_only_models": doc_only_models,
+                                "suggestion": suggestion,
+                                "options": options,
+                            }
+                        }
+                        panier = await asyncio.to_thread(self.catalog.get_panier, conversation_id)
+                        yield {"done": True, "panier": panier}
+                        return
+
                     yield {"tool_call": {"name": tool_name, "status": "running"}}
                     result = await self._execute_tool(
-                        tool_name, tool_args, collection, conversation_id
+                        tool_name, tool_args, collection, conversation_id, catalog_method
                     )
 
                     # After search_catalog: server-side conflict/element detection
@@ -1076,8 +2362,32 @@ class DevisService:
 
                             elif matches_postes:
                                 # Default column="nom_poste" and nom_poste matches found.
-                                # PRIORITY 1: multiple postes, PRIORITY 2: single poste multi-affaires.
-                                choice_event = _detect_conflict(deduped_results, current_affaire)
+                                # For multiple distinct postes: do NOT auto-emit choice cards.
+                                # The LLM must decide: specs to verify → report_findings,
+                                # no specs → ask_user_choice. The _next_action hint in the
+                                # tool result enforces this.
+                                conflict = _detect_conflict(deduped_results, current_affaire)
+                                if conflict and conflict.get("type") == "affaire":
+                                    # Single poste / multiple affaires: safe to auto-handle.
+                                    choice_event = conflict
+                                else:
+                                    # Multiple distinct postes: emit a catalog_preview so the
+                                    # user can see what was found while the LLM reasons.
+                                    if len(deduped_results) > 1:
+                                        yield {
+                                            "catalog_preview": {
+                                                "query": query_str,
+                                                "postes": [
+                                                    {
+                                                        "nom_poste": _s(r.get("nom_poste")),
+                                                        "ensemble":  _s(r.get("ensemble")),
+                                                        "nom_affaire": _s(r.get("nom_affaire")),
+                                                    }
+                                                    for r in deduped_results[:5]
+                                                ],
+                                            }
+                                        }
+                                    choice_event = None
 
                             else:
                                 # Default column="nom_poste", no nom_poste match found.
@@ -1196,6 +2506,27 @@ class DevisService:
                         except Exception:
                             pass
 
+                    # Emit settings update to frontend immediately
+                    if tool_name == "set_devis_settings":
+                        try:
+                            parsed_settings = json.loads(result)
+                            yield {"settings": {
+                                "coefficient": parsed_settings.get("coefficient", 0.0),
+                                "coef_final":  parsed_settings.get("coef_final", 0.0),
+                            }}
+                        except Exception:
+                            pass
+
+                    # Emit highlight event for visually marking the updated panier item
+                    if tool_name == "update_panier_item":
+                        try:
+                            parsed_update = json.loads(result)
+                            item_id = parsed_update.get("item_id")
+                            if item_id:
+                                yield {"highlight": item_id}
+                        except Exception:
+                            pass
+
                     messages.append({"role": "tool", "content": result})
                     yield {"tool_call": {"name": tool_name, "status": "done"}}
 
@@ -1204,6 +2535,15 @@ class DevisService:
                     self.catalog.get_panier, conversation_id
                 )
                 yield {"panier": panier}
+
+                # If any update_panier_item was called this round, stop the loop.
+                # The system-prompt panier context is stale (captured before the loop),
+                # so the LLM would keep retrying the same update unnecessarily.
+                if any(
+                    tc.get("function", {}).get("name") == "update_panier_item"
+                    for tc in tool_calls
+                ):
+                    break
 
             # ── Final streaming response (no tools passed) ────────────────────
             async with httpx.AsyncClient(timeout=300.0) as client:

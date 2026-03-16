@@ -1,17 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
-import "highlight.js/styles/github-dark.css";
-import { ArrowDown, Check, Copy, Send } from "lucide-react";
-import Image from "next/image";
-import { addMessage, fetchCollections, fetchLLMStatus, getConversationMessages, streamChat } from "@/app/lib/api";
-import type { ChatMessage, ChatSource } from "@/app/lib/types";
+import { ArrowDown, Send } from "lucide-react";
+import { fetchCollections, fetchLLMStatus, getConversationMessages, streamChat } from "@/app/lib/api";
+import type { ChatMessage } from "@/app/lib/types";
 import { useConversation } from "@/app/providers";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
 
 // ─── Suggestion Cards ──────────────────────────────────────────────────────────
 const SUGGESTIONS = [
@@ -21,136 +17,16 @@ const SUGGESTIONS = [
   { title: "Aide à la rédaction", subtitle: "Génère du contenu à partir de tes sources" },
 ];
 
-// ─── Inline / Block Code ───────────────────────────────────────────────────────
-function CodeBlock({
-  className,
-  children,
-  ...props
-}: React.HTMLAttributes<HTMLElement>) {
-  const [copied, setCopied] = useState(false);
-  const match = /language-(\w+)/.exec(className || "");
-  const language = match?.[1] ?? "";
-  const code = String(children).replace(/\n$/, "");
-
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  if (!match) {
-    return (
-      <code
-        className="bg-muted text-orange-400 dark:text-orange-300 px-1.5 py-0.5 rounded text-[0.85em] font-mono"
-        {...props}
-      >
-        {children}
-      </code>
-    );
-  }
-
-  return (
-    <div className="relative my-4 rounded-lg overflow-hidden border border-border">
-      <div className="flex items-center justify-between px-4 py-2 bg-muted/60 border-b border-border">
-        <span className="text-fluid-xs text-muted-foreground font-mono">{language}</span>
-        <button
-          onClick={handleCopy}
-          className="flex items-center gap-1.5 text-fluid-xs text-muted-foreground hover:text-foreground transition-colors"
-        >
-          {copied ? <Check size={13} /> : <Copy size={13} />}
-          {copied ? "Copié !" : "Copier"}
-        </button>
-      </div>
-      <pre className="overflow-x-auto p-4 text-fluid-sm m-0 bg-[#0d1117]">
-        <code className={className} {...props}>
-          {children}
-        </code>
-      </pre>
-    </div>
-  );
-}
-
 // ─── Message item ──────────────────────────────────────────────────────────────
 function MessageItem({ msg }: { msg: ChatMessage }) {
-  if (msg.role === "user") {
-    return (
-      <div className="flex justify-end mb-6">
-        <div className="max-w-[80%] bg-muted text-foreground rounded-[18px] px-4 py-3 text-fluid-sm leading-relaxed whitespace-pre-wrap">
-          {msg.content}
-        </div>
-      </div>
-    );
-  }
-
+  if (msg.role === "user") return <UserBubble content={msg.content} />;
   return (
-    <div className="flex gap-3 mb-6">
-      {/* Avatar */}
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center mt-0.5 border border-border">
-        <Image
-          src="/logoVLM.png"
-          alt="RAG Local"
-          width={18}
-          height={18}
-          className="object-contain"
-        />
-      </div>
-      {/* Content */}
-      <div className="flex-1 min-w-0">
-        <div className="prose prose-base dark:prose-invert max-w-none text-foreground leading-relaxed">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeHighlight]}
-            components={{
-              code: CodeBlock as React.ComponentType<React.HTMLAttributes<HTMLElement>>,
-              a: ({ href, children }) => (
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-500 hover:underline"
-                >
-                  {children}
-                </a>
-              ),
-            }}
-          >
-            {msg.content || (msg.isStreaming ? "\u200b" : "")}
-          </ReactMarkdown>
-          {msg.isStreaming && (
-            <span className="inline-block w-[2px] h-4 bg-foreground/60 animate-pulse align-middle ml-0.5" />
-          )}
-        </div>
-        {/* Sources */}
-        {msg.sources && msg.sources.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {msg.sources.map((src: ChatSource, i: number) => (
-              <span
-                key={i}
-                className="text-fluid-xs text-muted-foreground bg-muted border border-border rounded px-2 py-1"
-              >
-                {src.fichier} · p.{src.page}
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── Loading dots ──────────────────────────────────────────────────────────────
-function LoadingDots() {
-  return (
-    <div className="flex gap-3 mb-6">
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center border border-border">
-        <Image src="/logoVLM.png" alt="RAG Local" width={18} height={18} className="object-contain" />
-      </div>
-      <div className="flex items-center gap-1.5 mt-2">
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.3s]" />
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.15s]" />
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce" />
-      </div>
-    </div>
+    <AssistantMessage
+      content={msg.content}
+      sources={msg.sources}
+      metrics={msg.metrics}
+      isStreaming={msg.isStreaming}
+    />
   );
 }
 
@@ -289,7 +165,7 @@ export default function ChatPage() {
       try {
         let firstToken = true;
 
-        for await (const event of streamChat(text, collection, "defaut", history)) {
+        for await (const event of streamChat(text, collection, "defaut", history, convId ?? undefined)) {
           if (event.error) {
             setError(event.error);
             setIsLoading(false);
@@ -320,7 +196,7 @@ export default function ChatPage() {
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === assistantId
-                  ? { ...m, sources: event.sources ?? [], isStreaming: false }
+                  ? { ...m, sources: event.sources ?? [], metrics: event.metrics, isStreaming: false }
                   : m
               )
             );
@@ -335,12 +211,8 @@ export default function ChatPage() {
         setError(msg);
         setIsLoading(false);
       } finally {
-        // Persist to DB
-        if (convId) {
-          await addMessage(convId, "user", text);
-          if (assistantContent) await addMessage(convId, "assistant", assistantContent);
-          refreshConversations();
-        }
+        // Le backend persiste les messages directement (résistant aux déconnexions SSE)
+        if (convId) refreshConversations();
       }
     },
     [input, isLoading, llmReady, messages, collection, mode, createConversation, refreshConversations, scrollToBottom]

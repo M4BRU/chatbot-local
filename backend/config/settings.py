@@ -31,3 +31,12 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://frontend:3000"]
+
+    # Claude API (mode agent orchestrateur)
+    anthropic_api_key: str = ""
+    claude_model: str = "claude-sonnet-4-6"
+    agent_max_tokens: int = 2048
+
+    # OpenAI API (modes simple_gpt / combined_gpt)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o"

@@ -166,7 +166,7 @@ def _docling_result_to_pages(result, chemin: Path) -> list[ParsedPage]:
     pour une meilleure détection des titres et sections.
     """
     from collections import defaultdict
-    from docling_core.types.doc import TableItem, TextItem, DocItemLabel
+    from docling_core.types.doc import TableItem, TextItem, DocItemLabel, PictureItem
 
     doc = result.document
     pages_content: dict[int, list[str]] = defaultdict(list)
@@ -201,6 +201,18 @@ def _docling_result_to_pages(result, chemin: Path) -> list[ParsedPage]:
                     metadata_prefix = f"[TABLE-L{level}]{section_ref}"
                 except Exception:
                     pass
+
+        elif isinstance(item, PictureItem):
+            # Image : pas d'analyse visuelle, juste un label [IMAGE] + légende Docling si dispo.
+            # Évite les parents "vide" (titre seul) sur les pages constituées d'un titre + image.
+            caption = ""
+            try:
+                caption = item.caption_text(doc).strip() if hasattr(item, "caption_text") else ""
+            except Exception:
+                pass
+            section_ref = f"[{last_section}]" if last_section else ""
+            text = f"[IMAGE]{section_ref}" + (f" — {caption}" if caption else "")
+            metadata_prefix = f"[IMAGE-L{level}] "
 
         elif isinstance(item, TextItem):
             text = item.text
@@ -397,19 +409,45 @@ def _parser_excel_pandas(chemin: Path) -> list[ParsedPage]:
     Fallback Excel via pandas.
     Groupe les lignes par blocs de 30 (headers répétés) pour éviter
     les micro-chunks (une ligne = un chunk) avec le semantic chunker.
+    Filtre les feuilles cachées/très cachées (.xls via xlrd).
     """
     import pandas as pd
 
     ROWS_PER_BLOCK = 30
     pages = []
 
+    # Détection visibilité feuilles pour .xls (xlrd expose hidden/vhidden)
+    hidden_sheets: set[str] = set()
+    if chemin.suffix.lower() == ".xls":
+        try:
+            import xlrd
+            wb = xlrd.open_workbook(str(chemin))
+            for i in range(wb.nsheets):
+                vis = wb.sheet_visibility(i)  # 0=visible, 1=hidden, 2=très caché
+                name = wb.sheet_names()[i]
+                if vis != 0:
+                    hidden_sheets.add(name)
+            logger.info(
+                f"Excel .xls {chemin.name} : {wb.nsheets} feuilles total, "
+                f"{len(hidden_sheets)} cachées — {list(hidden_sheets)[:5]}"
+            )
+        except Exception as e:
+            logger.debug(f"xlrd visibility check échoué ({e}) — toutes feuilles incluses")
+
     try:
         excel_file = pd.ExcelFile(str(chemin))
+        all_sheets = excel_file.sheet_names
+        visible_sheets = [s for s in all_sheets if s not in hidden_sheets]
+        skipped = len(all_sheets) - len(visible_sheets)
+        if skipped:
+            logger.info(f"Excel {chemin.name} : {skipped} feuilles cachées ignorées sur {len(all_sheets)}")
 
-        for sheet_name in excel_file.sheet_names:
+        for sheet_name in visible_sheets:
             df = pd.read_excel(excel_file, sheet_name=sheet_name)
             if df.empty:
                 continue
+
+            logger.debug(f"  Feuille '{sheet_name}' : {len(df)} lignes × {len(df.columns)} colonnes")
 
             # Diviser en blocs de ROWS_PER_BLOCK lignes avec headers répétés
             for i in range(0, len(df), ROWS_PER_BLOCK):
@@ -430,4 +468,5 @@ def _parser_excel_pandas(chemin: Path) -> list[ParsedPage]:
         logger.warning(f"Impossible de lire {chemin.name} : {e}")
         return []
 
+    logger.info(f"Excel {chemin.name} : {len(pages)} pages parsées")
     return pages

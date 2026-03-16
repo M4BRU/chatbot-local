@@ -1,11 +1,16 @@
 # syntax=docker/dockerfile:1
-# Image de base ML — à rebuilder UNIQUEMENT quand requirements-ml.txt change.
+# Image de base — à rebuilder quand un fichier requirements-*.txt change.
 #
 # Build :  docker build -f backend/Dockerfile.base -t chatbot-local-ml-base .
-# Puis le Dockerfile principal utilise FROM chatbot-local-ml-base
 #
-# Cette image contient torch + docling + FlagEmbedding (~9GB).
-# Elle n'est jamais modifiée pour de simples changements de code.
+# 3 couches indépendantes — Docker cache chaque couche séparément :
+#   Layer 1 : ML lourds (torch, docling, FlagEmbedding…) ~30–60 min  — change rarement
+#   Layer 2 : Infra (chromadb, qdrant, pandas, pymupdf…)  ~5–10 min  — change rarement
+#   Layer 3 : App (fastapi, uvicorn, anthropic, openai…)  ~1–2 min   — change parfois
+#
+# Si seul requirements.txt (app) change → seul Layer 3 se relance (~1–2 min).
+# Si seul requirements-infra.txt change → Layer 2 + 3 se relancent (~6–12 min).
+# Si requirements-ml.txt change → tout relance (~36–72 min).
 
 FROM python:3.12-slim
 
@@ -18,8 +23,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Layer 1 : ML lourds (torch ecosystem) ────────────────────────────────────
 COPY backend/requirements-ml.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --user -r requirements-ml.txt
+
+# ── Layer 2 : Infra (C/Rust natif, sans torch) ───────────────────────────────
+COPY backend/requirements-infra.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --user -r requirements-infra.txt
+
+# ── Layer 3 : App (pure Python) ──────────────────────────────────────────────
+COPY backend/requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --user -r requirements.txt
 
 ENV PATH=/root/.local/bin:$PATH

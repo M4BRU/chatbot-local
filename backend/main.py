@@ -9,8 +9,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.dependencies import get_settings
-from backend.api.routes import chat_router, collections_router, conversations_router, devis_router, documents_router, health_router
+from backend.api.routes import agent_router, chat_router, collections_router, conversations_router, devis_router, documents_router, excel_documents_router, eval_router, health_router
 
+logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
@@ -82,9 +83,12 @@ def _warmup_all() -> None:
 async def lifespan(app: FastAPI):
     """Lance le pre-warm Ollama + reranker en arrière-plan au démarrage."""
     # Init SQLite DBs
-    from backend.api.dependencies import get_conversation_manager, get_catalog_adapter
+    from backend.api.dependencies import get_conversation_manager, get_catalog_adapter, get_excel_collection_adapter
     get_conversation_manager().init_db()
     get_catalog_adapter().init_db()  # creates devis_paniers table
+    get_excel_collection_adapter().init_db()  # creates excel_collections table
+    from backend.core.eval_store import init_eval_db
+    init_eval_db()  # creates eval_log table
 
     loop = asyncio.get_event_loop()
     logger.info("Démarrage pre-warm modèles (arrière-plan)…")
@@ -114,7 +118,10 @@ app.include_router(chat_router)
 app.include_router(collections_router)
 app.include_router(conversations_router)
 app.include_router(documents_router)
+app.include_router(excel_documents_router)
 app.include_router(devis_router)
+app.include_router(eval_router)
+app.include_router(agent_router)
 
 
 @app.get("/")

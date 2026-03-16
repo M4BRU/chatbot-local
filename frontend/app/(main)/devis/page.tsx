@@ -1,19 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
-import "highlight.js/styles/github-dark.css";
-import { ArrowDown, ChevronDown, Download, FileText, Send, ShoppingCart, Trash2, X } from "lucide-react";
+import { ArrowDown, ChevronDown, ChevronRight, Download, MoreHorizontal, Send, Trash2, X } from "lucide-react";
 import Image from "next/image";
+import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
 import {
   addElementToPanierDirect,
+  addPosteToPanierDirect,
   addMessage,
   clearPanier,
   exportDevisExcel,
   fetchCatalogStatus,
   fetchCollections,
+  fetchDevisSettings,
   fetchLLMStatus,
   fetchPanier,
   fetchPosteElements,
@@ -23,18 +22,60 @@ import {
   setSearchScope,
   streamDevisChat,
   streamGenerateDevis,
+  updateDevisSettings,
+  updatePanierItem,
 } from "@/app/lib/api";
 import type { CatalogElement, ChatMessage, PanierItem } from "@/app/lib/types";
 import { useConversation } from "@/app/providers";
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+
+// ─── RFQ Planning progress banner ─────────────────────────────────────────────
+const RFQ_STATUS_LABELS: Record<string, string> = {
+  analyzing:    "Analyse du RFQ",
+  searching:    "Recherche documentaire",
+  gap_check:    "Vérification des lacunes",
+  synthesizing: "Synthèse du contexte",
+};
+
+function RfqPlanningBanner({
+  planning,
+}: {
+  planning: { status: string; step: string; dimensions_found?: number };
+}) {
+  return (
+    <div className="flex gap-3 mb-4">
+      <div className="w-8 shrink-0" />
+      <div className="flex-1 rounded-lg border border-blue-500/20 bg-blue-500/5 px-4 py-3 max-w-[580px]">
+        <div className="flex items-center gap-2 mb-1.5">
+          <svg className="animate-spin h-3.5 w-3.5 text-blue-500 shrink-0" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+          <span className="text-xs font-semibold text-blue-600 dark:text-blue-400">
+            Analyse RFQ — {RFQ_STATUS_LABELS[planning.status] ?? planning.status}
+          </span>
+          {planning.dimensions_found != null && planning.dimensions_found > 0 && (
+            <span className="ml-auto text-xs bg-blue-500/15 rounded-full px-2 py-0.5 text-blue-700 dark:text-blue-300 shrink-0">
+              {planning.dimensions_found} dim.
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">{planning.step}</p>
+      </div>
+    </div>
+  );
+}
 
 // ─── Tool call status badge ────────────────────────────────────────────────────
 const TOOL_LABELS: Record<string, string> = {
   search_catalog: "Recherche dans le catalogue",
   search_docs: "Recherche dans les documents",
-  add_to_panier: "Ajout au panier",
+  report_findings: "Identification des composants",
+  add_to_panier: "Ajout au devis",
   ask_user_choice: "Présentation des options",
+  set_devis_settings: "Mise à jour des coefficients",
+  update_panier_item: "Modification du poste",
 };
 
 interface ToolCallState {
@@ -76,87 +117,239 @@ type VariantOption = {
   rows?: (string | number | null)[][];
 };
 
+// ─── Affaire row with lazy-loaded elements ─────────────────────────────────────
+function AffaireRow({
+  nomPoste,
+  nomAffaire,
+  prixTotal,
+  disabled,
+}: {
+  nomPoste: string;
+  nomAffaire: string;
+  prixTotal: string | null;
+  disabled?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [elements, setElements] = useState<CatalogElement[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const toggle = async () => {
+    if (disabled) return;
+    if (!expanded && elements === null) {
+      setLoading(true);
+      try {
+        const data = await fetchPosteElements(nomPoste, nomAffaire);
+        setElements(data);
+      } catch {
+        setElements([]);
+      } finally {
+        setLoading(false);
+      }
+    }
+    setExpanded((v) => !v);
+  };
+
+  return (
+    <div className="border-b border-border/40 last:border-0">
+      <button
+        onClick={toggle}
+        disabled={disabled}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-muted/30 transition-colors text-left disabled:opacity-50"
+      >
+        <span className="font-medium text-foreground truncate max-w-[60%]">{nomAffaire}</span>
+        <div className="flex items-center gap-2 shrink-0">
+          {prixTotal && <span className="text-muted-foreground">{prixTotal}</span>}
+          {loading ? (
+            <svg className="animate-spin h-3 w-3 text-muted-foreground" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+            </svg>
+          ) : (
+            <ChevronDown className={cn("h-3 w-3 text-muted-foreground transition-transform", expanded && "rotate-180")} />
+          )}
+        </div>
+      </button>
+
+      {expanded && elements !== null && (
+        <div className="bg-muted/20 border-t border-border/30 overflow-x-auto">
+          {elements.length === 0 ? (
+            <p className="px-3 py-2 text-xs text-muted-foreground">Aucun élément trouvé.</p>
+          ) : (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-border/40 bg-muted/40">
+                  <th className="px-3 py-1.5 text-left text-muted-foreground font-medium">Éléments</th>
+                  <th className="px-3 py-1.5 text-left text-muted-foreground font-medium">Fournisseur</th>
+                  <th className="px-3 py-1.5 text-left text-muted-foreground font-medium">Prix €</th>
+                </tr>
+              </thead>
+              <tbody>
+                {elements.map((el, i) => (
+                  <tr key={i} className={cn("border-b border-border/30 last:border-0", i % 2 !== 0 && "bg-muted/10")}>
+                    <td className="px-3 py-1.5 text-foreground">{el.elements || "—"}</td>
+                    <td className="px-3 py-1.5 text-foreground">{el.fournisseur || "—"}</td>
+                    <td className="px-3 py-1.5 text-foreground">{el.fourniture != null ? String(el.fourniture) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function QueryVariantSelector({
   question,
   options,
   onSelect,
   disabled,
+  type,
 }: {
   question: string;
   options: VariantOption[];
   onSelect: (id: string, label: string) => void;
   disabled?: boolean;
+  type?: string;
 }) {
-  const [activeIdx, setActiveIdx] = useState(0);
-  const active = options[activeIdx];
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
 
   return (
-    <div className="max-w-2xl">
+    <div className="max-w-2xl w-full">
       <p className="text-sm text-foreground mb-3">{question}</p>
 
-      {/* Horizontal cards */}
-      <div className="flex gap-2 overflow-x-auto pb-2 mb-3">
-        {options.map((opt, i) => (
-          <button
-            key={opt.id}
-            disabled={disabled}
-            onClick={() => setActiveIdx(i)}
-            className={cn(
-              "flex-shrink-0 rounded-lg border p-3 text-left transition-all min-w-[160px] max-w-[220px]",
-              i === activeIdx
-                ? "border-foreground/50 bg-muted shadow-sm"
-                : "border-border bg-card hover:bg-muted/40 hover:border-foreground/20",
-              disabled && "opacity-50 cursor-not-allowed"
-            )}
-          >
-            <p className="text-xs font-medium text-foreground truncate">{opt.label}</p>
-            {opt.description && (
-              <span className="inline-block mt-1 text-xs bg-foreground/10 text-foreground/70 rounded-full px-2 py-0.5">
-                {opt.description}
-              </span>
-            )}
-            {opt.detail && (
-              <p className="text-xs text-muted-foreground mt-1 truncate">{opt.detail}</p>
-            )}
-          </button>
-        ))}
+      <div className="flex flex-col gap-2">
+        {options.map((opt, i) => {
+          const isExpanded = expandedIdx === i;
+
+          // ── "poste" type: each card lists affaires, each affaire row is expandable ──
+          if (type === "poste") {
+            let nomPoste = opt.label;
+            let occurrences: { nom_affaire: string; num_poste: string }[] = [];
+            try {
+              const parsed = JSON.parse(opt.id);
+              nomPoste = parsed.nom_poste ?? opt.label;
+              occurrences = parsed.occurrences ?? [];
+            } catch { /* keep defaults */ }
+
+            // Build prix map from opt.rows (col 0 = nom_affaire, col 1 = prix)
+            const prixMap: Record<string, string> = {};
+            (opt.rows ?? []).forEach((row) => {
+              if (row[0]) prixMap[String(row[0])] = row[1] != null ? String(row[1]) : "";
+            });
+            const uniqueAffaires = [...new Set(occurrences.map((o) => o.nom_affaire))];
+
+            return (
+              <div
+                key={opt.id}
+                className={cn("rounded-lg border bg-card transition-all", isExpanded ? "border-foreground/40 shadow-sm" : "border-border")}
+              >
+                {/* Card header */}
+                <div className="p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-medium text-foreground">{nomPoste}</p>
+                    {opt.detail && <span className="text-xs text-muted-foreground shrink-0">{opt.detail}</span>}
+                  </div>
+                  <div className="flex items-center gap-2 mt-2">
+                    <button
+                      onClick={() => setExpandedIdx(isExpanded ? null : i)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <ChevronDown className={cn("h-3 w-3 transition-transform", isExpanded && "rotate-180")} />
+                      {isExpanded ? "Masquer les affaires" : `${uniqueAffaires.length} affaire${uniqueAffaires.length > 1 ? "s" : ""}`}
+                    </button>
+                    {!disabled && (
+                      <button
+                        onClick={() => onSelect(opt.id, opt.label)}
+                        className="ml-auto rounded-full bg-foreground text-background px-3 py-1 text-xs font-medium hover:opacity-80 transition-all"
+                      >
+                        Sélectionner
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Affaire rows — each expandable to show elements */}
+                {isExpanded && (
+                  <div className="border-t border-border">
+                    {uniqueAffaires.map((aff) => (
+                      <AffaireRow
+                        key={aff}
+                        nomPoste={nomPoste}
+                        nomAffaire={aff}
+                        prixTotal={prixMap[aff] ?? null}
+                        disabled={disabled}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          // ── "affaire" type: each card has pre-loaded elements ──────────────────
+          const hasTable = opt.columns && opt.rows && opt.rows.length > 0;
+          return (
+            <div
+              key={opt.id}
+              className={cn("rounded-lg border bg-card transition-all", isExpanded ? "border-foreground/40 shadow-sm" : "border-border")}
+            >
+              <div className="p-3">
+                <p className="text-xs font-medium text-foreground">{opt.label}</p>
+                <div className="flex items-center gap-2 mt-1 flex-wrap">
+                  {opt.description && (
+                    <span className="text-xs bg-foreground/10 text-foreground/70 rounded-full px-2 py-0.5">{opt.description}</span>
+                  )}
+                  {opt.detail && <span className="text-xs text-muted-foreground">{opt.detail}</span>}
+                </div>
+                <div className="flex items-center gap-2 mt-2 flex-wrap">
+                  {hasTable && (
+                    <button
+                      onClick={() => setExpandedIdx(isExpanded ? null : i)}
+                      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <ChevronDown className={cn("h-3 w-3 transition-transform", isExpanded && "rotate-180")} />
+                      {isExpanded ? "Masquer les éléments" : `Voir les ${opt.rows!.length} éléments`}
+                    </button>
+                  )}
+                  {!disabled && (
+                    <button
+                      onClick={() => onSelect(opt.id, opt.label)}
+                      className="ml-auto rounded-full bg-foreground text-background px-3 py-1 text-xs font-medium hover:opacity-80 transition-all"
+                    >
+                      Sélectionner
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {isExpanded && hasTable && (
+                <div className="border-t border-border overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-border bg-muted/50">
+                        {opt.columns!.map((col) => (
+                          <th key={col} className="px-3 py-2 text-left text-muted-foreground font-medium whitespace-nowrap">{col}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {opt.rows!.map((row, ri) => (
+                        <tr key={ri} className={cn("border-b border-border/40 last:border-0", ri % 2 !== 0 && "bg-muted/20")}>
+                          {row.map((cell, ci) => (
+                            <td key={ci} className="px-3 py-2 text-foreground">{cell ?? "—"}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
-
-      {/* Table for active card */}
-      {active?.columns && active?.rows && active.rows.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-border mb-3 bg-card">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="border-b border-border bg-muted/50">
-                {active.columns.map((col) => (
-                  <th key={col} className="px-3 py-2 text-left text-muted-foreground font-medium whitespace-nowrap">
-                    {col}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {active.rows.map((row, ri) => (
-                <tr key={ri} className={cn("border-b border-border/40 last:border-0", ri % 2 !== 0 && "bg-muted/20")}>
-                  {row.map((cell, ci) => (
-                    <td key={ci} className="px-3 py-2 text-foreground">{cell ?? "—"}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Confirm */}
-      {!disabled && (
-        <button
-          onClick={() => onSelect(active.id, active.label)}
-          className="rounded-full bg-foreground text-background px-4 py-1.5 text-sm font-medium hover:opacity-80 transition-all"
-        >
-          Sélectionner « {active?.label} »
-        </button>
-      )}
     </div>
   );
 }
@@ -171,15 +364,7 @@ function MessageItem({
   toolCalls?: ToolCallState[];
   onChoiceSelect?: (id: string, label: string, messageId: string) => void | Promise<void>;
 }) {
-  if (msg.role === "user") {
-    return (
-      <div className="flex justify-end mb-6">
-        <div className="max-w-[80%] bg-muted text-foreground rounded-[18px] px-4 py-3 text-fluid-sm leading-relaxed whitespace-pre-wrap">
-          {msg.content}
-        </div>
-      </div>
-    );
-  }
+  if (msg.role === "user") return <UserBubble content={msg.content} />;
 
   // Choice cards
   if (msg.type === "choices" && msg.choices) {
@@ -197,7 +382,97 @@ function MessageItem({
             options={msg.choices.options}
             disabled={!!msg.choiceSelected}
             onSelect={(id, label) => onChoiceSelect?.(id, label, msg.id)}
+            type={choiceType}
           />
+        </div>
+      );
+    }
+
+    // Findings confirmation card — list of components found in docs
+    if (choiceType === "findings_confirmation") {
+      const components = msg.choices.components ?? [];
+      const catalogMatches = msg.choices.catalog_matches ?? [];
+      const docOnlyModels = msg.choices.doc_only_models ?? [];
+      const hasSpecInfo = catalogMatches.length > 0;
+
+      const specIcon: Record<string, string> = {
+        match: "✅",
+        partial: "🟡",
+        no_match: "❌",
+        unknown: "❓",
+      };
+
+      return (
+        <div className="flex gap-3 mb-6">
+          <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center mt-0.5 border border-border">
+            <Image src="/logoVLM.png" alt="Devis" width={18} height={18} className="object-contain" />
+          </div>
+          <div className="max-w-xl w-full">
+            <p className="text-sm text-foreground mb-3">{msg.choices.question}</p>
+
+            {/* Spec-aware: catalog matches with status */}
+            {hasSpecInfo && (
+              <div className="rounded-lg border border-border bg-muted/20 mb-3 overflow-hidden">
+                <p className="text-xs font-semibold text-muted-foreground px-3 py-2 border-b border-border/60 uppercase tracking-wide">
+                  Postes catalogue
+                </p>
+                {catalogMatches.map((m, i) => (
+                  <div key={i} className="flex items-start gap-2 px-3 py-2 border-b border-border/40 last:border-0">
+                    <span className="text-sm shrink-0">{specIcon[m.spec_status] ?? "❓"}</span>
+                    <div>
+                      <span className="text-xs font-medium text-foreground">{m.nom_poste}</span>
+                      {m.note && <p className="text-xs text-muted-foreground mt-0.5">{m.note}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Standard flow: simple component chips */}
+            {!hasSpecInfo && components.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-4">
+                {components.map((comp, i) => (
+                  <span
+                    key={i}
+                    className="rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-700 dark:text-blue-300 px-2.5 py-1 text-xs font-medium"
+                  >
+                    {comp}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Doc-only models — informational */}
+            {docOnlyModels.length > 0 && (
+              <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 mb-3 px-3 py-2">
+                <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 mb-1">
+                  📄 Modèles en documentation (absents du catalogue)
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {docOnlyModels.map((m, i) => (
+                    <span key={i} className="text-xs text-amber-700 dark:text-amber-300 bg-amber-500/10 rounded-full px-2 py-0.5 border border-amber-500/20">
+                      {m}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div className="flex flex-wrap gap-2">
+              {msg.choices.options.map((opt) => (
+                <button
+                  key={opt.id}
+                  disabled={!!msg.choiceSelected}
+                  onClick={() => onChoiceSelect?.(opt.id, opt.label, msg.id)}
+                  title={opt.detail}
+                  className="rounded-full border border-border bg-card px-3 py-1.5 text-sm hover:bg-muted/60 hover:border-foreground/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       );
     }
@@ -229,192 +504,376 @@ function MessageItem({
   }
 
   return (
-    <div className="flex gap-3 mb-6">
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center mt-0.5 border border-border">
-        <Image src="/logoVLM.png" alt="Devis" width={18} height={18} className="object-contain" />
-      </div>
-      <div className="flex-1 min-w-0">
-        {/* Tool call indicators attached to this message */}
-        {toolCalls && toolCalls.map((tc) => <ToolCallBadge key={tc.id} tool={tc} />)}
-        <div className="prose prose-base dark:prose-invert max-w-none text-foreground leading-relaxed">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeHighlight]}
-            components={{
-              a: ({ href, children }) => (
-                <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">
-                  {children}
-                </a>
-              ),
-            }}
-          >
-            {msg.content || (msg.isStreaming ? "\u200b" : "")}
-          </ReactMarkdown>
-          {msg.isStreaming && (
-            <span className="inline-block w-[2px] h-4 bg-foreground/60 animate-pulse align-middle ml-0.5" />
-          )}
-        </div>
-      </div>
-    </div>
+    <AssistantMessage content={msg.content} isStreaming={msg.isStreaming} noCode>
+      {toolCalls && toolCalls.map((tc) => <ToolCallBadge key={tc.id} tool={tc} />)}
+    </AssistantMessage>
   );
 }
 
-// ─── Loading dots ──────────────────────────────────────────────────────────────
-function LoadingDots() {
-  return (
-    <div className="flex gap-3 mb-6">
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center border border-border">
-        <Image src="/logoVLM.png" alt="Devis" width={18} height={18} className="object-contain" />
-      </div>
-      <div className="flex items-center gap-1.5 mt-2">
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.3s]" />
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.15s]" />
-        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce" />
-      </div>
-    </div>
-  );
-}
-
-// ─── Panier panel ─────────────────────────────────────────────────────────────
-function PanierPanel({
-  panier,
-  onRemoveItem,
-  onClear,
-  onGenerate,
-  onExportExcel,
-  isGenerating,
-  isExporting,
+// ─── Poste row (editable MdO fields, expandable elements) ─────────────────────
+function PosteRow({
+  item,
+  isOption,
+  highlighted,
+  onUpdate,
+  onRemove,
 }: {
-  panier: PanierItem[];
-  onRemoveItem: (id: string) => void;
-  onClear: () => void;
-  onGenerate: () => void;
-  onExportExcel: () => void;
-  isGenerating: boolean;
-  isExporting: boolean;
+  item: PanierItem;
+  isOption: boolean;
+  highlighted?: boolean;
+  onUpdate: (itemId: string, field: string, value: number | boolean) => Promise<void>;
+  onRemove: (itemId: string) => void;
 }) {
-  // null = loading, [] = vide, [...] = chargé
-  const [expandedItems, setExpandedItems] = useState<Record<string, CatalogElement[] | null>>({});
+  const etudRef = useRef<HTMLInputElement>(null);
+  const atelRef = useRef<HTMLInputElement>(null);
+  const clientRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [elements, setElements] = useState<CatalogElement[] | null>(null);
+  const [loadingEl, setLoadingEl] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [pending, setPending] = useState<Record<string, boolean>>({});
+  const [fieldErr, setFieldErr] = useState<Record<string, boolean>>({});
 
-  const toggleExpand = async (item: PanierItem) => {
-    if (expandedItems[item.id] !== undefined) {
-      setExpandedItems((prev) => {
-        const n = { ...prev };
-        delete n[item.id];
-        return n;
-      });
-    } else {
-      setExpandedItems((prev) => ({ ...prev, [item.id]: null }));
-      const elems = await fetchPosteElements(item.nom_poste, item.nom_affaire ?? undefined);
-      setExpandedItems((prev) => ({ ...prev, [item.id]: elems }));
+  // Sync uncontrolled inputs when item props change externally (e.g., LLM update_panier_item)
+  useEffect(() => {
+    if (etudRef.current && document.activeElement !== etudRef.current)
+      etudRef.current.value = String(item.nbre_jours_etude ?? 0);
+    if (atelRef.current && document.activeElement !== atelRef.current)
+      atelRef.current.value = String(item.nbre_jours_atelier ?? 0);
+    if (clientRef.current && document.activeElement !== clientRef.current)
+      clientRef.current.value = String(item.nbre_jours_client ?? 0);
+  }, [item.nbre_jours_etude, item.nbre_jours_atelier, item.nbre_jours_client]);
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handle = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [menuOpen]);
+
+  const toggleExpand = async () => {
+    if (!expanded && elements === null) {
+      setLoadingEl(true);
+      try {
+        const data = await fetchPosteElements(item.nom_poste, item.nom_affaire);
+        setElements(data);
+      } catch {
+        setElements([]);
+      } finally {
+        setLoadingEl(false);
+      }
+    }
+    setExpanded(v => !v);
+  };
+
+  const handleNumBlur = async (field: string, ref: React.RefObject<HTMLInputElement | null>) => {
+    const el = ref.current;
+    if (!el) return;
+    const newVal = Math.max(0, parseInt(el.value) || 0);
+    const originalVal = (item[field as keyof PanierItem] as number) ?? 0;
+    if (newVal === originalVal) return;
+    setPending(prev => ({ ...prev, [field]: true }));
+    try {
+      await onUpdate(item.id, field, newVal);
+    } catch {
+      el.value = String(originalVal);
+      setFieldErr(prev => ({ ...prev, [field]: true }));
+      setTimeout(() => setFieldErr(prev => ({ ...prev, [field]: false })), 3000);
+    } finally {
+      setPending(prev => ({ ...prev, [field]: false }));
     }
   };
 
+  const numFields: [string, React.RefObject<HTMLInputElement | null>][] = [
+    ["nbre_jours_etude", etudRef],
+    ["nbre_jours_atelier", atelRef],
+    ["nbre_jours_client", clientRef],
+  ];
+
   return (
-    <aside className="w-72 flex-shrink-0 border-l border-border flex flex-col bg-card h-full overflow-hidden">
+    <>
+      <tr
+        onClick={toggleExpand}
+        className={cn(
+          "border-b border-border/40 cursor-pointer select-none transition-colors",
+          isOption ? "bg-amber-500/5 hover:bg-amber-500/10" : "hover:bg-muted/20",
+          highlighted && "bg-blue-500/10 animate-pulse"
+        )}
+      >
+        {/* Expand indicator (visual only — row click handles toggle) */}
+        <td className="px-1.5 py-1.5 text-center w-6 text-muted-foreground">
+          {loadingEl ? (
+            <svg className="animate-spin h-3 w-3 inline" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+            </svg>
+          ) : expanded ? (
+            <ChevronDown className="h-3 w-3 inline" />
+          ) : (
+            <ChevronRight className="h-3 w-3 inline" />
+          )}
+        </td>
+        {/* Poste + Affaire */}
+        <td className="px-2 py-1.5 text-xs max-w-[120px]">
+          <div className="font-medium truncate" title={item.nom_poste}>{item.nom_poste}</div>
+          {item.nom_affaire && (
+            <div className="text-muted-foreground truncate text-[10px]" title={item.nom_affaire}>
+              {item.nom_affaire}
+            </div>
+          )}
+        </td>
+        {/* MdO number fields — stopPropagation so clicking input doesn't toggle row */}
+        {numFields.map(([field, ref]) => (
+          <td key={field} className="px-1 py-1.5 text-center" onClick={e => e.stopPropagation()}>
+            <input
+              ref={ref}
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              defaultValue={String((item[field as keyof PanierItem] as number) ?? 0)}
+              onBlur={() => handleNumBlur(field, ref)}
+              disabled={!!pending[field]}
+              className={cn(
+                "w-10 text-center text-xs border rounded px-1 py-0.5 bg-transparent focus:outline-none focus:ring-1 focus:ring-foreground/20",
+                pending[field] && "opacity-50 cursor-wait",
+                fieldErr[field] ? "border-destructive" : "border-border"
+              )}
+            />
+          </td>
+        ))}
+        {/* ··· context menu */}
+        <td className="px-1 py-1.5 text-center" onClick={e => e.stopPropagation()}>
+          <div ref={menuRef} className="relative inline-block">
+            <button
+              onClick={() => setMenuOpen(v => !v)}
+              className="text-muted-foreground hover:text-foreground transition-colors"
+              title="Actions"
+            >
+              <MoreHorizontal className="h-3.5 w-3.5" />
+            </button>
+            {menuOpen && (
+              <div className="absolute right-0 bottom-full mb-1 z-50 bg-card border border-border rounded-md shadow-lg py-1 min-w-[180px]">
+                <button
+                  onClick={() => {
+                    onUpdate(item.id, "is_option", !isOption).catch(() => {});
+                    setMenuOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-xs hover:bg-muted/60 transition-colors"
+                >
+                  {isOption ? "↑ Remettre en poste principal" : "↓ Passer en option"}
+                </button>
+                <div className="border-t border-border/50 my-1" />
+                <button
+                  onClick={() => { onRemove(item.id); setMenuOpen(false); }}
+                  className="w-full text-left px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 transition-colors"
+                >
+                  Supprimer
+                </button>
+              </div>
+            )}
+          </div>
+        </td>
+        {/* Delete shortcut */}
+        <td className="px-1.5 py-1.5 text-center" onClick={e => e.stopPropagation()}>
+          <button
+            onClick={() => onRemove(item.id)}
+            className="text-muted-foreground hover:text-destructive transition-colors"
+            title="Retirer"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </td>
+      </tr>
+      {/* Expanded elements sub-table */}
+      {expanded && elements !== null && (
+        <tr className="border-b border-border/40">
+          <td />
+          <td colSpan={6} className="pb-2 pr-2">
+            <div className="rounded border border-border/40 bg-muted/20 overflow-x-auto">
+              {elements.length === 0 ? (
+                <p className="px-3 py-2 text-xs text-muted-foreground">Aucun élément trouvé.</p>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-border/40 bg-muted/30">
+                      <th className="px-2 py-1 text-left text-muted-foreground font-medium">Ensemble</th>
+                      <th className="px-2 py-1 text-left text-muted-foreground font-medium">Éléments</th>
+                      <th className="px-2 py-1 text-left text-muted-foreground font-medium">Fournisseur</th>
+                      <th className="px-2 py-1 text-right text-muted-foreground font-medium">Fourniture €</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {elements.map((el, i) => (
+                      <tr key={i} className={cn("border-b border-border/30 last:border-0", i % 2 !== 0 && "bg-muted/10")}>
+                        <td className="px-2 py-1">{el.ensemble || "—"}</td>
+                        <td className="px-2 py-1">{el.elements || "—"}</td>
+                        <td className="px-2 py-1">{el.fournisseur || "—"}</td>
+                        <td className="px-2 py-1 text-right">{el.fourniture != null ? String(el.fourniture) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// ─── Devis panel ──────────────────────────────────────────────────────────────
+function DevisPanel({
+  postes,
+  devisSettings,
+  highlightedId,
+  onSettingsChange,
+  onUpdateItem,
+  onRemoveItem,
+  onClear,
+  onExportExcel,
+  isExporting,
+}: {
+  postes: PanierItem[];
+  devisSettings: { coefficient: number; coef_final: number };
+  highlightedId?: string | null;
+  onSettingsChange: (key: "coefficient" | "coef_final", value: number) => void;
+  onUpdateItem: (itemId: string, field: string, value: number | boolean) => Promise<void>;
+  onRemoveItem: (itemId: string) => void;
+  onClear: () => void;
+  onExportExcel: () => void;
+  isExporting: boolean;
+}) {
+  const mainPostes   = postes.filter(p => !p.is_option);
+  const optionPostes = postes.filter(p => p.is_option);
+
+  // Group postes by ensemble, preserving first-appearance order, "Autre" last
+  function groupByEnsemble(items: PanierItem[]): { ensemble: string; rows: PanierItem[] }[] {
+    const order: string[] = [];
+    const map = new Map<string, PanierItem[]>();
+    for (const item of items) {
+      const key = item.ensemble?.trim() || "__autre__";
+      if (!map.has(key)) { map.set(key, []); order.push(key); }
+      map.get(key)!.push(item);
+    }
+    // "Autre" always last
+    const sorted = order.filter(k => k !== "__autre__");
+    if (map.has("__autre__")) sorted.push("__autre__");
+    return sorted.map(k => ({ ensemble: k === "__autre__" ? "Autre" : k, rows: map.get(k)! }));
+  }
+
+  return (
+    <aside className="w-[45%] flex-shrink-0 border-l border-border flex flex-col bg-card min-h-0 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <div className="flex items-center gap-2">
-          <ShoppingCart className="h-4 w-4 text-muted-foreground" />
-          <span className="text-sm font-medium">Panier ({panier.length})</span>
-        </div>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
+        <span className="text-sm font-medium">Postes du devis ({mainPostes.length}{optionPostes.length > 0 ? ` + ${optionPostes.length} opt.` : ""})</span>
         <button
           onClick={onClear}
-          title="Vider le panier"
+          title="Vider le devis"
           className="text-muted-foreground hover:text-destructive transition-colors"
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>
       </div>
 
-      {/* Items */}
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
-        {panier.map((item) => {
-          const expanded = expandedItems[item.id] !== undefined;
-          const elements = expandedItems[item.id];
-          return (
-            <div
-              key={item.id}
-              className="group rounded-lg border border-border bg-background p-2.5"
-            >
-              <div className="flex items-start gap-2">
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-medium truncate">{item.nom_poste}</p>
-                  {item.ensemble && (
-                    <p className="text-xs text-muted-foreground truncate">{item.ensemble}</p>
-                  )}
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="text-xs text-muted-foreground">Qté {item.quantite}</span>
-                    {item.fournisseur && (
-                      <span className="text-xs text-muted-foreground truncate">· {item.fournisseur}</span>
-                    )}
-                  </div>
-                  {item.nom_affaire && (
-                    <p className="text-xs text-muted-foreground/60 truncate mt-0.5">Réf. {item.nom_affaire}</p>
-                  )}
-                </div>
-                <div className="flex items-center gap-1 shrink-0 mt-0.5">
-                  <button
-                    onClick={() => toggleExpand(item)}
-                    title="Voir les éléments"
-                    className="text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    <ChevronDown className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")} />
-                  </button>
-                  <button
-                    onClick={() => onRemoveItem(item.id)}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity"
-                    title="Retirer"
-                  >
-                    <X className="h-3 w-3 text-muted-foreground hover:text-destructive" />
-                  </button>
-                </div>
-              </div>
+      {/* Settings row — no spinners on these inputs */}
+      <div className="flex items-center gap-4 px-4 py-2 border-b border-border bg-muted/20 flex-shrink-0">
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap">
+          Coeff. fournitures %
+          <input
+            type="text"
+            inputMode="numeric"
+            value={devisSettings.coefficient}
+            onChange={e => onSettingsChange("coefficient", parseFloat(e.target.value) || 0)}
+            className="w-16 text-center text-xs border border-border rounded px-1 py-0.5 bg-transparent focus:outline-none focus:ring-1 focus:ring-foreground/20"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap">
+          Coef. final %
+          <input
+            type="text"
+            inputMode="numeric"
+            value={devisSettings.coef_final}
+            onChange={e => onSettingsChange("coef_final", parseFloat(e.target.value) || 0)}
+            className="w-16 text-center text-xs border border-border rounded px-1 py-0.5 bg-transparent focus:outline-none focus:ring-1 focus:ring-foreground/20"
+          />
+        </label>
+      </div>
 
-              {/* Accordion: sub-elements */}
-              {expanded && (
-                <div className="mt-2 pl-2 border-l border-border space-y-1">
-                  {elements === null ? (
-                    <p className="text-xs text-muted-foreground">Chargement…</p>
-                  ) : elements.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">Aucun détail disponible</p>
-                  ) : (
-                    elements.map((el, i) => (
-                      <div key={i} className="text-xs text-muted-foreground">
-                        <span className="font-medium">{el.elements || "—"}</span>
-                        {el.fournisseur && <span> · {el.fournisseur}</span>}
-                        {el.fourniture != null && <span> · {el.fourniture}€</span>}
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
+      {/* Table */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <table className="w-full">
+          <thead className="sticky top-0 bg-card z-10">
+            <tr className="border-b border-border text-xs text-muted-foreground">
+              <th className="w-6" />
+              <th className="px-2 py-2 text-left font-medium">Poste / Affaire</th>
+              <th className="px-1 py-2 text-center font-medium whitespace-nowrap">Étude (j)</th>
+              <th className="px-1 py-2 text-center font-medium whitespace-nowrap">Atelier (j)</th>
+              <th className="px-1 py-2 text-center font-medium whitespace-nowrap">Client (j)</th>
+              <th className="px-1 py-2 text-center font-medium" title="Basculer option / poste">↕</th>
+              <th className="w-6" />
+            </tr>
+          </thead>
+          <tbody>
+            {groupByEnsemble(mainPostes).map(({ ensemble, rows }) => (
+              <>
+                <tr key={`grp-${ensemble}`}>
+                  <td colSpan={7} className="px-3 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground bg-muted/40 border-y border-border/40 uppercase">
+                    {ensemble}
+                  </td>
+                </tr>
+                {rows.map(item => (
+                  <PosteRow
+                    key={item.id}
+                    item={item}
+                    isOption={false}
+                    highlighted={highlightedId === item.id}
+                    onUpdate={onUpdateItem}
+                    onRemove={onRemoveItem}
+                  />
+                ))}
+              </>
+            ))}
+            {/* Options section separator */}
+            {optionPostes.length > 0 && (
+              <tr>
+                <td colSpan={7} className="px-3 py-1.5 text-[11px] font-semibold text-amber-600 dark:text-amber-400 bg-amber-500/10 border-y border-amber-500/20">
+                  ✦ Options (en sus)
+                </td>
+              </tr>
+            )}
+            {groupByEnsemble(optionPostes).map(({ ensemble, rows }) => (
+              <>
+                {rows.map(item => (
+                  <PosteRow
+                    key={item.id}
+                    item={item}
+                    isOption={true}
+                    highlighted={highlightedId === item.id}
+                    onUpdate={onUpdateItem}
+                    onRemove={onRemoveItem}
+                  />
+                ))}
+              </>
+            ))}
+          </tbody>
+        </table>
       </div>
 
       {/* Footer */}
-      <div className="px-3 py-3 border-t border-border space-y-2">
-        <button
-          onClick={onGenerate}
-          disabled={isGenerating || panier.length === 0}
-          className={cn(
-            "w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-all",
-            isGenerating || panier.length === 0
-              ? "bg-muted text-muted-foreground cursor-not-allowed"
-              : "bg-foreground text-background hover:opacity-80"
-          )}
-        >
-          <FileText className="h-4 w-4" />
-          {isGenerating ? "Génération…" : "Générer le devis"}
-        </button>
+      <div className="px-4 py-3 border-t border-border flex-shrink-0">
         <button
           onClick={onExportExcel}
-          disabled={isExporting || panier.length === 0}
+          disabled={isExporting || postes.length === 0}
           className={cn(
             "w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-all border",
-            isExporting || panier.length === 0
+            isExporting || postes.length === 0
               ? "border-border bg-muted text-muted-foreground cursor-not-allowed"
               : "border-green-600/40 bg-green-600/10 text-green-700 dark:text-green-400 hover:bg-green-600/20"
           )}
@@ -450,6 +909,7 @@ const SUGGESTIONS = [
 // ─── Main page ─────────────────────────────────────────────────────────────────
 export default function DevisPage() {
   const { currentConversationId, createConversation, refreshConversations, mode } = useConversation();
+  const { setOpen: setSidebarOpen } = useSidebar();
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -462,13 +922,21 @@ export default function DevisPage() {
   const [catalogLoaded, setCatalogLoaded] = useState(false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [catalogMethod, setCatalogMethod] = useState<"bm25" | "sql">("bm25");
+
+  // RFQ planning progress state
+  const [rfqPlanning, setRfqPlanning] = useState<{ status: string; step: string; dimensions_found?: number } | null>(null);
 
   // Tool calls for the current streaming turn
   const [activeToolCalls, setActiveToolCalls] = useState<ToolCallState[]>([]);
   // Map of assistantMessageId → tool calls that belong to it
   const [messageToolCalls, setMessageToolCalls] = useState<Record<string, ToolCallState[]>>({});
 
-  const [panier, setPanier] = useState<PanierItem[]>([]);
+  const [postes, setPostes] = useState<PanierItem[]>([]);
+  const [devisSettings, setDevisSettings] = useState({ coefficient: 0, coef_final: 0 });
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const activeConvIdRef = useRef<string | null>(null);
   const skipNextReloadRef = useRef<boolean>(false);
@@ -477,6 +945,19 @@ export default function DevisPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scopeChoicePendingRef = useRef(false);
   const pendingMessageRef = useRef<string>("");
+  // Keep a stable ref to setSidebarOpen to avoid effect re-runs
+  const setSidebarOpenRef = useRef(setSidebarOpen);
+  setSidebarOpenRef.current = setSidebarOpen;
+  const prevPostesLengthRef = useRef(0);
+
+  // ── Sidebar auto-close on 0→1 transition, reopen on N→0 ─────────────────
+  useEffect(() => {
+    const prev = prevPostesLengthRef.current;
+    const curr = postes.length;
+    prevPostesLengthRef.current = curr;
+    if (prev === 0 && curr > 0) setSidebarOpenRef.current(false);
+    if (prev > 0 && curr === 0) setSidebarOpenRef.current(true);
+  }, [postes.length]);
 
   // ── LLM status + catalog status ──────────────────────────────────────────
   useEffect(() => {
@@ -505,7 +986,7 @@ export default function DevisPage() {
     });
   }, []);
 
-  // ── Load conversation messages when switching conversation ────────────────
+  // ── Load conversation messages + panier + settings when switching ─────────
   useEffect(() => {
     if (skipNextReloadRef.current) {
       skipNextReloadRef.current = false;
@@ -522,11 +1003,13 @@ export default function DevisPage() {
           }))
         );
       });
-      fetchPanier(currentConversationId).then(setPanier);
+      fetchPanier(currentConversationId).then(setPostes);
+      fetchDevisSettings(currentConversationId).then(setDevisSettings);
     } else {
       activeConvIdRef.current = null;
       setMessages([]);
-      setPanier([]);
+      setPostes([]);
+      setDevisSettings({ coefficient: 0, coef_final: 0 });
     }
   }, [currentConversationId]);
 
@@ -553,14 +1036,62 @@ export default function DevisPage() {
     setShowScrollBtn(el.scrollHeight - el.scrollTop - el.clientHeight > 100);
   };
 
+  // ── Settings change (debounced save) ─────────────────────────────────────
+  const handleSettingsChange = useCallback((key: "coefficient" | "coef_final", value: number) => {
+    setDevisSettings(prev => {
+      const next = { ...prev, [key]: value };
+      if (settingsSaveTimerRef.current) clearTimeout(settingsSaveTimerRef.current);
+      settingsSaveTimerRef.current = setTimeout(async () => {
+        const convId = activeConvIdRef.current;
+        if (convId) {
+          await updateDevisSettings(convId, next.coefficient, next.coef_final).catch(console.error);
+        }
+      }, 500);
+      return next;
+    });
+  }, []);
+
+  // ── Update panier item (MdO fields) ──────────────────────────────────────
+  const handleUpdateItem = useCallback(async (itemId: string, field: string, value: number | boolean) => {
+    const convId = activeConvIdRef.current;
+    if (!convId) return;
+
+    // For checkbox (is_option): optimistic update
+    if (field === "is_option") {
+      setPostes(prev => prev.map(i => i.id === itemId ? { ...i, is_option: value as boolean } : i));
+    }
+
+    try {
+      const updateFields: { nbre_jours_etude?: number; nbre_jours_atelier?: number; nbre_jours_client?: number; is_option?: boolean } = {};
+      if (field === "nbre_jours_etude") updateFields.nbre_jours_etude = value as number;
+      else if (field === "nbre_jours_atelier") updateFields.nbre_jours_atelier = value as number;
+      else if (field === "nbre_jours_client") updateFields.nbre_jours_client = value as number;
+      else if (field === "is_option") updateFields.is_option = value as boolean;
+
+      await updatePanierItem(convId, itemId, updateFields);
+
+      // For numeric fields: update confirmed value in state
+      if (field !== "is_option") {
+        setPostes(prev => prev.map(i => i.id === itemId ? { ...i, [field]: value } : i));
+      }
+    } catch (err) {
+      // For checkbox: revert optimistic update
+      if (field === "is_option") {
+        setPostes(prev => prev.map(i => i.id === itemId ? { ...i, is_option: !value } : i));
+      }
+      throw err; // PosteRow handles error for numeric fields
+    }
+  }, []);
+
   // ── Send message ──────────────────────────────────────────────────────────
   const handleSend = useCallback(
-    async (content?: string) => {
+    async (content?: string, options?: { silent?: boolean }) => {
+      const silent = options?.silent ?? false;
       const text = (content ?? input).trim();
       if (!text || isLoading || !llmReady) return;
 
-      // Intercept: if a scope choice is pending, show choice cards first
-      if (scopeChoicePendingRef.current) {
+      // Intercept: if a scope choice is pending, show choice cards first (skip for silent)
+      if (!silent && scopeChoicePendingRef.current) {
         pendingMessageRef.current = text;
         setInput("");
         const choiceId = Math.random().toString(36).slice(2);
@@ -588,6 +1119,7 @@ export default function DevisPage() {
 
       setInput("");
       setError(null);
+      setRfqPlanning(null);
 
       const userMsg: ChatMessage = {
         id: Math.random().toString(36).slice(2),
@@ -601,7 +1133,7 @@ export default function DevisPage() {
         .slice(-10)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      setMessages((prev) => [...prev, userMsg]);
+      if (!silent) setMessages((prev) => [...prev, userMsg]);
       setIsLoading(true);
       setActiveToolCalls([]);
       scrollToBottom();
@@ -620,11 +1152,36 @@ export default function DevisPage() {
       try {
         let firstToken = true;
 
-        for await (const event of streamDevisChat(text, collection, convId!, history)) {
+        for await (const event of streamDevisChat(text, collection, convId!, history, catalogMethod)) {
           if (event.error) {
             setError(event.error);
             setIsLoading(false);
             break;
+          }
+
+          // RFQ planning progress
+          if (event.rfq_planning) {
+            if (event.rfq_planning.status === "done") {
+              setRfqPlanning(null);
+            } else {
+              setRfqPlanning(event.rfq_planning);
+            }
+          }
+
+          // Catalog preview — show found postes while LLM reasons on specs
+          if (event.catalog_preview) {
+            const { query, postes } = event.catalog_preview;
+            const posteList = postes.map((p) => p.nom_poste).join(", ");
+            const previewId = Math.random().toString(36).slice(2);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: previewId,
+                role: "assistant" as const,
+                content: `🗂️ Catalogue — **${postes.length} poste(s)** trouvé(s) pour « ${query} » : ${posteList}`,
+                isStreaming: false,
+              },
+            ]);
           }
 
           // Docs search result — show which sources were consulted
@@ -660,9 +1217,21 @@ export default function DevisPage() {
             }
           }
 
-          // Panier update
+          // Postes update
           if (event.panier) {
-            setPanier(event.panier);
+            setPostes(event.panier);
+          }
+
+          // Settings update from LLM tool call
+          if (event.settings) {
+            setDevisSettings(event.settings);
+          }
+
+          // Highlight the panier item modified by the LLM (auto-clears after 3s)
+          if (event.highlight) {
+            if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+            setHighlightedId(event.highlight);
+            highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 3000);
           }
 
           // Choice cards — LLM wants user to pick one option
@@ -682,6 +1251,7 @@ export default function DevisPage() {
                 choices: event.choices,
                 choiceSelected: false,
                 isStreaming: false,
+                fromSilent: silent,  // track if this card came from a silent continuation
               },
             ]);
             firstToken = false;
@@ -711,7 +1281,7 @@ export default function DevisPage() {
           }
 
           if (event.done) {
-            if (event.panier) setPanier(event.panier);
+            if (event.panier) setPostes(event.panier);
             if (event.ask_scope) scopeChoicePendingRef.current = true;
             setMessages((prev) =>
               prev.map((m) =>
@@ -730,13 +1300,13 @@ export default function DevisPage() {
         setIsLoading(false);
       } finally {
         if (convId) {
-          await addMessage(convId, "user", text);
+          if (!silent) await addMessage(convId, "user", text);
           if (assistantContent) await addMessage(convId, "assistant", assistantContent);
           refreshConversations();
         }
       }
     },
-    [input, isLoading, llmReady, messages, collection, mode, createConversation, refreshConversations, scrollToBottom]
+    [input, isLoading, llmReady, messages, collection, catalogMethod, mode, createConversation, refreshConversations, scrollToBottom]
   );
 
   // ── Choice selection ──────────────────────────────────────────────────────
@@ -750,6 +1320,7 @@ export default function DevisPage() {
       const choiceMsg = messages.find((m) => m.id === messageId);
       const choiceType = choiceMsg?.choices?.type;
       const nomPoste = choiceMsg?.choices?.nom_poste;
+      const fromSilent = choiceMsg?.fromSilent ?? false;
       const convId = activeConvIdRef.current;
 
       if (choiceType === "element") {
@@ -761,11 +1332,22 @@ export default function DevisPage() {
           const action: string = parsed.action ?? "";
 
           if (action === "add_poste") {
-            // Common poste found — lock affaire + LLM adds the poste
-            lockDevisAffaire(convId, parsed.nom_affaire).catch(console.error);
-            handleSend(
-              `Affaire sélectionnée : "${parsed.nom_affaire}". Ajoute le poste "${parsed.nom_poste}" (num_poste: "${parsed.num_poste}") au panier.`
-            );
+            // Common poste found — lock affaire + add directly via SQL
+            if (parsed.nom_affaire) await lockDevisAffaire(convId, parsed.nom_affaire);
+            try {
+              const result = await addPosteToPanierDirect(convId, {
+                nom_poste: parsed.nom_poste,
+                nom_affaire: parsed.nom_affaire,
+                num_poste: parsed.num_poste,
+              });
+              if (result.added.length > 0) {
+                setPostes((prev) => [...prev, ...result.added]);
+                const confirmId = Math.random().toString(36).slice(2);
+                const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
+                setMessages((prev) => [...prev, confirmMsg]);
+                await addMessage(convId, "assistant", confirmMsg.content);
+              }
+            } catch (err) { console.error("add_poste direct:", err); }
 
           } else if (action === "show_elements") {
             // User chose "add separately" — create one card per element
@@ -783,7 +1365,7 @@ export default function DevisPage() {
               return { id: JSON.stringify(idData), label: el.text, detail };
             });
             const subId = Math.random().toString(36).slice(2);
-            const subQ = "Lequel des éléments souhaitez-vous ajouter au panier ?";
+            const subQ = "Lequel des éléments souhaitez-vous ajouter au devis ?";
             setMessages((prev) => [
               ...prev,
               {
@@ -819,9 +1401,9 @@ export default function DevisPage() {
             // Final: add element directly to panier
             const newItems = await addElementToPanierDirect(convId, parsed as Record<string, string>);
             if (newItems.length > 0) {
-              setPanier((prev) => [...prev, ...newItems]);
+              setPostes((prev) => [...prev, ...newItems]);
               const confirmId = Math.random().toString(36).slice(2);
-              const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.elements ?? label}** ajouté au panier.` };
+              const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.elements ?? label}** ajouté au devis.` };
               setMessages((prev) => [...prev, confirmMsg]);
               await addMessage(convId, "assistant", confirmMsg.content);
             }
@@ -853,10 +1435,21 @@ export default function DevisPage() {
             );
             if (uniqueAffaires.length <= 1) {
               const occ = uniqueAffaires[0] ?? {};
-              if (occ.nom_affaire) lockDevisAffaire(convId, occ.nom_affaire).catch(console.error);
-              handleSend(
-                `Affaire sélectionnée : "${occ.nom_affaire}". Ajoute le poste "${nomPoste}"${occ.num_poste ? ` (num_poste: "${occ.num_poste}")` : ""} au panier.`
-              );
+              if (occ.nom_affaire) await lockDevisAffaire(convId, occ.nom_affaire);
+              try {
+                const result = await addPosteToPanierDirect(convId, {
+                  nom_poste: nomPoste,
+                  nom_affaire: occ.nom_affaire,
+                  num_poste: occ.num_poste,
+                });
+                if (result.added.length > 0) {
+                  setPostes((prev) => [...prev, ...result.added]);
+                  const confirmId = Math.random().toString(36).slice(2);
+                  const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
+                  setMessages((prev) => [...prev, confirmMsg]);
+                  await addMessage(convId, "assistant", confirmMsg.content);
+                }
+              } catch (err) { console.error("relevance add_poste:", err); }
             } else {
               const subOptions = uniqueAffaires.map((occ) => {
                 const detailParts = [
@@ -902,14 +1495,28 @@ export default function DevisPage() {
           );
 
           if (uniqueAffaires.length <= 1) {
-            // Single affaire — lock it and send direct add instruction
+            // Single affaire — SQL direct (fast) then explicit next-search if tasks remain
             const occ = uniqueAffaires[0] ?? {};
-            if (occ.nom_affaire) {
-              lockDevisAffaire(convId, occ.nom_affaire).catch(console.error);
-            }
-            handleSend(
-              `Affaire sélectionnée : "${occ.nom_affaire}". Ajoute le poste "${nomPoste}"${occ.num_poste ? ` (num_poste: "${occ.num_poste}")` : ""} au panier.`
-            );
+            if (occ.nom_affaire) await lockDevisAffaire(convId, occ.nom_affaire);
+            try {
+              const result = await addPosteToPanierDirect(convId, {
+                nom_poste: nomPoste,
+                nom_affaire: occ.nom_affaire,
+                num_poste: occ.num_poste,
+              });
+              if (result.added.length > 0) {
+                setPostes((prev) => [...prev, ...result.added]);
+                const confirmId = Math.random().toString(36).slice(2);
+                const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
+                setMessages((prev) => [...prev, confirmMsg]);
+                await addMessage(convId, "assistant", confirmMsg.content);
+                // Explicit next-search: backend already knows the remaining tasks
+                if (!fromSilent && result.remaining_tasks.length > 0) {
+                  const next = result.remaining_tasks[0].query;
+                  handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
+                }
+              }
+            } catch (err) { console.error("poste add_direct:", err); }
           } else {
             // Multiple affaires — show sub-choice cards without a new LLM call
             const subOptions = uniqueAffaires.map((occ) => {
@@ -939,20 +1546,33 @@ export default function DevisPage() {
           }
         } catch {
           // Fallback if id is not valid JSON
-          handleSend(`Poste sélectionné : "${label}". Recherche ce poste exact et ajoute-le au panier.`);
+          handleSend(`Poste sélectionné : "${label}". Recherche ce poste exact et ajoute-le au devis.`);
         }
       } else if (choiceType === "poste_affaire") {
         // id = JSON { nom_poste, nom_affaire, num_poste }
-        // Affaire sub-selection after poste pick — lock affaire then add directly.
+        // Affaire sub-selection — SQL direct (fast) then explicit next-search if tasks remain.
         if (!convId) return;
         try {
           const parsed: { nom_poste: string; nom_affaire: string; num_poste: string } = JSON.parse(id);
-          lockDevisAffaire(convId, parsed.nom_affaire).catch(console.error);
-          handleSend(
-            `Affaire sélectionnée : "${parsed.nom_affaire}". Ajoute le poste "${parsed.nom_poste}"${parsed.num_poste ? ` (num_poste: "${parsed.num_poste}")` : ""} au panier.`
-          );
-        } catch {
-          handleSend(label);
+          await lockDevisAffaire(convId, parsed.nom_affaire);
+          const result = await addPosteToPanierDirect(convId, {
+            nom_poste: parsed.nom_poste,
+            nom_affaire: parsed.nom_affaire,
+            num_poste: parsed.num_poste,
+          });
+          if (result.added.length > 0) {
+            setPostes((prev) => [...prev, ...result.added]);
+            const confirmId = Math.random().toString(36).slice(2);
+            const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
+            setMessages((prev) => [...prev, confirmMsg]);
+            await addMessage(convId, "assistant", confirmMsg.content);
+            if (!fromSilent && result.remaining_tasks.length > 0) {
+              const next = result.remaining_tasks[0].query;
+              handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
+            }
+          }
+        } catch (err) {
+          console.error("poste_affaire add_direct:", err);
         }
       } else if (choiceType === "search_column") {
         // No nom_poste matched — user picked a column to search in.
@@ -973,6 +1593,20 @@ export default function DevisPage() {
           // "refine" → user will retype, nothing to do
         } catch {
           // ignore
+        }
+      } else if (choiceType === "findings_confirmation") {
+        try {
+          const parsed: { action: string; components?: string[] } = JSON.parse(id);
+          if (parsed.action === "confirm_findings" && parsed.components?.length) {
+            const componentList = parsed.components.map((c) => `"${c}"`).join(", ");
+            handleSend(
+              `[SYSTÈME] Composants validés : ${componentList}. Cherche maintenant chacun dans le catalogue avec search_catalog(query=..., column="nom_poste").`,
+              { silent: true },
+            );
+          }
+          // "cancel_findings" → do nothing
+        } catch {
+          // ignore parse errors
         }
       } else if (choiceType === "search_scope") {
         // After add_to_panier: user picks whether next search stays in same affaire or full catalog.
@@ -998,7 +1632,7 @@ export default function DevisPage() {
         }
         // Send a precise instruction: LLM calls add_to_panier directly, no new search needed.
         const userMsg = nomPoste
-          ? `Affaire sélectionnée : "${label}". Ajoute le poste "${nomPoste}" au panier.`
+          ? `Affaire sélectionnée : "${label}". Ajoute le poste "${nomPoste}" au devis.`
           : label;
         handleSend(userMsg);
       }
@@ -1079,13 +1713,13 @@ export default function DevisPage() {
     }
   }, [isExporting]);
 
-  // ── Panier actions ────────────────────────────────────────────────────────
+  // ── Postes actions ────────────────────────────────────────────────────────
   const handleRemoveItem = useCallback(
     async (itemId: string) => {
       const convId = activeConvIdRef.current;
       if (!convId) return;
       await removePanierItem(convId, itemId);
-      setPanier((prev) => prev.filter((i) => i.id !== itemId));
+      setPostes((prev) => prev.filter((i) => i.id !== itemId));
     },
     []
   );
@@ -1094,7 +1728,7 @@ export default function DevisPage() {
     const convId = activeConvIdRef.current;
     if (!convId) return;
     await clearPanier(convId);
-    setPanier([]);
+    setPostes([]);
   }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1134,19 +1768,33 @@ export default function DevisPage() {
         </button>
       </div>
       <div className="flex items-center justify-between mt-2 px-1">
-        <select
-          value={collection}
-          onChange={(e) => setCollection(e.target.value)}
-          className="text-fluid-xs text-muted-foreground bg-transparent border-none outline-none cursor-pointer hover:text-foreground transition-colors"
-        >
-          {collections.length === 0 ? (
-            <option value="">Aucune collection</option>
-          ) : (
-            collections.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))
-          )}
-        </select>
+        <div className="flex items-center gap-2">
+          <select
+            value={collection}
+            onChange={(e) => setCollection(e.target.value)}
+            className="text-fluid-xs text-muted-foreground bg-transparent border-none outline-none cursor-pointer hover:text-foreground transition-colors"
+          >
+            {collections.length === 0 ? (
+              <option value="">Aucune collection</option>
+            ) : (
+              collections.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))
+            )}
+          </select>
+          <button
+            onClick={() => setCatalogMethod(m => m === "bm25" ? "sql" : "bm25")}
+            title={catalogMethod === "sql" ? "Mode NL2SQL actif — cliquer pour BM25" : "Mode BM25 actif — cliquer pour NL2SQL"}
+            className={cn(
+              "text-fluid-xs rounded-full px-2 py-0.5 border transition-colors",
+              catalogMethod === "sql"
+                ? "bg-violet-500/15 border-violet-500/30 text-violet-600 dark:text-violet-400"
+                : "bg-transparent border-border text-muted-foreground hover:text-foreground"
+            )}
+          >
+            {catalogMethod === "sql" ? "NL2SQL" : "BM25"}
+          </button>
+        </div>
         {!catalogLoaded && (
           <p className="text-fluid-xs text-amber-500/80">
             Catalogue non chargé — lookup désactivé
@@ -1157,9 +1805,9 @@ export default function DevisPage() {
   );
 
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-screen overflow-hidden">
       {/* ── Main chat column ─────────────────────────────────────────────── */}
-      <div className="relative flex flex-col flex-1 min-w-0 bg-background">
+      <div className="relative flex flex-col flex-1 min-w-0 overflow-hidden bg-background">
         {/* Header */}
         <header className="flex items-center gap-3 h-14 px-4 border-b border-border flex-shrink-0">
           <SidebarTrigger className="text-muted-foreground hover:text-foreground" />
@@ -1219,6 +1867,10 @@ export default function DevisPage() {
                     onChoiceSelect={handleChoiceSelect}
                   />
                 ))}
+                {/* RFQ planning progress banner (first message) */}
+                {isLoading && rfqPlanning && (
+                  <RfqPlanningBanner planning={rfqPlanning} />
+                )}
                 {/* Active tool calls for the in-progress turn */}
                 {isLoading && activeToolCalls.length > 0 && (
                   <div className="flex gap-3 mb-4">
@@ -1230,7 +1882,7 @@ export default function DevisPage() {
                     </div>
                   </div>
                 )}
-                {isLoading && activeToolCalls.length === 0 && <LoadingDots />}
+                {isLoading && activeToolCalls.length === 0 && !rfqPlanning && <LoadingDots />}
                 {error && (
                   <p className="text-center text-sm text-destructive py-2">{error}</p>
                 )}
@@ -1254,15 +1906,17 @@ export default function DevisPage() {
         )}
       </div>
 
-      {/* ── Panier panel (visible only when items exist) ─────────────────── */}
-      {panier.length > 0 && (
-        <PanierPanel
-          panier={panier}
+      {/* ── Devis panel (visible only when postes exist) ──────────────────── */}
+      {postes.length > 0 && (
+        <DevisPanel
+          postes={postes}
+          devisSettings={devisSettings}
+          highlightedId={highlightedId}
+          onSettingsChange={handleSettingsChange}
+          onUpdateItem={handleUpdateItem}
           onRemoveItem={handleRemoveItem}
           onClear={handleClearPanier}
-          onGenerate={handleGenerateDevis}
           onExportExcel={handleExportExcel}
-          isGenerating={isGenerating}
           isExporting={isExporting}
         />
       )}

@@ -2,10 +2,12 @@
 core/search.py — RAGEngine : recherche similarité + génération Ollama streaming.
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -47,12 +49,14 @@ Question client : {question}
 
 Consignes de réponse :
 - Réponds en français, de manière professionnelle et structurée.
-- Cite toujours la source (nom de la machine, référence brochure, numéro de page).
-- Si le contexte permet de recommander une machine spécifique, explique pourquoi elle convient au besoin.
+- Cite la source quand elle est disponible (nom du fichier, section, page si précisée dans le contexte).
+- Réponds directement à la question posée en t'appuyant sur le contexte fourni.
+- Ne recommande une machine spécifique QUE si la question le demande explicitement.
 - Si l'information n'est pas dans le contexte fourni, dis-le clairement : « Je n'ai pas trouvé cette information dans la documentation disponible. »
 - Ne jamais inventer de spécifications techniques.
 - Reproduis les listes du contexte de manière exhaustive : cite TOUS les éléments sans en omettre, abréger ou résumer aucun.
-- N'ajoute jamais d'explications ou de phrases qui ne sont pas explicitement dans le contexte fourni."""
+- N'ajoute jamais d'explications ou de phrases qui ne sont pas explicitement dans le contexte fourni.
+- Les préfixes `[Section: ...]` dans le contexte sont des métadonnées internes de navigation — ne les reproduis jamais dans ta réponse."""
 
 # Prompts nommés disponibles
 PROMPTS = {
@@ -61,11 +65,54 @@ PROMPTS = {
     "vlm": PROMPT_VLM_ROBOTICS,  # alias : collection "vlm" → prompt VLM Robotics
 }
 
+# ── Contexte domaine pour HyDE ────────────────────────────────────────────────
+# Descriptions courtes (~50 tokens) injectées dans _generer_document_hypothetique()
+# pour guider le LLM vers le bon vocabulaire technique avant la retrieval.
+# TODO: enrichir avec metadata 'technology' (WAAM, laser, Cold Spray, FSW...)
+#       si indexé dans les documents → contexte encore plus précis par procédé
+# TODO: enrichir avec metadata 'sector' (ASD, Naval, Ferroviaire...)
+#       pour orienter le document hypothétique vers le bon secteur client
+CONTEXTE_DOMAINE_MACHINE: dict[str, str] = {
+    "SOLO":    "SOLO : machine hybride XXL mono-robot VLM Robotics. Procédés : WAAM (CMT Fronius), usinage, CND, scan. Grandes pièces structurelles métalliques.",
+    "GEMINI":  "GEMINI : machine hybride XXL bi-robot VLM Robotics, la plus avancée. Multi-procédés simultanés, haute productivité.",
+    "COMPAQT": "COMPAQT XL : machine hybride entrée de gamme VLM Robotics. Fabrication additive (WAAM/laser) + usinage intégrés.",
+    "HYMANCO": "HYMANCO : unité mobile containerisée VLM Robotics. Interventions terrain MRO, déployable sur site.",
+}
+CONTEXTE_VLM_DEFAUT = (
+    "VLM Robotics : constructeur de machines-outils hybrides XXL (fabrication additive + usinage). "
+    "Gamme : COMPAQT, SOLO, GEMINI, HYMANCO. Technologies : WAAM, laser, Cold Spray, FSW, CND."
+)
+
 NB_CHUNKS_RECHERCHE = 6   # fallback si collection vide
 CHUNK_SIZE_APPROX = 1000  # doit correspondre à document_manager.CHUNK_SIZE
-NUM_CTX_MIN = 4096   # 4096 : Qwen3:8b a 37 layers (~4.5 Go VRAM) + KV cache q8_0 306 Mo = ~5.0 Go GPU
-                     # 8192 ctx = 612 Mo KV → dépasse les ~5.4 Go dispo sur RTX 3060 Laptop 6 Go
-NUM_CTX_MAX = 32768
+NUM_CTX_MIN = 4096
+# Plafond hardware pour RTX 3060 6GB + qwen3.5:4b :
+#   weights GPU 3.1GB + KV q8_0 @8192 ~1.7GB + compute 0.76GB = ~5.6GB ✅
+#   KV q8_0 @12288 ~2.5GB → total ~6.4GB → OOM
+# Mettre OLLAMA_NUM_CTX_HARD_MAX=32768 sur RTX 5090.
+NUM_CTX_HARD_MAX = int(os.environ.get("OLLAMA_NUM_CTX_HARD_MAX", "8192"))
+NUM_CTX_MAX = 32768  # plafond absolu pour _adapter_parametres (borné par HARD_MAX ensuite)
+
+# Brackets fixes pour éviter les rechargements Ollama entre calls successifs.
+# Quand num_ctx change entre query-rewriting (4096) et génération (autre valeur),
+# Ollama décharge + recharge le modèle (~12-25s de latence).
+# On arrondit au bracket le plus proche ≤ HARD_MAX : les calls qui tombent dans
+# le même bracket ne déclenchent pas de rechargement.
+# RTX 3060 (HARD_MAX=8192)  : brackets actifs = [4096, 6200, 8192]
+# RTX 5090 (HARD_MAX=32768) : brackets actifs = [4096, 6200, 8192, 12288, 16384, 32768]
+_NUM_CTX_BRACKETS = [4096, 6200, 8192, 12288, 16384, 32768]
+
+
+def _bracket_num_ctx(tokens_estimes: int) -> int:
+    """
+    Arrondit au bracket fixe le plus proche pour éviter les rechargements Ollama.
+    Ne dépasse jamais NUM_CTX_HARD_MAX (limite hardware configurée).
+    Si aucun bracket ne suffit, retourne HARD_MAX directement.
+    """
+    for b in _NUM_CTX_BRACKETS:
+        if tokens_estimes <= b and b <= NUM_CTX_HARD_MAX:
+            return b
+    return NUM_CTX_HARD_MAX
 
 # ── Metadata filtering ────────────────────────────────────────────────────────
 _MACHINES_CONNUES = ["GEMINI", "SOLO", "COMPAQT", "HYMANCO"]
@@ -73,6 +120,7 @@ _MACHINES_CONNUES = ["GEMINI", "SOLO", "COMPAQT", "HYMANCO"]
 # ── Reranker config ───────────────────────────────────────────────────────────
 USE_RERANKER = os.environ.get("USE_RERANKER", "true").lower() == "true"
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+USE_RERANKER_GPU = os.environ.get("USE_RERANKER_GPU", "false").lower() == "true"
 RERANKER_CANDIDATS_MULT = 3   # récupère k×3 candidats avant reranking
 RERANKER_CANDIDATS_MAX = 25   # plafond pour éviter un contexte trop large
 _reranker_instance = None
@@ -84,6 +132,101 @@ _reranker_instance = None
 USE_COLBERT = os.environ.get("USE_COLBERT", "false").lower() == "true"
 COLBERT_MODEL = os.environ.get("COLBERT_MODEL", "colbert-ir/colbertv2.0")
 _colbert_instance = None
+
+# ── Group A — nouvelles fonctionnalités RAG ───────────────────────────────────
+MAX_CHUNKS_PER_SOURCE = int(os.environ.get("MAX_CHUNKS_PER_SOURCE", "0"))  # 0=désactivé
+USE_MULTI_QUERY = os.environ.get("USE_MULTI_QUERY", "true").lower() == "true"
+USE_HYDE = os.environ.get("USE_HYDE", "false").lower() == "true"
+USE_MMR = os.environ.get("USE_MMR", "true").lower() == "true"
+MMR_LAMBDA = float(os.environ.get("MMR_LAMBDA", "0.6"))
+USE_CRAG = os.environ.get("USE_CRAG", "false").lower() == "true"
+CRAG_QUALITY_THRESHOLD = float(os.environ.get("CRAG_QUALITY_THRESHOLD", "0.5"))
+FILTER_THINK_FROM_STREAM = os.environ.get("FILTER_THINK_FROM_STREAM", "false").lower() == "true"
+
+# ── Group B — Qdrant + bge-m3 + parent/child ─────────────────────────────────
+# VECTOR_DB=qdrant : désactive BM25, keyword_fallback, tail_extension, section_retrieval
+#   (ces features utilisent db._collection — API ChromaDB non disponible avec Qdrant)
+# USE_PARENT_CHILD=true : remplace tail_extension et section_retrieval par parent_text
+#   Le LLM reçoit le parent (800-1200 tokens) au lieu du child (250 tokens)
+VECTOR_DB = os.environ.get("VECTOR_DB", "chroma").lower()
+USE_PARENT_CHILD = os.environ.get("USE_PARENT_CHILD", "false").lower() == "true"
+
+
+def build_search_config_hash() -> str:
+    """
+    Hash SHA256[:8] des paramètres de recherche (query-time).
+    Change sans re-indexation → déclenche un nouveau groupe dans le dashboard eval.
+    """
+    config = {
+        "hyde": USE_HYDE,
+        "crag": USE_CRAG,
+        "multi_query": USE_MULTI_QUERY,
+        "mmr": USE_MMR,
+        "reranker": USE_RERANKER,
+        "reranker_model": RERANKER_MODEL if USE_RERANKER else None,
+        "parent_child": USE_PARENT_CHILD,
+    }
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def _get_pipeline_hash() -> str:
+    """Retourne le hash de la pipeline d'indexation (depuis document_manager)."""
+    try:
+        from core.document_manager import build_pipeline_fingerprint
+        return build_pipeline_fingerprint()["hash"]
+    except Exception:
+        return "unknown"
+
+
+_RE_IMAGE_LABEL = re.compile(r'\[IMAGE(?:-L\d+)?\][^\n]*', re.IGNORECASE)
+
+def _filtrer_chunks_image_seule(resultats: list, seuil_chars: int = 80) -> list:
+    """
+    Filtre les chunks dont le contenu utile (hors labels [IMAGE...]) est trop court.
+
+    Un chunk "image seule" = titre de section + image sans texte extracté.
+    Ces chunks polluent le contexte LLM et le reranker avec du contenu non-textuel.
+
+    TODO: désactiver ce filtre quand l'OCR sera intégré (Docling VLM / Tesseract).
+          À ce moment, les images auront du texte extracté et le [IMAGE] label
+          sera complété par le contenu visuel reconnu → chunks utiles à conserver.
+    """
+    filtres = []
+    nb_exclus = 0
+    for doc, score in resultats:
+        texte_sans_image = _RE_IMAGE_LABEL.sub("", doc.page_content).strip()
+        if len(texte_sans_image) < seuil_chars:
+            nb_exclus += 1
+            continue
+        filtres.append((doc, score))
+    if nb_exclus:
+        logger.info(f"Filtre image-seule : {nb_exclus} chunk(s) exclus (< {seuil_chars} chars utiles)")
+    return filtres
+
+
+def _cap_par_source(resultats: list, max_per_source: int) -> list:
+    """
+    A2 — Limite le nombre de chunks par source document.
+    Désactivé si max_per_source=0 (MAX_CHUNKS_PER_SOURCE=0).
+    Appliqué après reranking pour ne capper que les chunks les plus pertinents.
+    Valeur recommandée quand activé : 5 (permet les longues explications).
+    """
+    if max_per_source <= 0:
+        return resultats
+    counts: dict[str, int] = {}
+    filtered = []
+    for doc, score in resultats:
+        source = doc.metadata.get("source", "")
+        base = re.sub(r'\.(pdf|docx|doc|txt)$', '', source, flags=re.IGNORECASE)
+        count = counts.get(base, 0)
+        if count < max_per_source:
+            filtered.append((doc, score))
+            counts[base] = count + 1
+    nb_removed = len(resultats) - len(filtered)
+    if nb_removed:
+        logger.info(f"Cap par source (max={max_per_source}) : {nb_removed} chunk(s) écarté(s)")
+    return filtered
+
 
 def _deduplicater_pdf_docx(resultats: list) -> list:
     """
@@ -97,13 +240,16 @@ def _deduplicater_pdf_docx(resultats: list) -> list:
       "0093 - SAFRAN.docx" p.3 score 0.87  ←  éliminé (doublon, score inférieur)
       "0093 - SAFRAN.pdf" p.5  score 0.76  ←  conservé (page différente, pas un doublon)
     """
-    seen: dict[tuple, tuple[float, int]] = {}  # (base, page) → (score, index)
+    seen: dict[tuple, tuple[float, int]] = {}  # (base, page, chunk_idx) → (score, index)
 
     for i, (doc, score) in enumerate(resultats):
         source = doc.metadata.get("source", "")
         page = doc.metadata.get("page", "?")
+        chunk_idx = doc.metadata.get("chunk_idx", i)
         base = re.sub(r'\.(pdf|docx|doc|txt)$', '', source, flags=re.IGNORECASE)
-        key = (base, page)
+        # chunk_idx dans la clé : PDF vs DOCX du même doc ont le même chunk_idx → dédupliqués
+        # Deux chunks différents de la même page ont des chunk_idx différents → conservés
+        key = (base, page, chunk_idx)
 
         if key not in seen or score > seen[key][0]:
             seen[key] = (score, i)
@@ -187,9 +333,12 @@ def _get_or_build_bm25(db, collection_name: str) -> "_BM25CollectionIndex | None
     """
     Retourne l'index BM25 depuis le cache, ou le reconstruit si la collection a changé.
     L'index est invalidé automatiquement quand des documents sont ajoutés/supprimés.
+    Désactivé si VECTOR_DB=qdrant (Qdrant HYBRID natif remplace BM25).
     """
-    if not USE_HYBRID_SEARCH:
+    if not USE_HYBRID_SEARCH or VECTOR_DB == "qdrant":
         return None
+    if not hasattr(db, "_collection"):
+        return None  # Qdrant store sans _collection — BM25 indisponible
     try:
         nb_chunks = db._collection.count()
         cached = _bm25_cache.get(collection_name)
@@ -237,6 +386,226 @@ def _rrf_fusion(vector_results: list, bm25_results: list, k_final: int) -> list:
     return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
 
 
+def _rrf_fusion_lists(result_lists: list, k_final: int) -> list:
+    """
+    A5 — RRF fusion sur plusieurs listes de résultats (multi-query).
+    Chaque liste reçoit un score RRF = Σ 1/(RRF_K + rang) par chunk présent.
+    """
+    def uid(doc) -> str:
+        return doc.page_content[:150]
+
+    scores: dict[str, float] = {}
+    doc_map: dict[str, object] = {}
+
+    for result_list in result_lists:
+        for rank, (doc, _) in enumerate(result_list):
+            u = uid(doc)
+            scores[u] = scores.get(u, 0.0) + 1.0 / (RRF_K + rank + 1)
+            doc_map[u] = doc
+
+    sorted_uids = sorted(scores, key=lambda u: scores[u], reverse=True)
+    return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
+
+
+def _generer_variantes_question(question: str, history: str, hyde_doc: str = "") -> list:
+    """
+    A5 — Génère 2 variantes sémantiques de la question pour le multi-query retrieval.
+    - hyde_doc : si fourni (HyDE actif), inspire les variantes avec le vocabulaire technique
+                 du document hypothétique → variantes plus ciblées que la question brute
+    Retourne [original, variante1, variante2] ou [original] si échec.
+    """
+    if not USE_MULTI_QUERY:
+        return [question]
+
+    contexte_hyde = ""
+    if hyde_doc and hyde_doc != question:
+        # Tronquer le doc HyDE pour rester dans num_ctx=4096 (~200 tokens max)
+        contexte_hyde = (
+            f"Contexte technique (vocabulaire à utiliser dans les variantes) :\n"
+            f"{hyde_doc[:800]}\n\n"
+        )
+
+    prompt = (
+        "Tu es un moteur de diversification de requêtes pour un système RAG.\n"
+        f"{contexte_hyde}"
+        "Génère 2 reformulations différentes de la question ci-dessous, "
+        "couvrant des aspects ou formulations complémentaires.\n"
+        "Réponds UNIQUEMENT avec les 2 variantes, une par ligne, sans numérotation ni explication.\n\n"
+        f"Question : {question}\n\n"
+        "Variantes :"
+    )
+    if ENABLE_NO_THINK:
+        prompt = "/no_think\n\n" + prompt
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.7, "num_ctx": NUM_CTX_HARD_MAX},  # aligné sur tool_loop — évite reload KV cache
+    }
+    try:
+        resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=500)
+        resp.raise_for_status()
+        text = resp.json().get("response", "").strip()
+        lignes = [l.strip() for l in text.split('\n') if l.strip()]
+        variantes = lignes[:2]
+        if variantes:
+            result = [question] + variantes
+            logger.info(f"Multi-query : {len(result)} variantes générées")
+            for i, v in enumerate(result):
+                logger.info(f"  Query #{i+1} : {v}")
+            return result
+    except Exception as e:
+        logger.warning(f"Multi-query variantes échouées ({e}) — query originale seulement")
+    return [question]
+
+
+def _generer_document_hypothetique(
+    question: str,
+    history: str = "",
+    filtre: dict | None = None,
+    nom_collection: str = "",
+    hyde_mode: str = "narrative",
+) -> str:
+    """
+    A6 — HyDE (Hypothetical Document Embeddings).
+    Génère un document hypothétique qui répondrait à la question.
+    - filtre         : metadata filter (ex: machine=SOLO) — priorité haute pour contexte machine
+    - nom_collection : nom de la collection — fallback contexte VLM général si pas de machine
+    - history        : historique de conv pour les warm turns
+    - hyde_mode      : "narrative" (défaut, paragraphes descriptifs) ou "composition"
+                       (liste de références produits — pour le RFQPlanner)
+    Retourne la question originale si échec.
+    """
+    # Construire le contexte domaine — priorité : machine spécifique > VLM général > rien
+    # Permet à HyDE de générer un document hypothétique pertinent même sans historique (cold start).
+    contexte_domaine = ""
+    if filtre:
+        for cle, val in filtre.items():
+            if isinstance(val, dict) and "$eq" in val:
+                machine = str(val["$eq"]).upper()
+                if machine in CONTEXTE_DOMAINE_MACHINE:
+                    contexte_domaine = f"Contexte : {CONTEXTE_DOMAINE_MACHINE[machine]}\n"
+                    break
+    if not contexte_domaine and "vlm" in nom_collection.lower():
+        contexte_domaine = f"Contexte : {CONTEXTE_VLM_DEFAUT}\n"
+    # TODO: si metadata 'technology' disponible dans filtre → injecter description procédé
+    # TODO: si metadata 'sector' disponible dans filtre → injecter contexte secteur client
+
+    # Construire le contexte historique (warm turns) — uniquement en mode narrative
+    contexte_history = ""
+    if history and hyde_mode == "narrative":
+        contexte_history = f"Historique de conversation (termes et contexte domaine) :\n{history}\n\n"
+
+    if hyde_mode == "composition":
+        # Mode RFQPlanner : génère une liste de composants SPÉCIFIQUES à la dimension demandée.
+        # IMPORTANT : ne pas générer une BOM complète machine → pollution du multi-query avec
+        # termes hors-scope (ex: chercher "Source Laser" ne doit pas retourner Comau/VLMV3T).
+        # Chaque dimension = sa propre liste courte de composants DIRECTS uniquement.
+        prompt = (
+            "Tu es un générateur de listes de composants pour un système RAG industriel.\n"
+            f"{contexte_domaine}"
+            "Génère une liste courte (5-8 lignes) de composants techniques, références produits "
+            "et marques SPÉCIFIQUES à la dimension technique suivante UNIQUEMENT. "
+            "Ne liste QUE les composants directement liés à cette dimension précise "
+            "(ex: pour 'Source Laser' → uniquement lasers, têtes laser, optiques, fibres optiques ; "
+            "pour 'CN / Pupitre' → uniquement automates, CNC, IHM, écrans opérateur ; "
+            "pour 'Robot' → uniquement bras robotiques, contrôleurs robot). "
+            "Ne pas inclure des composants d'autres dimensions. "
+            "Utilise des noms de produits réels et précis. "
+            "Format : une référence par ligne, nom du composant suivi de sa marque/modèle.\n"
+            "Réponds UNIQUEMENT avec la liste, sans introduction ni explication.\n\n"
+            f"Dimension technique à détailler : {question}\n\n"
+            "Liste de composants spécifiques à cette dimension :"
+        )
+    else:
+        prompt = (
+            "Tu es un générateur de documents hypothétiques pour un système RAG.\n"
+            f"{contexte_domaine}"
+            "Génère 1-2 paragraphes de documentation technique qui répondraient "
+            "à la question suivante. Utilise le vocabulaire technique des documents sources.\n"
+            "Réponds UNIQUEMENT avec le document hypothétique, sans introduction ni explication.\n\n"
+            f"{contexte_history}"
+            f"Question : {question}\n\n"
+            "Document hypothétique :"
+        )
+    if ENABLE_NO_THINK:
+        prompt = "/no_think\n\n" + prompt
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.5, "num_ctx": NUM_CTX_HARD_MAX},  # aligné sur tool_loop — évite reload KV cache
+    }
+    try:
+        resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=500)
+        resp.raise_for_status()
+        doc = resp.json().get("response", "").strip()
+        if doc:
+            logger.info(f"HyDE : document hypothétique généré ({len(doc)} chars)\n--- HYDE DOC ---\n{doc}\n--- FIN HYDE ---")
+            return doc
+    except Exception as e:
+        logger.warning(f"HyDE échoué ({e}) — question originale conservée")
+    return question
+
+
+def _appliquer_mmr(resultats: list, lambda_mult: float = MMR_LAMBDA, k: int = 0) -> list:
+    """
+    A4 — Maximal Marginal Relevance : diversifie les résultats tout en gardant la pertinence.
+    lambda_mult=0.6 → 60% relevance, 40% diversity.
+    Algorithme greedy : sélectionne le chunk maximisant λ×relevance − (1−λ)×max_sim_to_selected.
+    """
+    if not USE_MMR or len(resultats) <= 1:
+        return resultats
+
+    target_k = k if k > 0 else len(resultats)
+
+    try:
+        import numpy as np
+        from core.embeddings import get_embeddings
+
+        texts = [doc.page_content for doc, _ in resultats]
+        scores = [score for _, score in resultats]
+        score_max = max(scores) if scores else 1.0
+        norm_scores = [s / score_max if score_max > 0 else s for s in scores]
+
+        embs = get_embeddings().embed_documents(texts)
+        embs_np = np.array(embs, dtype=float)
+        norms = np.linalg.norm(embs_np, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        embs_norm = embs_np / norms
+
+        selected_indices: list[int] = []
+        remaining = list(range(len(resultats)))
+
+        while remaining and len(selected_indices) < target_k:
+            if not selected_indices:
+                best_idx = max(remaining, key=lambda i: norm_scores[i])
+            else:
+                selected_embs = embs_norm[selected_indices]
+                best_mmr = -float("inf")
+                best_idx = remaining[0]
+                for i in remaining:
+                    relevance = norm_scores[i]
+                    sims = embs_norm[i] @ selected_embs.T
+                    max_sim = float(np.max(sims))
+                    mmr_score = lambda_mult * relevance - (1 - lambda_mult) * max_sim
+                    if mmr_score > best_mmr:
+                        best_mmr = mmr_score
+                        best_idx = i
+            selected_indices.append(best_idx)
+            remaining.remove(best_idx)
+
+        result = [resultats[i] for i in selected_indices]
+        logger.info(f"MMR : {len(resultats)} chunks → {len(result)} retenus (λ={lambda_mult})")
+        return result
+
+    except Exception as e:
+        logger.warning(f"MMR échoué ({e}) — résultats originaux conservés")
+        return resultats
+
+
 # ── Tail extension (chunk N+1 début) ─────────────────────────────────────────
 # Activé uniquement sur les chunks où has_continuation=True (calculé à l'indexation).
 # Récupère le début du chunk N+1 via chunk_idx — sans heuristique au retrieval.
@@ -251,8 +620,14 @@ def _ajouter_tail_suivant(db, resultats: list) -> list:
 
     has_continuation est calculé à l'indexation sur le texte raw :
       True ⟺ chunk N finit par un item de liste ET chunk N+1 commence par un item de liste.
+
+    Désactivé si :
+      - USE_PARENT_CHILD=true : le parent_text fournit déjà le contexte élargi
+      - VECTOR_DB=qdrant : db._collection non disponible
     """
     if not resultats or TAIL_EXTENSION_CHARS <= 0:
+        return resultats
+    if USE_PARENT_CHILD or VECTOR_DB == "qdrant" or not hasattr(db, "_collection"):
         return resultats
 
     from langchain_core.documents import Document
@@ -317,7 +692,10 @@ def _detecter_section_ciblee(db, question: str, resultats_initiaux: list) -> str
     """
     Détecte si la question cible une section spécifique en analysant les métadonnées Docling.
     Utilise les vrais labels [TITRE-L1], [SECTION-L2] au lieu de deviner avec les majuscules.
+    Désactivé si USE_PARENT_CHILD=true ou VECTOR_DB=qdrant (db._collection non disponible).
     """
+    if USE_PARENT_CHILD or VECTOR_DB == "qdrant" or not hasattr(db, "_collection"):
+        return None
     if not resultats_initiaux or len(resultats_initiaux) > 3:
         return None
 
@@ -492,15 +870,21 @@ def _recuperer_section_complete(db, titre_recherche: str, k_max: int = 20) -> li
 KEYWORD_FALLBACK_THRESHOLD = float(os.environ.get("KEYWORD_FALLBACK_THRESHOLD", "0.01"))
 
 _STOPWORDS_FALLBACK = {
-    # FR
+    # FR — articles, pronoms, prépositions
     "les", "des", "pour", "dans", "avec", "sur", "par", "une", "qui", "que",
     "est", "son", "ses", "moi", "lui", "leur", "tout", "cette", "aussi",
     "donne", "mois", "references", "documents", "trouve", "trouver",
     "parle", "concernant", "cela", "ceci", "avoir", "etre", "faire",
     "peux", "mots", "toute", "base", "donnees", "infos", "informations",
     "passages", "concernant",
+    # FR — mots vagues fréquents dans les questions de suivi
+    "plus", "detail", "details", "meme", "encore", "bien", "tres",
+    "non", "oui", "comment", "quoi", "quel", "quelle", "quels", "quelles",
+    "dire", "dis", "donner", "expliquer", "voir", "connais", "connaitre",
+    "peut", "faut", "donc", "alors", "mais", "car", "donc", "ainsi",
     # EN
     "the", "and", "for", "with", "that", "this", "from", "about",
+    "more", "detail", "tell", "give", "show", "explain", "what", "how",
 }
 
 
@@ -508,12 +892,16 @@ def _keyword_fallback_search(db, question: str, k: int) -> list:
     """
     Recherche exacte via ChromaDB where_document lorsque la recherche sémantique
     ne trouve rien de pertinent.
+    Désactivé si VECTOR_DB=qdrant (where_document non disponible avec Qdrant).
 
     Extrait les mots significatifs de la question et cherche les chunks qui les
     contiennent littéralement (plusieurs variantes de casse tentées).
     Exemple : question="l'AMDEC" → cherche "AMDEC", "amdec", "Amdec" dans les chunks.
     """
     from langchain_core.documents import Document
+
+    if VECTOR_DB == "qdrant" or not hasattr(db, "_collection"):
+        return []  # where_document non disponible avec Qdrant
 
     tokens = re.findall(r'\w+', question.lower())
     mots_cles = [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS_FALLBACK]
@@ -566,6 +954,48 @@ def _keyword_fallback_search(db, question: str, k: int) -> list:
     return resultats
 
 
+def _substituer_parent_chunks(resultats: list) -> list:
+    """
+    B3 — Remplace le page_content de chaque child chunk par son parent_text.
+    Le LLM reçoit le parent (800-1200 tokens) au lieu du child (250 tokens).
+    Désactivé si USE_PARENT_CHILD=false (pas de parent_text en metadata).
+
+    Déduplication par parent_id : si plusieurs children pointent vers le même parent,
+    on ne garde qu'une seule occurrence (meilleur score) pour éviter de répéter
+    le même texte dans le contexte LLM.
+    """
+    if not USE_PARENT_CHILD:
+        return resultats
+    from langchain_core.documents import Document
+
+    # Passe 1 — substitution + collecte par parent_id
+    sans_parent = []        # chunks sans parent_text (ordre conservé)
+    parents_vus: dict[str, tuple] = {}  # parent_id → (doc, score) meilleur score
+
+    for doc, score in resultats:
+        parent_text = doc.metadata.get("parent_text")
+        parent_id = doc.metadata.get("parent_id")
+        if parent_text and parent_id:
+            if parent_id not in parents_vus or score > parents_vus[parent_id][1]:
+                parents_vus[parent_id] = (
+                    Document(page_content=parent_text, metadata=doc.metadata),
+                    score,
+                )
+        else:
+            sans_parent.append((doc, score))
+
+    # Passe 2 — reconstituer dans l'ordre score décroissant
+    parents_dedup = sorted(parents_vus.values(), key=lambda x: x[1], reverse=True)
+    enrichis = sorted(sans_parent + parents_dedup, key=lambda x: x[1], reverse=True)
+
+    doublons = len(resultats) - len(sans_parent) - len(parents_vus)
+    logger.info(
+        f"Parent/child : {len(parents_vus)} parents uniques "
+        f"({doublons} doublon(s) supprimé(s))"
+    )
+    return enrichis
+
+
 def _extraire_filtre_question(question: str) -> dict | None:
     """
     Détecte si la question cible une seule machine spécifique.
@@ -585,6 +1015,10 @@ def _get_reranker():
     Singleton lazy du reranker BGE.
     Le modèle est téléchargé depuis HuggingFace au premier appel (~570MB).
     Retourne None si USE_RERANKER=false ou si FlagEmbedding est absent.
+
+    USE_RERANKER_GPU=true : charge le reranker sur GPU en fp16 (~570MB VRAM).
+    Vérifier que qwen3.5:4b (5.17GB) + reranker fp16 (0.57GB) = 5.74GB < 6GB VRAM dispo.
+    Fallback CPU automatique si CUDA indisponible.
     """
     global _reranker_instance
     if _reranker_instance is not None:
@@ -593,15 +1027,24 @@ def _get_reranker():
         return None
     try:
         from FlagEmbedding import FlagReranker
-        # use_fp16=False → reranker forcé sur CPU.
-        # Sur RTX 3060 Laptop 6 Go, Qwen3:8b occupe déjà ~5.0 Go GPU.
-        # Le reranker sur GPU (~570 Mo fp16) dépasse le budget VRAM disponible,
-        # ralentit ou fait échouer le chargement du LLM.
-        # Sur CPU : cross-encoding de ~6-18 paires ≈ 1-2s de plus, imperceptible.
-        # devices="cpu" : seul moyen fiable en FlagEmbedding >= 1.3 de forcer CPU.
-        # use_fp16=False seul déclenche un "meta tensor" error (device_map="auto" interne).
-        _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=False, devices="cpu")
-        logger.info(f"Reranker initialisé : {RERANKER_MODEL} (CPU, fp32)")
+        if USE_RERANKER_GPU:
+            try:
+                import torch
+                use_gpu = torch.cuda.is_available()
+            except ImportError:
+                use_gpu = False
+            if use_gpu:
+                _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=True)
+                logger.info(f"Reranker initialisé : {RERANKER_MODEL} (GPU, fp16)")
+            else:
+                logger.warning("USE_RERANKER_GPU=true mais CUDA indisponible — fallback CPU")
+                _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=False, devices="cpu")
+                logger.info(f"Reranker initialisé : {RERANKER_MODEL} (CPU, fp32)")
+        else:
+            # devices="cpu" : seul moyen fiable en FlagEmbedding >= 1.3 de forcer CPU.
+            # use_fp16=False seul déclenche un "meta tensor" error (device_map="auto" interne).
+            _reranker_instance = FlagReranker(RERANKER_MODEL, use_fp16=False, devices="cpu")
+            logger.info(f"Reranker initialisé : {RERANKER_MODEL} (CPU, fp32)")
         return _reranker_instance
     except Exception as e:
         logger.warning(f"Reranker indisponible ({e}) — désactivé")
@@ -652,6 +1095,11 @@ def _appliquer_colbert(colbert, question: str, resultats: list, top_k: int) -> l
             f"ColBERT : {len(resultats)} candidats → {len(reranked)} gardés "
             f"(score top : {reranked[0][1]:.3f})"
         )
+        # A1 — log détaillé par chunk
+        for rank, (doc, score) in enumerate(reranked, 1):
+            source = doc.metadata.get("source", "?")
+            page = doc.metadata.get("page", "?")
+            logger.debug(f"  ColBERT #{rank} score={score:.4f} | {source} p.{page}")
         return reranked
     except Exception as e:
         logger.warning(f"ColBERT reranking échoué ({e}) — résultats originaux conservés")
@@ -673,6 +1121,11 @@ def _appliquer_reranker(reranker, question: str, resultats: list, top_k: int) ->
             f"Reranker : {len(resultats)} candidats → {len(top)} gardés "
             f"(score top : {scores[indexes_tries[0]]:.3f})"
         )
+        # A1 — log détaillé par chunk
+        for rank, (doc, score) in enumerate(top, 1):
+            source = doc.metadata.get("source", "?")
+            page = doc.metadata.get("page", "?")
+            logger.debug(f"  Reranker #{rank} score={score:.4f} | {source} p.{page}")
         return top
     except Exception as e:
         logger.warning(f"Reranker échoué ({e}) — résultats originaux conservés")
@@ -694,7 +1147,7 @@ def _reformuler_question(question: str, history: str) -> str:
 
     Si le rewriting échoue (timeout, erreur), retourne la question originale.
     """
-    if not history or history.count("User:") <= 1:
+    if not history:
         return question
 
     prompt = (
@@ -763,9 +1216,14 @@ class RAGEngine:
     """Moteur RAG : recherche de similarité + génération Ollama."""
 
     def __init__(self, nom_collection: str, prompt_name: str = "defaut",
-                 collection_manager: CollectionManager | None = None):
+                 collection_manager: CollectionManager | None = None,
+                 hyde_mode: str = "narrative"):
         self.cm = collection_manager or CollectionManager()
         self.nom_collection = nom_collection
+        self.hyde_mode = hyde_mode  # "narrative" (défaut) ou "composition" (RFQPlanner)
+        # Auto-select prompt VLM si collection VLM et prompt non spécifié explicitement
+        if prompt_name == "defaut" and "vlm" in nom_collection.lower():
+            prompt_name = "vlm_robotics"
         self.prompt_template = get_prompt(prompt_name)
         self.db = self.cm.get_collection(nom_collection)
 
@@ -896,14 +1354,25 @@ class RAGEngine:
 
         Règles :
           K       = max(6, min(nb_chunks // 8, 20))
-          num_ctx = K × ~250 tokens/chunk + 1200 overhead, borné entre 4096 et 32768
+          num_ctx = K × tokens_par_chunk + 1200 overhead, borné entre 4096 et HARD_MAX
+
+        Tokens par chunk :
+          USE_PARENT_CHILD=false : ~250 tokens (chunk standard 450 tokens, ~250 utiles)
+          USE_PARENT_CHILD=true  : ~1000 tokens (parent chunk envoyé au LLM)
 
         Exemples :
-          48  chunks → K=6,  num_ctx=4096
-          446 chunks → K=20, num_ctx=6200 (→ 8192 par l'arrondi)
+          48  chunks (child) → K=6,  num_ctx=4096
+          446 chunks (child) → K=20, num_ctx=6200 (→ 8192 par l'arrondi)
+          446 chunks (parent)→ K=20, num_ctx=21200 (→ 32768 sur RTX 5090, capé 8192 sur 3060)
         """
         try:
-            nb_chunks = self.db._collection.count()
+            # Qdrant : QdrantCollectionStore.count(), ChromaDB : db._collection.count()
+            if VECTOR_DB == "qdrant" and hasattr(self.db, "count"):
+                nb_chunks = self.db.count()
+            elif hasattr(self.db, "_collection"):
+                nb_chunks = self.db._collection.count()
+            else:
+                nb_chunks = 0
         except Exception:
             nb_chunks = 0
 
@@ -911,10 +1380,13 @@ class RAGEngine:
             return NB_CHUNKS_RECHERCHE, NUM_CTX_MIN
 
         k = max(6, min(nb_chunks // 8, 20))
-        tokens_par_chunk = CHUNK_SIZE_APPROX // 4   # ~250 tokens
-        overhead = 1200                              # prompt + historique + question
-        num_ctx = k * tokens_par_chunk + overhead
-        num_ctx = max(NUM_CTX_MIN, min(num_ctx, NUM_CTX_MAX))
+        if USE_PARENT_CHILD:
+            tokens_par_chunk = 1000  # parent chunks ~1000 tokens (contexte LLM large)
+        else:
+            tokens_par_chunk = CHUNK_SIZE_APPROX // 4   # ~250 tokens
+        overhead = 1200  # prompt + historique + question
+        num_ctx_estime = k * tokens_par_chunk + overhead
+        num_ctx = _bracket_num_ctx(num_ctx_estime)
         return k, num_ctx
 
     def rechercher(self, question: str, k: int = NB_CHUNKS_RECHERCHE,
@@ -924,12 +1396,22 @@ class RAGEngine:
 
         Pipeline :
           1. Détecte si la question cible une machine spécifique → filtre metadata
-          2. Récupère k×3 candidats (si reranker actif) ou k directement
-          3. Recherche vectorielle ChromaDB
-          4. Hybrid BM25 : fusionne vector + BM25 via RRF → k_candidats meilleurs
-          5. Reranke via cross-encoder BGE → garde les top k
+          2. Calcule k_candidats (réduit par query si multi-query)
+          3a. A6 HyDE — doc hypothétique comme query vectorielle (si USE_HYDE=true)
+          3b. A5 Multi-query — N variantes → N recherches vectorielles → RRF fusion
+              Sinon : 1 recherche vectorielle classique
+          4. Hybrid BM25 — fusion avec RRF sur la query originale
+          5. Reranking via cross-encoder BGE (ou ColBERT si USE_COLBERT=true)
+          5a. A7 CRAG light — évalue qualité top 2, re-query keyword si score < seuil
+          5b. Keyword fallback — si aucun résultat pertinent
+          5c. A4 MMR — diversification après reranking (si USE_MMR=true)
           6. Seuil relatif : écarte les chunks au score < score_max × 0.1
-          7. Déduplication PDF/DOCX : élimine les doublons entre formats
+          6b. Seuil absolu ≥ 0.01
+          7. Déduplication PDF/DOCX
+          7a. A2 Cap par source (si MAX_CHUNKS_PER_SOURCE > 0)
+          7b. Tail extension
+          7c. Section complète
+          A1. Log des chunks retenus finaux (niveau DEBUG)
           8. Retourne (contexte_texte, liste_sources)
         """
         # 1. Pré-filtrage metadata
@@ -939,19 +1421,64 @@ class RAGEngine:
 
         # 2. Nombre de candidats à récupérer
         reranker = _get_reranker()
+        # A5 : si multi-query actif, réduire k par query (k×2 au lieu de k×3)
+        # pour garder ~24 candidats totaux sur 3 queries
+        if USE_MULTI_QUERY:
+            k_par_query = min(k * 2, RERANKER_CANDIDATS_MAX)
+        else:
+            k_par_query = min(k * RERANKER_CANDIDATS_MULT, RERANKER_CANDIDATS_MAX) if reranker else k
         k_candidats = min(k * RERANKER_CANDIDATS_MULT, RERANKER_CANDIDATS_MAX) if reranker else k
 
-        # 3. Recherche vectorielle
-        try:
-            resultats = self.db.similarity_search_with_score(question, k=k_candidats, filter=filtre)
-            if not resultats and filtre:
-                logger.info(f"Aucun résultat avec filtre {filtre}, retry sans filtre")
-                resultats = self.db.similarity_search_with_score(question, k=k_candidats)
-        except Exception as e:
-            logger.warning(f"Recherche avec filtre échouée ({e}) — retry sans filtre")
-            resultats = self.db.similarity_search_with_score(question, k=k_candidats)
+        # 3a. A6 HyDE — générer un document hypothétique comme query vectorielle principale
+        if USE_HYDE:
+            query_vecteur = _generer_document_hypothetique(
+                question, history=history, filtre=filtre,
+                nom_collection=self.nom_collection, hyde_mode=self.hyde_mode,
+            )
+        else:
+            query_vecteur = question
 
-        # 4. Hybrid BM25 — fusion avec RRF sur les mêmes k_candidats
+        # 3b. A5 Multi-query — N variantes de queries → N recherches → RRF fusion
+        if USE_MULTI_QUERY:
+            # Si HyDE actif, passer le doc hypothétique pour inspirer les variantes
+            hyde_doc = query_vecteur if USE_HYDE and query_vecteur != question else ""
+            variantes = _generer_variantes_question(question, history, hyde_doc=hyde_doc)
+            # Si HyDE actif en mode narrative, l'ajouter comme variante supplémentaire.
+            # En mode composition (RFQPlanner), NE PAS ajouter : le doc HyDE est une BOM
+            # dimension-spécifique → l'ajouter comme variante vectorielle polluerait les résultats
+            # avec des termes hors-scope d'autres dimensions.
+            if USE_HYDE and query_vecteur != question and self.hyde_mode != "composition":
+                variantes = variantes + [query_vecteur]
+
+            result_lists = []
+            for q_variante in variantes:
+                try:
+                    r = self.db.similarity_search_with_score(q_variante, k=k_par_query, filter=filtre)
+                    if not r and filtre:
+                        r = self.db.similarity_search_with_score(q_variante, k=k_par_query)
+                    result_lists.append(r)
+                except Exception as e:
+                    logger.warning(f"Multi-query recherche '{q_variante[:40]}…' échouée ({e})")
+                    try:
+                        result_lists.append(
+                            self.db.similarity_search_with_score(q_variante, k=k_par_query)
+                        )
+                    except Exception:
+                        result_lists.append([])
+
+            resultats = _rrf_fusion_lists(result_lists, k_final=k_candidats)
+        else:
+            # 3. Recherche vectorielle classique (query_vecteur = HyDE ou originale)
+            try:
+                resultats = self.db.similarity_search_with_score(query_vecteur, k=k_candidats, filter=filtre)
+                if not resultats and filtre:
+                    logger.info(f"Aucun résultat avec filtre {filtre}, retry sans filtre")
+                    resultats = self.db.similarity_search_with_score(query_vecteur, k=k_candidats)
+            except Exception as e:
+                logger.warning(f"Recherche avec filtre échouée ({e}) — retry sans filtre")
+                resultats = self.db.similarity_search_with_score(query_vecteur, k=k_candidats)
+
+        # 4. Hybrid BM25 — fusion avec RRF sur la query originale (pas HyDE/variantes)
         bm25_index = _get_or_build_bm25(self.db, self.nom_collection)
         if bm25_index:
             bm25_results = bm25_index.search(question, k=k_candidats, filtre=filtre)
@@ -964,6 +1491,43 @@ class RAGEngine:
         elif reranker and resultats:
             resultats = _appliquer_reranker(reranker, question, resultats, top_k=k)
 
+        # 5a. A7 CRAG light — évalue qualité des top 2 chunks, re-query si insuffisant
+        if USE_CRAG and resultats:
+            top2 = resultats[:2]
+            scores_crag = []
+            for doc, _ in top2:
+                try:
+                    prompt_crag = (
+                        f"Question : {question}\n\n"
+                        f"Passage : {doc.page_content[:500]}\n\n"
+                        "Ce passage répond-il à la question ? "
+                        "Score de 0 à 1 (0=pas du tout, 1=parfaitement). "
+                        "Réponds UNIQUEMENT avec le score numérique."
+                    )
+                    if ENABLE_NO_THINK:
+                        prompt_crag = "/no_think\n\n" + prompt_crag
+                    payload_crag = {
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt_crag,
+                        "stream": False,
+                        "options": {"temperature": 0.0, "num_ctx": NUM_CTX_MIN},
+                    }
+                    resp = requests.post(OLLAMA_API_GENERATE, json=payload_crag, timeout=30)
+                    text = resp.json().get("response", "").strip()
+                    m = re.search(r'\d+\.?\d*', text)
+                    if m:
+                        scores_crag.append(min(1.0, float(m.group())))
+                except Exception as e:
+                    logger.debug(f"CRAG éval chunk échouée : {e}")
+            if scores_crag:
+                avg_crag = sum(scores_crag) / len(scores_crag)
+                logger.info(f"CRAG : score moyen = {avg_crag:.2f} (seuil={CRAG_QUALITY_THRESHOLD})")
+                if avg_crag < CRAG_QUALITY_THRESHOLD:
+                    logger.info("CRAG : qualité insuffisante → re-query keyword fallback déclenché")
+                    fallback_crag = _keyword_fallback_search(self.db, question, k=k)
+                    if fallback_crag:
+                        resultats = fallback_crag + [r for r in resultats if r not in fallback_crag]
+
         # 5b. Keyword fallback — si le reranker (ou la RRF sans reranker) ne trouve
         # rien de pertinent, recherche exacte par mots-clés via where_document.
         score_best = resultats[0][1] if resultats else 0.0
@@ -973,47 +1537,102 @@ class RAGEngine:
                 # On prepend les résultats keyword : ils ont une correspondance exacte
                 resultats = fallback + [r for r in resultats if r not in fallback]
 
-        # 6. Seuil reranker relatif : élimine les chunks trop éloignés du meilleur
-        # (score < score_max × 0.1). Le meilleur chunk passe toujours ce seuil.
+        # 5c. A4 MMR — diversification après reranking, avant seuil relatif
+        if USE_MMR and resultats:
+            resultats = _appliquer_mmr(resultats, lambda_mult=MMR_LAMBDA, k=k)
+
+        # 6. Seuil reranker adaptatif : élimine les chunks trop éloignés du meilleur.
+        # Multiplicateur adapté au score top :
+        #   score_top ≥ 0.8 (collection très spécialisée) → seuil × 0.35
+        #   score_top ≥ 0.5                               → seuil × 0.20
+        #   score_top < 0.5 (retrieval difficile)         → seuil × 0.10
+        # Empêche de garder 17 chunks quand tout est pertinent (→ context truncation).
         if reranker and resultats:
-            score_max_r = resultats[0][1]  # résultats déjà triés par score décroissant
-            seuil_relatif = score_max_r * 0.1
+            score_max_r = resultats[0][1]
+            if score_max_r >= 0.8:
+                mult = 0.35
+            elif score_max_r >= 0.5:
+                mult = 0.20
+            else:
+                mult = 0.10
+            seuil_relatif = score_max_r * mult
             nb_avant = len(resultats)
             resultats = [(doc, s) for doc, s in resultats if s >= seuil_relatif]
             nb_filtres = nb_avant - len(resultats)
             if nb_filtres:
                 logger.info(
-                    f"Seuil relatif reranker (≥{seuil_relatif:.3f}) : "
+                    f"Seuil relatif reranker (×{mult}, ≥{seuil_relatif:.3f}) : "
                     f"{nb_filtres} chunk(s) écarté(s) sur {nb_avant}"
                 )
 
-        # 6b. Seuil absolu : élimine les chunks quasi-nuls même après keyword fallback.
-        # Quand aucune recherche ne trouve rien, on retourne [] → le LLM dira
-        # "je n'ai pas trouvé" plutôt que de servir du contexte non pertinent.
-        # Seuil 0.01 intentionnellement bas : keyword fallback = 0.5, reranker OK > 0.1.
+        # 6b. Seuil absolu adaptatif : élimine les chunks quasi-nuls.
+        # Quand le top score est très bas (query difficile / cold retrieval), on abaisse
+        # le seuil proportionnellement pour ne pas éliminer des chunks légitimement pertinents.
+        # Exemples : top=0.8 → seuil=0.01 | top=0.05 → seuil=0.005 | top=0.014 → seuil=0.003
+        if resultats:
+            score_top_absolu = max(s for _, s in resultats)
+            seuil_absolu = min(0.01, score_top_absolu * 0.3)
+        else:
+            seuil_absolu = 0.01
         nb_avant_absolu = len(resultats)
-        resultats = [(doc, s) for doc, s in resultats if s >= 0.01]
+        resultats = [(doc, s) for doc, s in resultats if s >= seuil_absolu]
         if len(resultats) < nb_avant_absolu:
             logger.info(
-                f"Seuil absolu (≥0.01) : {nb_avant_absolu - len(resultats)} "
+                f"Seuil absolu (≥{seuil_absolu:.4f}) : {nb_avant_absolu - len(resultats)} "
                 f"chunk(s) quasi-nuls éliminés"
             )
 
         # 7. Déduplication PDF/DOCX
         resultats = _deduplicater_pdf_docx(resultats)
 
-        # 7b. Tail extension — complète les chunks qui s'arrêtent au milieu d'une liste
+        # 7a. A2 Cap par source (après reranking et déduplication)
+        resultats = _cap_par_source(resultats, MAX_CHUNKS_PER_SOURCE)
+
+        # 7a2. Filtre chunks image-seule (titre + [IMAGE] sans texte extracté)
+        # TODO: désactiver quand OCR intégré (Docling VLM / Tesseract) — voir _filtrer_chunks_image_seule
+        resultats = _filtrer_chunks_image_seule(resultats)
+
+        # 7b. B3 Parent/child — remplace le child par son parent_text pour le contexte LLM
+        # (tail extension et section retrieval ci-dessous sont skipées si USE_PARENT_CHILD=true)
+        resultats = _substituer_parent_chunks(resultats)
+
+        # 7c. Tail extension — complète les chunks qui s'arrêtent au milieu d'une liste
+        # Désactivée si USE_PARENT_CHILD=true ou VECTOR_DB=qdrant
         resultats = _ajouter_tail_suivant(self.db, resultats)
 
-        # 7c. Section complète — détection intelligente via analyse des résultats initiaux
+        # 7d. Section complète — détection intelligente via analyse des résultats initiaux
+        # Désactivée si USE_PARENT_CHILD=true ou VECTOR_DB=qdrant
         titre_cible = _detecter_section_ciblee(self.db, question, resultats)
         if titre_cible:
             logger.info(f"Section ciblée détectée : '{titre_cible}' → recherche section complète")
             section_complete = _recuperer_section_complete(self.db, titre_cible, k_max=k*2)
             if section_complete and len(section_complete) > len(resultats):
-                # Remplacer seulement si on a plus de contenu
+                nb_avant = len(resultats)
                 resultats = section_complete
-                logger.info(f"Section complète récupérée : {len(section_complete)} chunks (remplace {len(resultats)} résultats)")
+                logger.info(f"Section complète récupérée : {len(section_complete)} chunks (remplace {nb_avant} résultats)")
+
+        # Hard cap final : k chunks max pour éviter le context truncation
+        # _adapter_parametres calcule num_ctx = k × 250 tokens + 1200 overhead.
+        # Si les chunks sont plus longs (~350 tokens), on dépasse le KvSize d'Ollama.
+        # Le cap garantit que les logs "truncating input prompt" disparaissent.
+        if len(resultats) > k:
+            resultats = resultats[:k]
+
+        # A1 — Log des chunks retenus finaux avec aperçu contenu (top 3)
+        logger.info(f"Pipeline RAG : {len(resultats)} chunk(s) retenus pour le contexte LLM")
+        for rank, (doc, score) in enumerate(resultats, 1):
+            source = doc.metadata.get("source", "?")
+            page = doc.metadata.get("page", "?")
+            machine = doc.metadata.get("machine", "")
+            section = doc.metadata.get("hierarchy_parents", "")
+            apercu = doc.page_content[:150].replace("\n", " ").strip()
+            logger.info(
+                f"  Chunk #{rank} score={score:.4f} | {source} p.{page}"
+                + (f" | machine={machine}" if machine else "")
+                + (f" | section={section}" if section else "")
+            )
+            if rank <= 3:
+                logger.info(f"    ↳ \"{apercu}…\"")
 
         # 8. Formater les résultats
         contexte_parts = []
@@ -1107,6 +1726,7 @@ class RAGEngine:
             except Exception:
                 sections = []
 
+            parent_text = meta.get("parent_text")
             chunks.append({
                 "rank": rank,
                 "score": round(score, 4),
@@ -1117,6 +1737,7 @@ class RAGEngine:
                 "sections": sections,
                 "content": doc.page_content,
                 "content_preview": doc.page_content[:300],
+                "parent_text": parent_text,
             })
 
         return {
@@ -1129,14 +1750,37 @@ class RAGEngine:
         """
         Recherche + génération LLM.
 
-        Retourne {"reponse": generator|str, "sources": list[dict]}
+        Retourne {
+            "reponse":       generator|str,
+            "sources":       list[dict],
+            "context":       str,          # contexte complet (avec historique)
+            "context_chunks": list[str],   # chunks individuels (pour RAGAS)
+            "metrics":       dict,         # Level-A metrics (retrieval_ms, scores, hashes)
+        }
         """
         k, num_ctx = self._adapter_parametres()
 
         # Réécrire la question en query autonome si un historique est disponible
         query_recherche = _reformuler_question(question, history)
 
+        t0 = time.monotonic()
         contexte, sources = self.rechercher(query_recherche, k=k, history=history)
+        retrieval_ms = (time.monotonic() - t0) * 1000
+
+        # Découper le contexte en chunks individuels AVANT d'ajouter l'historique
+        # (pour RAGAS qui a besoin de chunks séparés comme retrieved_contexts)
+        context_chunks = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
+
+        # Métriques Level-A
+        scores = [s.get("score", 0) for s in sources if "score" in s]
+        metrics = {
+            "chunks_used": len(context_chunks),
+            "top_score": round(max(scores), 3) if scores else None,
+            "min_score": round(min(scores), 3) if scores else None,
+            "retrieval_ms": round(retrieval_ms, 1),
+            "pipeline_hash": _get_pipeline_hash(),
+            "search_hash": build_search_config_hash(),
+        }
 
         # Ajouter l'historique au contexte si fourni
         if history:
@@ -1144,8 +1788,28 @@ class RAGEngine:
 
         prompt = self.prompt_template.format(context=contexte, question=question)
 
+        # Ajuster num_ctx sur la longueur réelle du prompt.
+        # ~4 chars/token + 600 tokens de marge pour la réponse générée.
+        # On arrondit au bracket fixe (_NUM_CTX_BRACKETS) pour éviter de déclencher
+        # un rechargement du modèle Ollama si le bracket ne change pas par rapport
+        # au call précédent (query rewriting utilise le même bracket bas).
+        tokens_prompt_estimes = len(prompt) // 4
+        num_ctx_reel = _bracket_num_ctx(tokens_prompt_estimes + 600)
+        if num_ctx_reel != num_ctx:
+            logger.info(
+                f"num_ctx ajusté : {num_ctx} → {num_ctx_reel} "
+                f"(prompt ~{tokens_prompt_estimes} tokens, bracket {num_ctx_reel})"
+            )
+        num_ctx = num_ctx_reel
+
         reponse = self._appeler_ollama(prompt, stream=stream, num_ctx=num_ctx)
-        return {"reponse": reponse, "sources": sources}
+        return {
+            "reponse": reponse,
+            "sources": sources,
+            "context": contexte,
+            "context_chunks": context_chunks,
+            "metrics": metrics,
+        }
 
     @staticmethod
     def _appeler_ollama(prompt: str, stream: bool = True, num_ctx: int = NUM_CTX_MIN):
@@ -1204,21 +1868,79 @@ class RAGEngine:
             return data.get("response", "")
 
         def _stream_tokens():
-            try:
-                for ligne in reponse.iter_lines():
-                    if ligne:
-                        try:
-                            donnees = json.loads(ligne)
-                        except json.JSONDecodeError:
-                            continue
-                        token = donnees.get("response", "")
-                        if token:
-                            yield token
-                        if donnees.get("done", False):
+            # A8 — filtre optionnel des blocs <think>...</think>
+            # Activé via FILTER_THINK_FROM_STREAM=true.
+            # qwen3.5:4b peut streamer les tags caractère par caractère →
+            # un buffer accumulateur est nécessaire pour détecter les tags complets.
+            OPEN_TAG = "<think>"
+            CLOSE_TAG = "</think>"
+            # Longueur minimale du buffer tail pour détecter un tag partiel
+            OPEN_PREFIX_LEN = len(OPEN_TAG) - 1   # 6 chars = "<think"
+            CLOSE_PREFIX_LEN = len(CLOSE_TAG) - 1  # 7 chars = "</think"
+
+            def raw_token_gen():
+                try:
+                    for ligne in reponse.iter_lines():
+                        if ligne:
+                            try:
+                                donnees = json.loads(ligne)
+                            except json.JSONDecodeError:
+                                continue
+                            token = donnees.get("response", "")
+                            if token:
+                                yield token
+                            if donnees.get("done", False):
+                                return
+                except requests.exceptions.ChunkedEncodingError as e:
+                    logger.warning(f"Stream interrompu : {e}")
+                finally:
+                    reponse.close()
+
+            if not FILTER_THINK_FROM_STREAM:
+                yield from raw_token_gen()
+                return
+
+            buffer = ""
+            in_think = False
+
+            for token in raw_token_gen():
+                buffer += token
+
+                # Traiter le buffer jusqu'à ce qu'il ne puisse plus progresser
+                while buffer:
+                    if in_think:
+                        close_idx = buffer.find(CLOSE_TAG)
+                        if close_idx != -1:
+                            # Sortie du bloc think : garder tout ce qui suit </think>
+                            buffer = buffer[close_idx + len(CLOSE_TAG):]
+                            in_think = False
+                            # Reboucler pour traiter le reste du buffer
+                        else:
+                            # Encore dans think : garder seulement le suffixe
+                            # potentiellement partiel (pour détecter </think> au prochain token)
+                            if len(buffer) > CLOSE_PREFIX_LEN:
+                                buffer = buffer[-CLOSE_PREFIX_LEN:]
                             break
-            except requests.exceptions.ChunkedEncodingError as e:
-                logger.warning(f"Stream interrompu : {e}")
-            finally:
-                reponse.close()
+                    else:
+                        open_idx = buffer.find(OPEN_TAG)
+                        if open_idx != -1:
+                            # Émettre tout ce qui précède <think>
+                            if open_idx > 0:
+                                yield buffer[:open_idx]
+                            buffer = buffer[open_idx + len(OPEN_TAG):]
+                            in_think = True
+                            # Reboucler pour traiter la suite (peut-être </think> immédiat)
+                        else:
+                            # Pas de <think> complet — émettre la partie sûre
+                            # (garder le suffixe qui pourrait être un "<think" partiel)
+                            safe_len = len(buffer) - OPEN_PREFIX_LEN
+                            if safe_len > 0:
+                                yield buffer[:safe_len]
+                                buffer = buffer[safe_len:]
+                            break
+
+            # Vider le buffer restant si on n'est pas dans un bloc think
+            if buffer and not in_think:
+                yield buffer
 
         return _stream_tokens()
