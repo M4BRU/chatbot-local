@@ -5,7 +5,6 @@ import { ArrowDown, ChevronDown, ChevronRight, Download, MoreHorizontal, Send, T
 import Image from "next/image";
 import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
 import {
-  addElementToPanierDirect,
   addPosteToPanierDirect,
   addMessage,
   clearPanier,
@@ -19,7 +18,6 @@ import {
   getConversationMessages,
   lockDevisAffaire,
   removePanierItem,
-  setSearchScope,
   streamDevisChat,
   streamGenerateDevis,
   updateDevisSettings,
@@ -29,6 +27,7 @@ import type { CatalogElement, ChatMessage, PanierItem, RfqCandidate } from "@/ap
 import { useConversation } from "@/app/providers";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+import { useChoiceHandler } from "./useChoiceHandler";
 
 // ─── Shared spinner ──────────────────────────────────────────────────────────
 function Spinner({ className }: { className?: string }) {
@@ -1718,281 +1717,17 @@ export default function DevisPage() {
     [input, isLoading, llmReady, messages, collection, catalogMethod, mode, createConversation, refreshConversations, scrollToBottom]
   );
 
-  // ── Choice selection ──────────────────────────────────────────────────────
-  const handleChoiceSelect = useCallback(
-    async (id: string, label: string, messageId: string) => {
-      // Disable the choice cards
-      setMessages((prev) =>
-        prev.map((m) => (m.id === messageId ? { ...m, choiceSelected: true } : m))
-      );
-
-      const choiceMsg = messages.find((m) => m.id === messageId);
-      const choiceType = choiceMsg?.choices?.type;
-      const nomPoste = choiceMsg?.choices?.nom_poste;
-      const convId = activeConvIdRef.current;
-
-      if (choiceType === "element") {
-        // id is always JSON with an 'action' field — dispatch accordingly
-        if (!convId) return;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const parsed: Record<string, any> = JSON.parse(id);
-          const action: string = parsed.action ?? "";
-
-          if (action === "add_poste") {
-            try {
-              await addPosteAndConfirm(convId, { nom_poste: parsed.nom_poste, nom_affaire: parsed.nom_affaire, num_poste: parsed.num_poste });
-            } catch (err) { console.error("add_poste direct:", err); }
-
-          } else if (action === "show_elements") {
-            // User chose "add separately" — create one card per element
-            const elements: Array<{ text: string; occurrences: Record<string, string>[] }> = parsed.elements ?? [];
-            const subOptions = elements.map((el) => {
-              const occs: Record<string, string>[] = el.occurrences ?? [];
-              const affLabels = occs.map((o) => o.nom_affaire).filter(Boolean);
-              const detail = affLabels.length
-                ? `${affLabels.length > 1 ? "Affaires" : "Affaire"} : ${affLabels.join(", ")}`
-                : undefined;
-              const idData =
-                occs.length === 1
-                  ? { ...occs[0] }
-                  : { action: "show_element_affaires", element_text: el.text, occurrences: occs };
-              return { id: JSON.stringify(idData), label: el.text, detail };
-            });
-            const subId = crypto.randomUUID();
-            const subQ = "Lequel des éléments souhaitez-vous ajouter au devis ?";
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: subId, role: "assistant" as const, content: subQ,
-                type: "choices" as const,
-                choices: { type: "element" as const, question: subQ, options: subOptions },
-                choiceSelected: false,
-              },
-            ]);
-
-          } else if (action === "show_element_affaires") {
-            // User chose element alone — show affaire sub-selection cards
-            const occs: Record<string, string>[] = parsed.occurrences ?? [];
-            const elText: string = parsed.element_text ?? label;
-            const subOptions = occs.map((occ) => ({
-              id: JSON.stringify({ action: "add_element", ...occ }),
-              label: occ.nom_affaire || "?",
-              detail: `Poste : ${occ.nom_poste}${occ.fournisseur ? ` · ${occ.fournisseur}` : ""}`,
-            }));
-            const subId = crypto.randomUUID();
-            const subQ = `L'élément « ${elText} » est disponible dans plusieurs affaires. Laquelle utiliser ?`;
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: subId, role: "assistant" as const, content: subQ,
-                type: "choices" as const,
-                choices: { type: "element" as const, question: subQ, options: subOptions },
-                choiceSelected: false,
-              },
-            ]);
-
-          } else if (action === "add_element") {
-            // Final: add element directly to panier
-            const newItems = await addElementToPanierDirect(convId, parsed as Record<string, string>);
-            if (newItems.length > 0) {
-              setPostes((prev) => [...prev, ...newItems]);
-              const confirmId = crypto.randomUUID();
-              const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.elements ?? label}** ajouté au devis.` };
-              setMessages((prev) => [...prev, confirmMsg]);
-              await addMessage(convId, "assistant", confirmMsg.content);
-            }
-          }
-        } catch (err) {
-          console.error("Erreur sélection élément:", err);
-        }
-      } else if (choiceType === "relevance") {
-        // id is JSON — either a poste ({nom_poste, occurrences}) or an action ({action: ...})
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const parsed: Record<string, any> = JSON.parse(id);
-
-          if (parsed.action === "search_docs") {
-            // Tell the LLM to search in docs for the original query
-            handleSend(
-              `Aucun résultat pertinent dans le catalogue pour « ${parsed.query} ». Cherche dans la documentation PDF avec les termes de la description technique et des composants.`
-            );
-          } else if (parsed.action === "refine") {
-            // Just dismiss — user will retype in the input (card already disabled above)
-          } else if (parsed.nom_poste) {
-            // User chose to use one of the found postes.
-            // Inline the same logic as type="poste" to avoid recursive dispatch.
-            if (!convId) return;
-            const nomPoste: string = parsed.nom_poste;
-            const occurrences: Array<Record<string, string>> = parsed.occurrences ?? [];
-            const uniqueAffaires = occurrences.filter(
-              (occ, idx) => occurrences.findIndex((o) => o.nom_affaire === occ.nom_affaire) === idx
-            );
-            if (uniqueAffaires.length <= 1) {
-              const occ = uniqueAffaires[0] ?? {};
-              try {
-                await addPosteAndConfirm(convId, { nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste });
-              } catch (err) { console.error("relevance add_poste:", err); }
-            } else {
-              const subOptions = uniqueAffaires.map((occ) => {
-                const detailParts = [
-                  occ.ensemble && `Ensemble : ${occ.ensemble}`,
-                  occ.fournisseur && `Fournisseur : ${occ.fournisseur}`,
-                ].filter(Boolean);
-                return {
-                  id: JSON.stringify({ nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste }),
-                  label: occ.nom_affaire,
-                  detail: detailParts.join(" · ") || undefined,
-                };
-              });
-              const subId = crypto.randomUUID();
-              const subQ = `Le poste « ${nomPoste} » existe dans plusieurs affaires. Quelle affaire utiliser ?`;
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: subId, role: "assistant" as const, content: subQ,
-                  type: "choices" as const,
-                  choices: { type: "poste_affaire" as const, question: subQ, options: subOptions },
-                  choiceSelected: false,
-                },
-              ]);
-            }
-          }
-        } catch {
-          handleSend(label);
-        }
-        return;
-      } else if (choiceType === "poste") {
-        // id = JSON { nom_poste, occurrences: [{nom_affaire, num_poste, fournisseur, ensemble}] }
-        // No new LLM search needed — occurrences were embedded by the backend.
-        if (!convId) return;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const parsed: { nom_poste: string; occurrences: Array<Record<string, string>> } = JSON.parse(id);
-          const nomPoste = parsed.nom_poste;
-          const occurrences = parsed.occurrences ?? [];
-
-          // Deduplicate by nom_affaire
-          const uniqueAffaires = occurrences.filter(
-            (occ, idx) => occurrences.findIndex((o) => o.nom_affaire === occ.nom_affaire) === idx
-          );
-
-          if (uniqueAffaires.length <= 1) {
-            const occ = uniqueAffaires[0] ?? {};
-            try {
-              const { remaining_tasks } = await addPosteAndConfirm(convId, { nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste });
-              if (remaining_tasks.length > 0) {
-                const next = remaining_tasks[0].query;
-                handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
-              }
-            } catch (err) { console.error("poste add_direct:", err); }
-          } else {
-            const subOptions = uniqueAffaires.map((occ) => {
-              const detailParts = [
-                occ.ensemble && `Ensemble : ${occ.ensemble}`,
-                occ.fournisseur && `Fournisseur : ${occ.fournisseur}`,
-              ].filter(Boolean);
-              return {
-                id: JSON.stringify({ nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste }),
-                label: occ.nom_affaire,
-                detail: detailParts.join(" · ") || undefined,
-              };
-            });
-            const subId = crypto.randomUUID();
-            const subQ = `Le poste « ${nomPoste} » existe dans plusieurs affaires. Quelle affaire utiliser pour ce devis ?`;
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: subId,
-                role: "assistant" as const,
-                content: subQ,
-                type: "choices" as const,
-                choices: { type: "poste_affaire" as const, question: subQ, options: subOptions },
-                choiceSelected: false,
-              },
-            ]);
-          }
-        } catch {
-          // Fallback if id is not valid JSON
-          handleSend(`Poste sélectionné : "${label}". Recherche ce poste exact et ajoute-le au devis.`);
-        }
-      } else if (choiceType === "poste_affaire") {
-        if (!convId) return;
-        try {
-          const parsed: { nom_poste: string; nom_affaire: string; num_poste: string } = JSON.parse(id);
-          const { remaining_tasks } = await addPosteAndConfirm(convId, { nom_poste: parsed.nom_poste, nom_affaire: parsed.nom_affaire, num_poste: parsed.num_poste });
-          if (remaining_tasks.length > 0) {
-            const next = remaining_tasks[0].query;
-            handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
-          }
-        } catch (err) {
-          console.error("poste_affaire add_direct:", err);
-        }
-      } else if (choiceType === "search_column") {
-        // No nom_poste matched — user picked a column to search in.
-        try {
-          const parsed: { action: string; column?: string; query?: string } = JSON.parse(id);
-          if (parsed.action === "search_column" && parsed.column && parsed.query) {
-            const colLabels: Record<string, string> = {
-              elements: "sous-composants (éléments)",
-              ensemble: "type d'ensemble",
-              nom_affaire: "nom d'affaire",
-              fournisseur: "fournisseur",
-            };
-            const colLabel = colLabels[parsed.column] ?? parsed.column;
-            handleSend(
-              `Cherche "${parsed.query}" dans la colonne ${colLabel}. Appelle search_catalog avec column="${parsed.column}".`
-            );
-          }
-          // "refine" → user will retype, nothing to do
-        } catch {
-          // ignore
-        }
-      } else if (choiceType === "findings_confirmation") {
-        try {
-          const parsed: { action: string; components?: string[] } = JSON.parse(id);
-          if (parsed.action === "confirm_findings" && parsed.components?.length) {
-            const componentList = parsed.components.map((c) => `"${c}"`).join(", ");
-            handleSend(
-              `[SYSTÈME] Composants validés : ${componentList}. Cherche maintenant chacun dans le catalogue avec search_catalog(query=..., column="nom_poste").`,
-              { silent: true },
-            );
-          }
-          // "cancel_findings" → do nothing
-        } catch {
-          // ignore parse errors
-        }
-      } else if (choiceType === "search_scope") {
-        // After add_to_panier: user picks whether next search stays in same affaire or full catalog.
-        if (!convId) return;
-        try {
-          const parsed: { action: string } = JSON.parse(id);
-          if (parsed.action === "search_all_affaires") {
-            await setSearchScope(convId, true);
-          }
-          // "search_same_affaire" → nothing to do, search_all stays false (already reset by backend)
-          scopeChoicePendingRef.current = false;
-          const savedMsg = pendingMessageRef.current;
-          pendingMessageRef.current = "";
-          if (savedMsg) handleSend(savedMsg);
-        } catch {
-          // ignore parse errors
-        }
-      } else {
-        // type === "affaire" (or legacy undefined): id/label = nom_affaire.
-        // Lock the affaire in the backend immediately before the next LLM call.
-        if (convId) {
-          lockDevisAffaire(convId, id).catch(console.error);
-        }
-        // Send a precise instruction: LLM calls add_to_panier directly, no new search needed.
-        const userMsg = nomPoste
-          ? `Affaire sélectionnée : "${label}". Ajoute le poste "${nomPoste}" au devis.`
-          : label;
-        handleSend(userMsg);
-      }
-    },
-    [handleSend, messages]
-  );
+  // ── Choice selection (extracted to useChoiceHandler.ts) ──────────────────
+  const handleChoiceSelect = useChoiceHandler({
+    messages,
+    setMessages,
+    setPostes,
+    handleSend,
+    addPosteAndConfirm,
+    activeConvIdRef,
+    scopeChoicePendingRef,
+    pendingMessageRef,
+  });
 
   // ── Generate devis ────────────────────────────────────────────────────────
   const handleGenerateDevis = useCallback(async () => {
