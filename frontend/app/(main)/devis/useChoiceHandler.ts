@@ -17,7 +17,7 @@ type AddPosteAndConfirm = (
 ) => Promise<{ added: boolean; remaining_tasks: { query: string }[] }>;
 
 interface Deps {
-  messages: ChatMessage[];
+  messagesRef: React.RefObject<ChatMessage[]>;
   setMessages: SetMessages;
   setPostes: SetPostes;
   handleSend: HandleSend;
@@ -283,14 +283,14 @@ function handleAffaireFallback(
 export function useChoiceHandler(deps: Deps) {
   return useCallback(
     async (id: string, label: string, messageId: string) => {
-      const { messages, setMessages, activeConvIdRef } = deps;
+      const { messagesRef, setMessages, activeConvIdRef } = deps;
 
       // Disable the choice cards
       setMessages((prev) =>
         prev.map((m) => (m.id === messageId ? { ...m, choiceSelected: true } : m)),
       );
 
-      const choiceMsg = messages.find((m) => m.id === messageId);
+      const choiceMsg = messagesRef.current.find((m) => m.id === messageId);
       const choiceType = choiceMsg?.choices?.type;
       const nomPoste = choiceMsg?.choices?.nom_poste;
       const convId = activeConvIdRef.current;
@@ -328,6 +328,6 @@ export function useChoiceHandler(deps: Deps) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [deps.handleSend, deps.messages],
+    [deps.handleSend],
   );
 }

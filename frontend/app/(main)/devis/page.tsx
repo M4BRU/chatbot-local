@@ -1324,6 +1324,9 @@ export default function DevisPage() {
   const setSidebarOpenRef = useRef(setSidebarOpen);
   setSidebarOpenRef.current = setSidebarOpen;
   const prevPostesLengthRef = useRef(0);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const sendDepthRef = useRef(0);
 
   // ── Sidebar auto-close on 0→1 transition, reopen on N→0 ─────────────────
   useEffect(() => {
@@ -1481,6 +1484,13 @@ export default function DevisPage() {
       const text = (content ?? input).trim();
       if (!text || isLoading || !llmReady) return;
 
+      // Guard against recursive chains (choice → handleSend → choice → ...)
+      if (sendDepthRef.current >= 5) {
+        console.warn("handleSend: max recursion depth reached, aborting");
+        return;
+      }
+      sendDepthRef.current++;
+
       // Intercept: if a scope choice is pending, show choice cards first (skip for silent)
       if (!silent && scopeChoicePendingRef.current) {
         pendingMessageRef.current = text;
@@ -1520,7 +1530,7 @@ export default function DevisPage() {
       };
       const assistantId = crypto.randomUUID();
 
-      const history = messages
+      const history = messagesRef.current
         .filter((m) => m.content && !m.isStreaming)
         .slice(-10)
         .map((m) => ({ role: m.role, content: m.content }));
@@ -1532,7 +1542,7 @@ export default function DevisPage() {
 
       // Auto-create conversation on first message
       let convId = activeConvIdRef.current;
-      if (messages.length === 0) {
+      if (messagesRef.current.length === 0) {
         skipNextReloadRef.current = true;
         convId = await createConversation(text.slice(0, 50), mode);
         activeConvIdRef.current = convId;
@@ -1706,6 +1716,7 @@ export default function DevisPage() {
         setError(msg);
         setIsLoading(false);
       } finally {
+        sendDepthRef.current--;
         if (convId) {
           if (!silent) await addMessage(convId, "user", text);
           if (assistantContent) await addMessage(convId, "assistant", assistantContent);
@@ -1714,12 +1725,12 @@ export default function DevisPage() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [input, isLoading, llmReady, messages, collection, catalogMethod, mode, createConversation, refreshConversations, scrollToBottom]
+    [input, isLoading, llmReady, collection, catalogMethod, mode, createConversation, refreshConversations, scrollToBottom]
   );
 
   // ── Choice selection (extracted to useChoiceHandler.ts) ──────────────────
   const handleChoiceSelect = useChoiceHandler({
-    messages,
+    messagesRef,
     setMessages,
     setPostes,
     handleSend,
