@@ -1459,6 +1459,22 @@ export default function DevisPage() {
     }
   }, []);
 
+  // ── Add poste helper (shared by choice handlers) ────────────────────────
+  const addPosteAndConfirm = useCallback(async (
+    convId: string,
+    params: { nom_poste: string; nom_affaire?: string; num_poste?: string },
+  ): Promise<{ added: boolean; remaining_tasks: { query: string }[] }> => {
+    if (params.nom_affaire) await lockDevisAffaire(convId, params.nom_affaire);
+    const result = await addPosteToPanierDirect(convId, params);
+    if (result.added.length > 0) {
+      setPostes((prev) => [...prev, ...result.added]);
+      const confirmMsg = { id: crypto.randomUUID(), role: "assistant" as const, content: `**${params.nom_poste}** ajouté au devis.` };
+      setMessages((prev) => [...prev, confirmMsg]);
+      await addMessage(convId, "assistant", confirmMsg.content);
+    }
+    return { added: result.added.length > 0, remaining_tasks: result.remaining_tasks ?? [] };
+  }, []);
+
   // ── Send message ──────────────────────────────────────────────────────────
   const handleSend = useCallback(
     async (content?: string, options?: { silent?: boolean }) => {
@@ -1724,21 +1740,8 @@ export default function DevisPage() {
           const action: string = parsed.action ?? "";
 
           if (action === "add_poste") {
-            // Common poste found — lock affaire + add directly via SQL
-            if (parsed.nom_affaire) await lockDevisAffaire(convId, parsed.nom_affaire);
             try {
-              const result = await addPosteToPanierDirect(convId, {
-                nom_poste: parsed.nom_poste,
-                nom_affaire: parsed.nom_affaire,
-                num_poste: parsed.num_poste,
-              });
-              if (result.added.length > 0) {
-                setPostes((prev) => [...prev, ...result.added]);
-                const confirmId = crypto.randomUUID();
-                const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
-                setMessages((prev) => [...prev, confirmMsg]);
-                await addMessage(convId, "assistant", confirmMsg.content);
-              }
+              await addPosteAndConfirm(convId, { nom_poste: parsed.nom_poste, nom_affaire: parsed.nom_affaire, num_poste: parsed.num_poste });
             } catch (err) { console.error("add_poste direct:", err); }
 
           } else if (action === "show_elements") {
@@ -1827,20 +1830,8 @@ export default function DevisPage() {
             );
             if (uniqueAffaires.length <= 1) {
               const occ = uniqueAffaires[0] ?? {};
-              if (occ.nom_affaire) await lockDevisAffaire(convId, occ.nom_affaire);
               try {
-                const result = await addPosteToPanierDirect(convId, {
-                  nom_poste: nomPoste,
-                  nom_affaire: occ.nom_affaire,
-                  num_poste: occ.num_poste,
-                });
-                if (result.added.length > 0) {
-                  setPostes((prev) => [...prev, ...result.added]);
-                  const confirmId = crypto.randomUUID();
-                  const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
-                  setMessages((prev) => [...prev, confirmMsg]);
-                  await addMessage(convId, "assistant", confirmMsg.content);
-                }
+                await addPosteAndConfirm(convId, { nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste });
               } catch (err) { console.error("relevance add_poste:", err); }
             } else {
               const subOptions = uniqueAffaires.map((occ) => {
@@ -1887,32 +1878,15 @@ export default function DevisPage() {
           );
 
           if (uniqueAffaires.length <= 1) {
-            // Single affaire — SQL direct (fast) then explicit next-search if tasks remain
             const occ = uniqueAffaires[0] ?? {};
-            if (occ.nom_affaire) await lockDevisAffaire(convId, occ.nom_affaire);
             try {
-              const result = await addPosteToPanierDirect(convId, {
-                nom_poste: nomPoste,
-                nom_affaire: occ.nom_affaire,
-                num_poste: occ.num_poste,
-              });
-              if (result.added.length > 0) {
-                setPostes((prev) => [...prev, ...result.added]);
-                const confirmId = crypto.randomUUID();
-                const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
-                setMessages((prev) => [...prev, confirmMsg]);
-                await addMessage(convId, "assistant", confirmMsg.content);
-                // Explicit next-search: backend already knows the remaining tasks.
-                // fromSilent n'est pas vérifié : le chaining doit fonctionner même
-                // quand les choice cards viennent d'un message silencieux (auto-chain).
-                if (result.remaining_tasks.length > 0) {
-                  const next = result.remaining_tasks[0].query;
-                  handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
-                }
+              const { remaining_tasks } = await addPosteAndConfirm(convId, { nom_poste: nomPoste, nom_affaire: occ.nom_affaire, num_poste: occ.num_poste });
+              if (remaining_tasks.length > 0) {
+                const next = remaining_tasks[0].query;
+                handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
               }
             } catch (err) { console.error("poste add_direct:", err); }
           } else {
-            // Multiple affaires — show sub-choice cards without a new LLM call
             const subOptions = uniqueAffaires.map((occ) => {
               const detailParts = [
                 occ.ensemble && `Ensemble : ${occ.ensemble}`,
@@ -1943,27 +1917,13 @@ export default function DevisPage() {
           handleSend(`Poste sélectionné : "${label}". Recherche ce poste exact et ajoute-le au devis.`);
         }
       } else if (choiceType === "poste_affaire") {
-        // id = JSON { nom_poste, nom_affaire, num_poste }
-        // Affaire sub-selection — SQL direct (fast) then explicit next-search if tasks remain.
         if (!convId) return;
         try {
           const parsed: { nom_poste: string; nom_affaire: string; num_poste: string } = JSON.parse(id);
-          await lockDevisAffaire(convId, parsed.nom_affaire);
-          const result = await addPosteToPanierDirect(convId, {
-            nom_poste: parsed.nom_poste,
-            nom_affaire: parsed.nom_affaire,
-            num_poste: parsed.num_poste,
-          });
-          if (result.added.length > 0) {
-            setPostes((prev) => [...prev, ...result.added]);
-            const confirmId = crypto.randomUUID();
-            const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
-            setMessages((prev) => [...prev, confirmMsg]);
-            await addMessage(convId, "assistant", confirmMsg.content);
-            if (result.remaining_tasks.length > 0) {
-              const next = result.remaining_tasks[0].query;
-              handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
-            }
+          const { remaining_tasks } = await addPosteAndConfirm(convId, { nom_poste: parsed.nom_poste, nom_affaire: parsed.nom_affaire, num_poste: parsed.num_poste });
+          if (remaining_tasks.length > 0) {
+            const next = remaining_tasks[0].query;
+            handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
           }
         } catch (err) {
           console.error("poste_affaire add_direct:", err);
