@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ChevronDown, ChevronRight, Download, MoreHorizontal, Send, Trash2, X } from "lucide-react";
 import Image from "next/image";
 import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
@@ -1265,6 +1265,60 @@ function CandidatesPanel({
   );
 }
 
+// ─── Session phase ─────────────────────────────────────────────────────────────
+type SessionPhase = "welcome" | "analyzing" | "exploring" | "building";
+
+const PHASE_PROGRESS: Record<SessionPhase, number> = {
+  welcome:   0,
+  analyzing: 22,
+  exploring: 58,
+  building:  100,
+};
+
+// Thin progress bar below the header — advances with the session phase
+function PhaseBar({ phase }: { phase: SessionPhase }) {
+  if (phase === "welcome") return null;
+  return (
+    <div className="h-[2px] bg-border/20 flex-shrink-0 relative overflow-hidden">
+      <div
+        className="absolute inset-y-0 left-0 bg-foreground/20 transition-[width] duration-1000 ease-out"
+        style={{ width: `${PHASE_PROGRESS[phase]}%` }}
+      />
+    </div>
+  );
+}
+
+// Replaces stacked ToolCallBadges — one unified line in "exploring" phase
+function ExploringIndicator({ toolCalls }: { toolCalls: ToolCallState[] }) {
+  const running = toolCalls.findLast((tc) => tc.status === "running");
+  return (
+    <div className="flex items-center gap-3 mb-4">
+      <div className="w-8 shrink-0" />
+      <div className="flex items-center gap-2.5">
+        <Spinner className="h-3 w-3 text-muted-foreground/60 shrink-0" />
+        <span className="text-sm text-muted-foreground">
+          {TOOL_LABELS[running?.name ?? ""] ?? "Traitement…"}
+        </span>
+        {toolCalls.length > 1 && (
+          <div className="flex items-center gap-[3px] ml-0.5">
+            {toolCalls.map((tc) => (
+              <span
+                key={tc.id}
+                className={cn(
+                  "block w-[3px] h-3 rounded-full transition-all duration-300",
+                  tc.status === "done"
+                    ? "bg-foreground/20"
+                    : "bg-foreground/60 animate-pulse"
+                )}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main page ─────────────────────────────────────────────────────────────────
 export default function DevisPage() {
   const { currentConversationId, createConversation, refreshConversations, mode } = useConversation();
@@ -1297,6 +1351,14 @@ export default function DevisPage() {
   const [messageToolCalls, setMessageToolCalls] = useState<Record<string, ToolCallState[]>>({});
 
   const [postes, setPostes] = useState<PanierItem[]>([]);
+
+  // Derived session phase — drives layout transitions
+  const sessionPhase = useMemo((): SessionPhase => {
+    if (messages.length === 0 && !isLoading) return "welcome";
+    if (isLoading && rfqPlanning !== null)   return "analyzing";
+    if (postes.length > 0)                   return "building";
+    return "exploring";
+  }, [messages.length, isLoading, rfqPlanning, postes.length]);
   const [devisSettings, setDevisSettings] = useState({ coefficient: 0, coef_final: 0 });
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [searchWS, setSearchWS] = useState<SearchWorkspaceState | null>(null);
@@ -1925,6 +1987,11 @@ export default function DevisPage() {
     </>
   );
 
+  const devisPanelWidth =
+    sessionPhase === "welcome" || sessionPhase === "analyzing" ? 0
+    : sessionPhase === "exploring" ? 340
+    : 420;
+
   return (
     <div className="flex h-screen overflow-hidden">
       {/* ── Main chat column ─────────────────────────────────────────────── */}
@@ -1934,6 +2001,9 @@ export default function DevisPage() {
           <SidebarTrigger className="text-muted-foreground hover:text-foreground" />
           <span className="text-sm font-medium text-muted-foreground">Devis de synthèse</span>
         </header>
+
+        {/* Phase progress bar */}
+        <PhaseBar phase={sessionPhase} />
 
         {/* LLM loading banner */}
         {!llmReady && !error && (
@@ -1989,16 +2059,9 @@ export default function DevisPage() {
                 {isLoading && rfqPlanning && (
                   <RfqPlanningBanner planning={rfqPlanning} />
                 )}
-                {/* Active tool calls for the in-progress turn */}
+                {/* Active tool calls — unified indicator */}
                 {isLoading && activeToolCalls.length > 0 && (
-                  <div className="flex gap-3 mb-4">
-                    <div className="w-8 shrink-0" />
-                    <div>
-                      {activeToolCalls.map((tc) => (
-                        <ToolCallBadge key={tc.id} tool={tc} />
-                      ))}
-                    </div>
-                  </div>
+                  <ExploringIndicator toolCalls={activeToolCalls} />
                 )}
                 {isLoading && activeToolCalls.length === 0 && !rfqPlanning && <LoadingDots />}
                 {error && (
@@ -2047,8 +2110,11 @@ export default function DevisPage() {
         />
       )}
 
-      {/* ── Devis panel (visible only when postes exist) ──────────────────── */}
-      {postes.length > 0 && (
+      {/* ── Devis panel — width animé selon la phase ─────────────────────── */}
+      <div
+        className="flex-shrink-0 overflow-hidden transition-[width] duration-700 ease-out"
+        style={{ width: devisPanelWidth }}
+      >
         <DevisPanel
           postes={postes}
           devisSettings={devisSettings}
@@ -2060,7 +2126,7 @@ export default function DevisPage() {
           onExportExcel={handleExportExcel}
           isExporting={isExporting}
         />
-      )}
+      </div>
     </div>
   );
 }
