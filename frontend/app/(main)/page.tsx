@@ -7,6 +7,7 @@ import type { ChatMessage } from "@/app/lib/types";
 import { useConversation } from "@/app/providers";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
 
 // ─── Suggestion Cards ──────────────────────────────────────────────────────────
@@ -57,10 +58,7 @@ function ReasoningBanner({
       <div className="w-8 shrink-0" />
       <div className="flex-1 rounded-lg border border-violet-500/20 bg-violet-500/5 px-4 py-3 max-w-[580px]">
         <div className="flex items-center gap-2 mb-1">
-          <svg className="animate-spin h-3.5 w-3.5 text-violet-500 shrink-0" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-          </svg>
+          <Spinner className="h-3.5 w-3.5 text-violet-500" />
           <span className="text-xs font-semibold text-violet-600 dark:text-violet-400">
             Mode Raisonnement
           </span>
@@ -102,6 +100,9 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [reasoningMode, setReasoningMode] = useState(false);
   const [reasoningStep, setReasoningStep] = useState<{ step: string; query?: string; index?: number; total?: number; found?: string; gaps_count?: number } | null>(null);
+
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  messagesRef.current = messages;
 
   const activeConvIdRef = useRef<string | null>(null);
   const skipNextReloadRef = useRef(false);
@@ -195,13 +196,14 @@ export default function ChatPage() {
       setReasoningStep(null);
 
       const userMsg: ChatMessage = {
-        id: Math.random().toString(36).slice(2),
+        id: crypto.randomUUID(),
         role: "user",
         content: text,
       };
-      const assistantId = Math.random().toString(36).slice(2);
+      const assistantId = crypto.randomUUID();
 
-      const history = messages
+      const currentMessages = messagesRef.current;
+      const history = currentMessages
         .filter((m) => m.content && !m.isStreaming)
         .slice(-10)
         .map((m) => ({ role: m.role, content: m.content }));
@@ -212,7 +214,7 @@ export default function ChatPage() {
 
       // Auto-create conversation on first message
       let convId = activeConvIdRef.current;
-      const isFirstMessage = messages.length === 0;
+      const isFirstMessage = currentMessages.length === 0;
       if (isFirstMessage) {
         skipNextReloadRef.current = true;
         convId = await createConversation(text.slice(0, 50), mode);
@@ -298,7 +300,8 @@ export default function ChatPage() {
         if (convId) refreshConversations();
       }
     },
-    [input, isLoading, llmReady, messages, collection, mode, createConversation, refreshConversations, scrollToBottom, reasoningMode]
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [input, isLoading, llmReady, collection, mode, createConversation, refreshConversations, scrollToBottom, reasoningMode]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -385,10 +388,7 @@ export default function ChatPage() {
       {/* ── LLM loading banner ──────────────────────────────────────────────── */}
       {!llmReady && !error && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-sm text-amber-600 dark:text-amber-400">
-          <svg className="animate-spin h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-          </svg>
+          <Spinner className="h-3.5 w-3.5" />
           Modèle IA en cours de chargement… (peut prendre 1–2 min au démarrage)
         </div>
       )}

@@ -27,17 +27,8 @@ import type { CatalogElement, ChatMessage, PanierItem, RfqCandidate } from "@/ap
 import { useConversation } from "@/app/providers";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import { useChoiceHandler } from "./useChoiceHandler";
-
-// ─── Shared spinner ──────────────────────────────────────────────────────────
-function Spinner({ className }: { className?: string }) {
-  return (
-    <svg className={cn("animate-spin shrink-0", className)} fill="none" viewBox="0 0 24 24">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-    </svg>
-  );
-}
 
 // ─── RFQ Planning progress banner ─────────────────────────────────────────────
 const RFQ_STATUS_LABELS: Record<string, string> = {
