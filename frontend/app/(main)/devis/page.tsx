@@ -30,6 +30,16 @@ import { useConversation } from "@/app/providers";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 
+// ─── Shared spinner ──────────────────────────────────────────────────────────
+function Spinner({ className }: { className?: string }) {
+  return (
+    <svg className={cn("animate-spin shrink-0", className)} fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+    </svg>
+  );
+}
+
 // ─── RFQ Planning progress banner ─────────────────────────────────────────────
 const RFQ_STATUS_LABELS: Record<string, string> = {
   analyzing:    "Analyse du RFQ",
@@ -48,10 +58,7 @@ function RfqPlanningBanner({
       <div className="w-8 shrink-0" />
       <div className="flex-1 rounded-lg border border-blue-500/20 bg-blue-500/5 px-4 py-3 max-w-[580px]">
         <div className="flex items-center gap-2 mb-1.5">
-          <svg className="animate-spin h-3.5 w-3.5 text-blue-500 shrink-0" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-          </svg>
+          <Spinner className="h-3.5 w-3.5 text-blue-500" />
           <span className="text-xs font-semibold text-blue-600 dark:text-blue-400">
             Analyse RFQ — {RFQ_STATUS_LABELS[planning.status] ?? planning.status}
           </span>
@@ -145,10 +152,7 @@ function SearchWorkspaceModal({
     if (comp.result === "skipped") return <span className="text-muted-foreground text-xs leading-none">—</span>;
     if (comp.id === currentId && (phase === "searching" || phase === "awaiting_choice")) {
       return (
-        <svg className="animate-spin h-3 w-3 text-primary shrink-0" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-        </svg>
+        <Spinner className="h-3 w-3 text-primary" />
       );
     }
     return <span className="w-3 h-3 rounded-full border border-border/60 inline-block shrink-0" />;
@@ -167,10 +171,7 @@ function SearchWorkspaceModal({
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2">
             {(phase === "searching" || phase === "awaiting_choice") && (
-              <svg className="animate-spin h-3.5 w-3.5 text-primary shrink-0" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-              </svg>
+              <Spinner className="h-3.5 w-3.5 text-primary" />
             )}
             <h3 className="font-medium text-sm">
               {phase === "config" && "Composants identifiés"}
@@ -338,10 +339,7 @@ function ToolCallBadge({ tool }: { tool: ToolCallState }) {
       )}
     >
       {tool.status === "running" ? (
-        <svg className="animate-spin h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-        </svg>
+        <Spinner className="h-3 w-3" />
       ) : (
         <span className="text-green-500">✓</span>
       )}
@@ -403,10 +401,7 @@ function AffaireRow({
         <div className="flex items-center gap-2 shrink-0">
           {prixTotal && <span className="text-muted-foreground">{prixTotal}</span>}
           {loading ? (
-            <svg className="animate-spin h-3 w-3 text-muted-foreground" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-            </svg>
+            <Spinner className="h-3 w-3 text-muted-foreground" />
           ) : (
             <ChevronDown className={cn("h-3 w-3 text-muted-foreground transition-transform", expanded && "rotate-180")} />
           )}
@@ -852,10 +847,7 @@ function PosteRow({
         {/* Expand indicator (visual only — row click handles toggle) */}
         <td className="px-1.5 py-1.5 text-center w-6 text-muted-foreground">
           {loadingEl ? (
-            <svg className="animate-spin h-3 w-3 inline" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-            </svg>
+            <Spinner className="h-3 w-3 inline" />
           ) : expanded ? (
             <ChevronDown className="h-3 w-3 inline" />
           ) : (
@@ -2249,10 +2241,7 @@ export default function DevisPage() {
         {/* LLM loading banner */}
         {!llmReady && !error && (
           <div className="flex items-center gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-sm text-amber-600 dark:text-amber-400">
-            <svg className="animate-spin h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-            </svg>
+            <Spinner className="h-3.5 w-3.5" />
             Modèle IA en cours de chargement…
           </div>
         )}
