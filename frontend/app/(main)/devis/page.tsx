@@ -994,7 +994,7 @@ function DevisPanel({
   }
 
   return (
-    <aside className="w-[45%] flex-shrink-0 border-l border-border flex flex-col bg-card min-h-0 overflow-hidden">
+    <aside className="w-full flex-shrink-0 border-l border-border flex flex-col bg-card min-h-0 overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
         <span className="text-sm font-medium">Postes du devis ({mainPostes.length}{optionPostes.length > 0 ? ` + ${optionPostes.length} opt.` : ""})</span>
@@ -1279,9 +1279,9 @@ const PHASE_PROGRESS: Record<SessionPhase, number> = {
 function PhaseBar({ phase }: { phase: SessionPhase }) {
   if (phase === "welcome") return null;
   return (
-    <div className="h-[2px] bg-border/20 flex-shrink-0 relative overflow-hidden">
+    <div className="h-[2px] flex-shrink-0 relative overflow-hidden">
       <div
-        className="absolute inset-y-0 left-0 bg-foreground/20 transition-[width] duration-1000 ease-out"
+        className="absolute inset-y-0 left-0 bg-foreground/15 transition-[width] duration-1000 ease-out"
         style={{ width: `${PHASE_PROGRESS[phase]}%` }}
       />
     </div>
