@@ -444,8 +444,11 @@ def _generer_variantes_question(question: str, history: str, hyde_doc: str = "")
         "options": {"temperature": 0.7, "num_ctx": NUM_CTX_HARD_MAX},  # aligné sur tool_loop — évite reload KV cache
     }
     try:
+        _t0 = time.monotonic()
+        logger.info(f"[OLLAMA] multi-query → start | model={OLLAMA_MODEL} num_ctx={NUM_CTX_HARD_MAX} timeout=500s")
         resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=500)
         resp.raise_for_status()
+        logger.info(f"[OLLAMA] multi-query → done in {time.monotonic()-_t0:.1f}s")
         text = resp.json().get("response", "").strip()
         lignes = [l.strip() for l in text.split('\n') if l.strip()]
         variantes = lignes[:2]
@@ -456,7 +459,7 @@ def _generer_variantes_question(question: str, history: str, hyde_doc: str = "")
                 logger.info(f"  Query #{i+1} : {v}")
             return result
     except Exception as e:
-        logger.warning(f"Multi-query variantes échouées ({e}) — query originale seulement")
+        logger.warning(f"[OLLAMA] multi-query → FAILED after {time.monotonic()-_t0:.1f}s : {e}")
     return [question]
 
 
@@ -539,14 +542,17 @@ def _generer_document_hypothetique(
         "options": {"temperature": 0.5, "num_ctx": NUM_CTX_HARD_MAX},  # aligné sur tool_loop — évite reload KV cache
     }
     try:
+        _t0 = time.monotonic()
+        logger.info(f"[OLLAMA] HyDE → start | model={OLLAMA_MODEL} num_ctx={NUM_CTX_HARD_MAX} timeout=500s")
         resp = requests.post(OLLAMA_API_GENERATE, json=payload, timeout=500)
         resp.raise_for_status()
+        logger.info(f"[OLLAMA] HyDE → done in {time.monotonic()-_t0:.1f}s")
         doc = resp.json().get("response", "").strip()
         if doc:
             logger.info(f"HyDE : document hypothétique généré ({len(doc)} chars)\n--- HYDE DOC ---\n{doc}\n--- FIN HYDE ---")
             return doc
     except Exception as e:
-        logger.warning(f"HyDE échoué ({e}) — question originale conservée")
+        logger.warning(f"[OLLAMA] HyDE → FAILED after {time.monotonic()-_t0:.1f}s : {e}")
     return question
 
 
@@ -1795,11 +1801,14 @@ class RAGEngine:
         # au call précédent (query rewriting utilise le même bracket bas).
         tokens_prompt_estimes = len(prompt) // 4
         num_ctx_reel = _bracket_num_ctx(tokens_prompt_estimes + 600)
-        if num_ctx_reel != num_ctx:
-            logger.info(
-                f"num_ctx ajusté : {num_ctx} → {num_ctx_reel} "
-                f"(prompt ~{tokens_prompt_estimes} tokens, bracket {num_ctx_reel})"
-            )
+        # Ne jamais descendre sous NUM_CTX_HARD_MAX : HyDE et multi-query ont déjà
+        # chargé le modèle à NUM_CTX_HARD_MAX. Un bracket inférieur (ex: 4096 pour un
+        # prompt court) forcerait un rechargement KV cache → GPU discovery failure WSL2.
+        num_ctx_reel = max(num_ctx_reel, NUM_CTX_HARD_MAX)
+        logger.info(
+            f"[OLLAMA] num_ctx calcul : prompt={len(prompt)} chars ~{tokens_prompt_estimes} tokens "
+            f"→ bracket={num_ctx_reel} (HARD_MAX={NUM_CTX_HARD_MAX}, _adapter={num_ctx})"
+        )
         num_ctx = num_ctx_reel
 
         reponse = self._appeler_ollama(prompt, stream=stream, num_ctx=num_ctx)
@@ -1834,6 +1843,8 @@ class RAGEngine:
         }
 
         try:
+            _t0 = time.monotonic()
+            logger.info(f"[OLLAMA] génération → start | model={OLLAMA_MODEL} num_ctx={num_ctx} stream={stream} timeout=600s")
             reponse = requests.post(
                 OLLAMA_API_GENERATE,
                 json=payload,
@@ -1841,6 +1852,10 @@ class RAGEngine:
                 timeout=600,  # 10 minutes au lieu de 5
             )
             reponse.raise_for_status()
+            if not stream:
+                logger.info(f"[OLLAMA] génération → done in {time.monotonic()-_t0:.1f}s")
+            else:
+                logger.info(f"[OLLAMA] génération → stream started after {time.monotonic()-_t0:.1f}s")
         except requests.ConnectionError:
             msg = "Impossible de contacter Ollama. Vérifiez qu'il est lancé avec `ollama serve`."
             if stream:
@@ -1849,6 +1864,7 @@ class RAGEngine:
                 return _err()
             return msg
         except requests.Timeout:
+            logger.error(f"[OLLAMA] génération → TIMEOUT after {time.monotonic()-_t0:.1f}s | num_ctx={num_ctx} stream={stream}")
             msg = "Ollama n'a pas répondu à temps. Réessayez."
             if stream:
                 def _err():
@@ -1944,3 +1960,203 @@ class RAGEngine:
                 yield buffer
 
         return _stream_tokens()
+
+
+# ── ReasoningEngine ────────────────────────────────────────────────────────────
+
+class ReasoningEngine:
+    """
+    Anchor-then-Drill reasoning pipeline (inspiré FAIR-RAG + SPARC-RAG, 2025-2026).
+
+    Phase 1 (exploring)  : recherche large avec la question originale → top-k chunks
+    Phase 2 (reflecting) : LLM lit les snippets compacts → identifie les gaps (JSON)
+    Phase 3 (deepening)  : recherches ciblées sur chaque gap (max 3, grounded)
+    Phase 4 (generating) : contexte fusionné → génération streaming
+
+    Avantage vs décomposition aveugle : les gaps sont ancrés dans les vrais documents
+    → zéro hallucination sur les sous-requêtes.
+    """
+
+    _SCHEMA_REFLECTION = {
+        "type": "object",
+        "properties": {
+            "found": {"type": "string"},
+            "gaps": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["found", "gaps"],
+    }
+
+    def __init__(
+        self,
+        nom_collection: str,
+        prompt_name: str = "defaut",
+        collection_manager: CollectionManager | None = None,
+    ):
+        self.rag = RAGEngine(
+            nom_collection=nom_collection,
+            prompt_name=prompt_name,
+            collection_manager=collection_manager,
+        )
+
+    @staticmethod
+    def _build_snippets(contexte: str, sources: list[dict], max_chars: int = 100) -> str:
+        """Construit des snippets compacts (source + 100 chars) pour le prompt de réflexion."""
+        chunks = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
+        lines = []
+        for i, chunk in enumerate(chunks):
+            src = sources[i] if i < len(sources) else {}
+            fichier = src.get("fichier", "?")
+            page = src.get("page", "?")
+            section_match = re.match(r"^\[([^\]]{0,60})\]", chunk)
+            section = section_match.group(1) if section_match else ""
+            texte = chunk.replace("\n", " ")[:max_chars]
+            parts = [f"[{fichier} p.{page}]"]
+            if section:
+                parts.append(f"[{section[:40]}]")
+            parts.append(texte + "…")
+            lines.append(" ".join(parts))
+        return "\n".join(lines)
+
+    def _reflect(self, question: str, snippets: str) -> dict:
+        """
+        Phase 2 — LLM lit les snippets et identifie les gaps.
+        Retourne {"found": "...", "gaps": ["q1", "q2"]} ou fallback {"found": "", "gaps": []}.
+        """
+        system = (
+            "Tu es un expert en analyse documentaire industrielle. "
+            "Voici des extraits de documents retrouvés pour une question.\n"
+            "Identifie :\n"
+            "1. Ce qui est déjà couvert par ces extraits (champ 'found', 1-2 phrases max)\n"
+            "2. Les aspects importants de la question NON couverts (champ 'gaps', max 3 requêtes courtes)\n"
+            "Les gaps doivent être des requêtes basées sur ce que les documents SEMBLENT contenir, "
+            "pas des inventions. Si tout est couvert, retourne gaps=[].\n"
+            "Réponds UNIQUEMENT en JSON valide."
+        )
+        user_content = f"Question : {question}\n\nExtraits trouvés :\n{snippets}"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+            "think": False,
+            "format": self._SCHEMA_REFLECTION,
+            "options": {"temperature": 0, "num_ctx": 4096},
+        }
+        ollama_base = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+        try:
+            resp = requests.post(f"{ollama_base}/api/chat", json=payload, timeout=45)
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "").strip()
+            parsed = json.loads(content)
+            gaps = [g.strip() for g in parsed.get("gaps", []) if isinstance(g, str) and g.strip()][:3]
+            found = parsed.get("found", "").strip()
+            logger.info("[anchor-drill] reflect → found=%r, %d gap(s): %s", found[:60], len(gaps), gaps)
+            return {"found": found, "gaps": gaps}
+        except Exception as exc:
+            logger.warning("[anchor-drill] _reflect failed: %s — no gaps", exc)
+            return {"found": "", "gaps": []}
+
+    def stream_with_reasoning(
+        self,
+        question: str,
+        history: str,
+        callback_step,
+    ):
+        """
+        Anchor-then-Drill pipeline. Yields (kind, data) tuples :
+          ("reasoning_step", {"step": "exploring"})
+          ("reasoning_step", {"step": "reflecting", "found": "...", "gaps_count": N})
+          ("reasoning_step", {"step": "deepening", "query": "...", "index": 1, "total": N})
+          ("reasoning_step", {"step": "generating"})
+          ("token", "...") × N
+          ("done", {"sources": [...], "metrics": {...}})
+        """
+        import time as _time
+        t0 = _time.monotonic()
+
+        # Phase 1 — Exploration large (anchor)
+        callback_step("reasoning_step", {"step": "exploring"})
+        anchor_ctx, anchor_sources = self.rag.rechercher(question, history=history)
+
+        snippets = self._build_snippets(anchor_ctx, anchor_sources)
+
+        # Phase 2 — Réflexion : LLM identifie les gaps à partir des vrais docs
+        callback_step("reasoning_step", {"step": "reflecting"})
+        reflection = self._reflect(question, snippets)
+        gaps = reflection["gaps"]
+        found_summary = reflection["found"]
+
+        callback_step("reasoning_step", {
+            "step": "reflecting",
+            "found": found_summary,
+            "gaps_count": len(gaps),
+        })
+
+        # Phase 3 — Approfondissement ciblé (drill) sur chaque gap
+        seen_keys: set[tuple] = set()
+        all_docs: list[str] = []
+        all_sources: list[dict] = []
+
+        for i, chunk in enumerate([c for c in anchor_ctx.split("\n\n---\n\n") if c.strip()]):
+            src = anchor_sources[i] if i < len(anchor_sources) else {}
+            key = (src.get("fichier", ""), str(src.get("page", i)))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_docs.append(chunk)
+                all_sources.append(src)
+
+        for idx, gap in enumerate(gaps):
+            callback_step("reasoning_step", {
+                "step": "deepening",
+                "query": gap,
+                "index": idx + 1,
+                "total": len(gaps),
+            })
+            try:
+                gap_ctx, gap_sources = self.rag.rechercher(gap, history=history)
+                for i, chunk in enumerate([c for c in gap_ctx.split("\n\n---\n\n") if c.strip()]):
+                    src = gap_sources[i] if i < len(gap_sources) else {}
+                    key = (src.get("fichier", ""), str(src.get("page", i)))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        all_docs.append(chunk)
+                        all_sources.append(src)
+            except Exception as exc:
+                logger.warning("[anchor-drill] gap search %r failed: %s", gap, exc)
+
+        retrieval_ms = (_time.monotonic() - t0) * 1000
+        logger.info("[anchor-drill] total: %d unique chunks, %d gap(s)", len(all_docs), len(gaps))
+
+        # Phase 4 — Génération streaming
+        callback_step("reasoning_step", {"step": "generating"})
+
+        unified_context = "\n\n---\n\n".join(all_docs) if all_docs else ""
+        if history:
+            full_context = f"Historique de conversation:\n{history}\n\n---\n\n{unified_context}"
+        else:
+            full_context = unified_context
+
+        prompt = self.rag.prompt_template.format(context=full_context, question=question)
+        tokens_estimes = len(prompt) // 4
+        num_ctx = _bracket_num_ctx(tokens_estimes + 600)
+
+        scores = [s.get("score", 0) for s in all_sources if "score" in s]
+        metrics = {
+            "chunks_used": len(all_docs),
+            "top_score": round(max(scores), 3) if scores else None,
+            "min_score": round(min(scores), 3) if scores else None,
+            "retrieval_ms": round(retrieval_ms, 1),
+            "pipeline_hash": _get_pipeline_hash(),
+            "search_hash": build_search_config_hash(),
+        }
+
+        token_gen = RAGEngine._appeler_ollama(prompt, stream=True, num_ctx=num_ctx)
+        for token in token_gen:
+            yield ("token", token)
+
+        yield ("done", {"sources": all_sources, "metrics": metrics})

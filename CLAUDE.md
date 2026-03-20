@@ -25,7 +25,7 @@ Ces fichiers contiennent des décisions techniques récentes (2026) qui **primen
 **Implications pour l'implémentation :**
 
 - Ne PAS sur-optimiser pour 6GB VRAM — ce sera obsolète. Concevoir pour 32GB.
-- Les configs "current 6GB" sont des hacks temporaires (ex: qwen3:8b tight VRAM, pas de Whisper simultané)
+- Les configs "current 6GB" sont des hacks temporaires (qwen3.5:4b actif, pas de Whisper simultané)
 - Sur 5090 : qwen3.5:9b confortable, Whisper large-v3 + LLM simultanément, vLLM viable
 - Les abstractions hexagonales (ports/adapters) doivent rendre la migration transparente
 
@@ -45,7 +45,7 @@ Ces fichiers contiennent des décisions techniques récentes (2026) qui **primen
 
 - Backend : FastAPI (hexagonal architecture, ports/adapters)
 - Frontend : Next.js 14 (App Router, TypeScript)
-- LLM : Ollama (qwen3:8b actuellement, migration vers qwen3.5:4b en test)
+- LLM : Ollama (**qwen3.5:4b** — modèle actif confirmé 2026-03-19)
 - Embeddings : mxbai-embed-large (HuggingFace CPU)
 - Vector DB : ChromaDB (migration Qdrant prévue Phase 2)
 - Docker Compose avec GPU passthrough (CUDA)

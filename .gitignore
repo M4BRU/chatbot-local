@@ -10,6 +10,11 @@ chroma_db/
 _bmad/
 _bmad-output/
 .claude/
+.agents/
+skills-lock.json
 
 # User documents (PDFs ingested by the chatbot)
 documents/
+
+# SSL certs (generated locally)
+nginx/certs/

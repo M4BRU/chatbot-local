@@ -19,6 +19,8 @@ interface CatalogPipeline { method: string; results: Record<string, unknown>[]; 
 interface CatalogChallengeResponse { question: string; bm25: CatalogPipeline; sql: CatalogPipeline }
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const apiFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+  fetch(input, { credentials: "include", ...init });
 
 interface Document {
   nom: string;
@@ -70,7 +72,7 @@ export default function AdminPage() {
   // Fetch collections
   const fetchCollections = async () => {
     try {
-      const res = await fetch(`${API_URL}/api/collections`);
+      const res = await apiFetch(`${API_URL}/api/collections`);
       const data = await res.json();
       setCollections(data.collections || []);
     } catch {
@@ -81,7 +83,7 @@ export default function AdminPage() {
   // Fetch documents for a collection
   const fetchDocuments = async (collectionName: string) => {
     try {
-      const res = await fetch(`${API_URL}/api/collections/${collectionName}/documents`);
+      const res = await apiFetch(`${API_URL}/api/collections/${collectionName}/documents`);
       const data = await res.json();
       setDocuments(data.documents || []);
     } catch {
@@ -91,7 +93,7 @@ export default function AdminPage() {
 
   const fetchVersionStatus = async () => {
     try {
-      const res = await fetch(`${API_URL}/api/collections/version-status`);
+      const res = await apiFetch(`${API_URL}/api/collections/version-status`);
       if (!res.ok) return;
       const data: Array<VersionInfo & { name: string }> = await res.json();
       const map: Record<string, VersionInfo> = {};
@@ -102,7 +104,7 @@ export default function AdminPage() {
 
   const fetchCatalogStatus = async () => {
     try {
-      const res = await fetch(`${API_URL}/api/v1/catalog/status`);
+      const res = await apiFetch(`${API_URL}/api/v1/catalog/status`);
       const data = await res.json();
       setCatalogStatus({ loaded: data.loaded, rows: data.rows, unique_postes: data.unique_postes ?? 0 });
     } catch {
@@ -126,7 +128,7 @@ export default function AdminPage() {
 
   const fetchExcelTables = async (col: string) => {
     try {
-      const res = await fetch(`${API_URL}/api/collections/${col}/excel`);
+      const res = await apiFetch(`${API_URL}/api/collections/${col}/excel`);
       if (res.ok) { const d = await res.json(); setExcelTables(d.tables || []); }
       else setExcelTables([]);
     } catch { setExcelTables([]); }
@@ -138,7 +140,7 @@ export default function AdminPage() {
     setChallenging(true);
     setChallengeResult(null);
     try {
-      const res = await fetch(`${API_URL}/api/v1/catalog/challenge`, {
+      const res = await apiFetch(`${API_URL}/api/v1/catalog/challenge`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: challengeQuestion, with_synthesis: challengeSynthesis }),
@@ -155,7 +157,7 @@ export default function AdminPage() {
     setComparing(true);
     setCompareResult(null);
     try {
-      const res = await fetch(`${API_URL}/api/collections/${selectedCollection}/excel/compare`, {
+      const res = await apiFetch(`${API_URL}/api/collections/${selectedCollection}/excel/compare`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: compareQuestion, with_synthesis: withSynthesis, filename: selectedFilename || null }),
@@ -172,7 +174,7 @@ export default function AdminPage() {
     if (!newCollectionName.trim()) return;
 
     try {
-      const res = await fetch(`${API_URL}/api/collections`, {
+      const res = await apiFetch(`${API_URL}/api/collections`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: newCollectionName.trim() }),
@@ -196,7 +198,7 @@ export default function AdminPage() {
     if (!confirm(`Supprimer la collection "${name}" ?`)) return;
 
     try {
-      const res = await fetch(`${API_URL}/api/collections/${name}`, { method: "DELETE" });
+      const res = await apiFetch(`${API_URL}/api/collections/${name}`, { method: "DELETE" });
       if (res.ok) {
         setMessage({ type: "success", text: `Collection "${name}" supprimée` });
         if (selectedCollection === name) {
@@ -229,7 +231,7 @@ export default function AdminPage() {
       formData.append("file", files[i]);
 
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `${API_URL}/api/collections/${selectedCollection}/documents`,
           { method: "POST", body: formData }
         );
@@ -275,7 +277,7 @@ export default function AdminPage() {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const res = await fetch(`${API_URL}/api/v1/catalog/upload`, { method: "POST", body: formData });
+      const res = await apiFetch(`${API_URL}/api/v1/catalog/upload`, { method: "POST", body: formData });
       const data = await res.json();
       if (res.ok) {
         setMessage({ type: "success", text: `Catalogue chargé : ${data.rows} lignes · ${data.unique_postes ?? 0} postes distincts détectés` });
@@ -295,7 +297,7 @@ export default function AdminPage() {
     if (!selectedCollection || !confirm(`Supprimer "${docName}" ?`)) return;
 
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `${API_URL}/api/collections/${selectedCollection}/documents/${encodeURIComponent(docName)}`,
         { method: "DELETE" }
       );
@@ -314,6 +316,9 @@ export default function AdminPage() {
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-2xl font-bold text-gray-800">Admin - Gestion des documents</h1>
           <div className="flex gap-4 items-center">
+            <Link href="/admin/users" className="text-sm text-blue-600 hover:underline">
+              👥 Utilisateurs
+            </Link>
             <Link href="/admin/eval" className="text-sm text-purple-600 hover:underline">
               📊 Dashboard éval RAG
             </Link>

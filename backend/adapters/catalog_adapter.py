@@ -94,6 +94,12 @@ class _CatalogBM25Indexes:
                 results.append(self._rows[idx])
         return results
 
+    def get_all_scores(self, query: str, column: str = "nom_poste") -> list[float]:
+        """Return BM25 score for every row (one float per row, same order as self._rows)."""
+        bm25 = self._indexes.get(column) or self._indexes.get("nom_poste")
+        tokens = _tokenize(query)
+        return list(bm25.get_scores(tokens))
+
 
 class CatalogAdapter:
     def __init__(self, db_path: Path = CATALOG_DB_PATH) -> None:
@@ -231,21 +237,32 @@ class CatalogAdapter:
             except Exception:
                 return []
 
-    def complete_task_item(self, conversation_id: str, nom_poste: str) -> None:
-        """Mark the first pending task whose query matches nom_poste as done."""
+    def complete_task_item(self, conversation_id: str, nom_poste: str, fallback_first: bool = False) -> None:
+        """Mark the first pending task whose query matches nom_poste as done.
+
+        Si fallback_first=True et qu'aucun mot ne correspond, marque la première tâche
+        pending comme done. Utile quand l'utilisateur choisit un résultat catalogue via
+        l'UI (le nom_poste peut différer de la query, ex: "Robot N220" pour "Comau NJ40").
+        """
         import json, re as _re
         tasks = self.get_task_list(conversation_id)
         if not tasks:
             return
         nom_words = set(_re.findall(r"\w{3,}", nom_poste.lower()))
+        matched = False
         for task in tasks:
             if task.get("done"):
                 continue
             q_words = set(_re.findall(r"\w{3,}", task["query"].lower()))
-            # Match if any query word appears in nom_poste or vice-versa
             if nom_words & q_words:
                 task["done"] = True
+                matched = True
                 break
+        if not matched and fallback_first:
+            for task in tasks:
+                if not task.get("done"):
+                    task["done"] = True
+                    break
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE devis_task_lists SET tasks = ? WHERE conversation_id = ?",
@@ -395,6 +412,112 @@ class CatalogAdapter:
                 [pattern, limit],
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def _bm25_get_all_scores(self, query: str, column: str = "nom_poste") -> list[float]:
+        """Return BM25 score for every catalogue row. Returns [] if index unavailable."""
+        self._rebuild_bm25_if_needed()
+        if self._bm25_indexes is None:
+            return []
+        return self._bm25_indexes.get_all_scores(query, column)
+
+    def search_hybrid(
+        self, query: str, limit: int = 15, column: str = "nom_poste"
+    ) -> list[dict]:
+        """
+        Hybrid search: merges BM25 (stemmed) + FTS5 results.
+
+        Each row gets:
+          _score      : BM25 score (float, 0.0 for FTS5-only matches)
+          _confidence : 'high' (≥60% of max), 'medium' (≥25%), 'low' (>0), 'fts_only' (=0)
+
+        Rows are deduped by (nom_poste, nom_affaire) with max score kept,
+        then sorted by score DESC and truncated to `limit`.
+        """
+        if not self.db_path.exists():
+            return []
+
+        # ── BM25 scores for all rows ─────────────────────────────────────────
+        all_scores = self._bm25_get_all_scores(query, column)
+        if all_scores and self._bm25_indexes is not None:
+            rows_with_score = [
+                (self._bm25_indexes._rows[i], float(all_scores[i]))
+                for i in range(len(all_scores))
+                if all_scores[i] > 0
+            ]
+        else:
+            rows_with_score = []
+
+        # ── FTS5 matches ─────────────────────────────────────────────────────
+        fts_rows: list[dict] = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fts_ok = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='catalogue_fts'"
+            ).fetchone()
+            if fts_ok and column in _FTS_COLS:
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT c.*
+                        FROM   catalogue c
+                        JOIN   catalogue_fts fts ON c.rowid = fts.row_id
+                        WHERE  fts.{column} MATCH ?
+                        ORDER  BY rank
+                        LIMIT  ?
+                        """,
+                        [query, limit * 2],
+                    ).fetchall()
+                    fts_rows = [dict(r) for r in rows]
+                except sqlite3.OperationalError:
+                    pass
+
+        # ── Merge by (nom_poste, nom_affaire) with max score ─────────────────
+        merged: dict[tuple, dict] = {}
+
+        def _key(row: dict) -> tuple:
+            return (
+                (row.get("nom_poste") or "").strip().lower(),
+                (row.get("nom_affaire") or "").strip().lower(),
+            )
+
+        for row, score in rows_with_score:
+            k = _key(row)
+            if k not in merged or score > merged[k]["_score"]:
+                merged[k] = {**row, "_score": score}
+
+        for row in fts_rows:
+            k = _key(row)
+            if k not in merged:
+                merged[k] = {**row, "_score": 0.0}
+            # BM25-scored rows already present — FTS5 doesn't override their score
+
+        if not merged:
+            return []
+
+        # ── Confidence bands ──────────────────────────────────────────────────
+        max_score = max(v["_score"] for v in merged.values())
+
+        def _confidence(score: float) -> str:
+            if max_score == 0:
+                return "fts_only"
+            pct = score / max_score
+            if pct >= 0.60:
+                return "high"
+            if pct >= 0.25:
+                return "medium"
+            if score > 0:
+                return "low"
+            return "fts_only"
+
+        results = sorted(merged.values(), key=lambda r: r["_score"], reverse=True)
+        for r in results:
+            r["_confidence"] = _confidence(r["_score"])
+
+        logger.info(
+            "search_hybrid[%s] %r → %d résultats (top score=%.2f)",
+            column, query, len(results[:limit]), max_score,
+        )
+        return results[:limit]
 
     def filter_to_column_matches(self, query: str, column: str, results: list[dict]) -> list[dict]:
         """

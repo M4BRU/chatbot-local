@@ -2,6 +2,10 @@ import type { AgentMode, AgentSSEEvent, CatalogElement, Conversation, Message, S
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// Inclut toujours les cookies HTTP-only (auth) pour chaque requête API
+const apiFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+  fetch(input, { credentials: "include", ...init });
+
 interface HistoryMessage {
   role: "user" | "assistant";
   content: string;
@@ -13,6 +17,7 @@ export async function* streamChat(
   promptName: string = "defaut",
   history: HistoryMessage[] = [],
   convId?: string,
+  reasoningMode?: boolean,
 ): AsyncGenerator<SSEEvent> {
   const body: Record<string, unknown> = {
     message,
@@ -21,8 +26,9 @@ export async function* streamChat(
     history,
   };
   if (convId) body.conv_id = convId;
+  if (reasoningMode) body.reasoning_mode = true;
 
-  const response = await fetch(`${API_URL}/api/chat`, {
+  const response = await apiFetch(`${API_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -67,7 +73,7 @@ export async function* streamAgentChat(
   const body: Record<string, unknown> = { message, collection_name: collectionName };
   if (forceMode) body.force_mode = forceMode;
 
-  const response = await fetch(`${API_URL}/api/v1/agent/chat`, {
+  const response = await apiFetch(`${API_URL}/api/v1/agent/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -99,7 +105,7 @@ export async function* streamAgentChat(
 
 export async function fetchLLMStatus(): Promise<boolean> {
   try {
-    const response = await fetch(`${API_URL}/api/v1/status`);
+    const response = await apiFetch(`${API_URL}/api/v1/status`);
     if (!response.ok) return false;
     const data = await response.json();
     return data.llm_ready === true;
@@ -109,7 +115,7 @@ export async function fetchLLMStatus(): Promise<boolean> {
 }
 
 export async function fetchCollections(): Promise<string[]> {
-  const response = await fetch(`${API_URL}/api/collections`);
+  const response = await apiFetch(`${API_URL}/api/collections`);
   if (!response.ok) return [];
   const data = await response.json();
   return data.collections || [];
@@ -160,13 +166,13 @@ export async function fetchChunks(
 ): Promise<BrowseResult> {
   const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   if (source) params.set("source", source);
-  const response = await fetch(`${API_URL}/api/collections/${collectionName}/chunks?${params}`);
+  const response = await apiFetch(`${API_URL}/api/collections/${collectionName}/chunks?${params}`);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
 
 export async function fetchCollectionSources(collectionName: string): Promise<string[]> {
-  const response = await fetch(`${API_URL}/api/collections/${collectionName}/sources`);
+  const response = await apiFetch(`${API_URL}/api/collections/${collectionName}/sources`);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
   return data.sources as string[];
@@ -175,13 +181,13 @@ export async function fetchCollectionSources(collectionName: string): Promise<st
 // ─── Conversation API ────────────────────────────────────────────────────────
 
 export async function fetchConversations(): Promise<Conversation[]> {
-  const response = await fetch(`${API_URL}/api/conversations`);
+  const response = await apiFetch(`${API_URL}/api/conversations`);
   if (!response.ok) return [];
   return response.json();
 }
 
 export async function createConversation(title: string, mode: string): Promise<Conversation> {
-  const response = await fetch(`${API_URL}/api/conversations`, {
+  const response = await apiFetch(`${API_URL}/api/conversations`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title, mode }),
@@ -191,13 +197,13 @@ export async function createConversation(title: string, mode: string): Promise<C
 }
 
 export async function getConversationMessages(id: string): Promise<Message[]> {
-  const response = await fetch(`${API_URL}/api/conversations/${id}/messages`);
+  const response = await apiFetch(`${API_URL}/api/conversations/${id}/messages`);
   if (!response.ok) return [];
   return response.json();
 }
 
 export async function addMessage(conversationId: string, role: string, content: string): Promise<void> {
-  await fetch(`${API_URL}/api/conversations/${conversationId}/messages`, {
+  await apiFetch(`${API_URL}/api/conversations/${conversationId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ role, content }),
@@ -205,7 +211,7 @@ export async function addMessage(conversationId: string, role: string, content: 
 }
 
 export async function updateConversationTitle(id: string, title: string): Promise<void> {
-  await fetch(`${API_URL}/api/conversations/${id}`, {
+  await apiFetch(`${API_URL}/api/conversations/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
@@ -213,7 +219,7 @@ export async function updateConversationTitle(id: string, title: string): Promis
 }
 
 export async function deleteConversation(id: string): Promise<void> {
-  await fetch(`${API_URL}/api/conversations/${id}`, { method: "DELETE" });
+  await apiFetch(`${API_URL}/api/conversations/${id}`, { method: "DELETE" });
 }
 
 // ─── Devis API ───────────────────────────────────────────────────────────────
@@ -225,7 +231,7 @@ export async function* streamDevisChat(
   history: { role: "user" | "assistant"; content: string }[],
   catalogMethod: string = "bm25"
 ): AsyncGenerator<DevisSSEEvent> {
-  const response = await fetch(`${API_URL}/api/v1/devis/chat`, {
+  const response = await apiFetch(`${API_URL}/api/v1/devis/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -262,7 +268,7 @@ export async function* streamDevisChat(
 export async function* streamGenerateDevis(
   conversationId: string
 ): AsyncGenerator<DevisSSEEvent> {
-  const response = await fetch(`${API_URL}/api/v1/devis/generate`, {
+  const response = await apiFetch(`${API_URL}/api/v1/devis/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ conversation_id: conversationId }),
@@ -291,23 +297,23 @@ export async function* streamGenerateDevis(
 }
 
 export async function fetchPanier(conversationId: string): Promise<PanierItem[]> {
-  const response = await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier`);
+  const response = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier`);
   if (!response.ok) return [];
   return response.json();
 }
 
 export async function clearPanier(conversationId: string): Promise<void> {
-  await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier`, { method: "DELETE" });
+  await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier`, { method: "DELETE" });
 }
 
 export async function removePanierItem(conversationId: string, itemId: string): Promise<void> {
-  await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier/${itemId}`, { method: "DELETE" });
+  await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier/${itemId}`, { method: "DELETE" });
 }
 
 export async function fetchPosteElements(nomPoste: string, nomAffaire?: string): Promise<CatalogElement[]> {
   let url = `${API_URL}/api/v1/catalog/elements?nom_poste=${encodeURIComponent(nomPoste)}`;
   if (nomAffaire) url += `&nom_affaire=${encodeURIComponent(nomAffaire)}`;
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   if (!res.ok) return [];
   return res.json();
 }
@@ -316,7 +322,7 @@ export async function addPosteToPanierDirect(
   conversationId: string,
   posteData: { nom_poste: string; nom_affaire?: string; num_poste?: string; quantite?: number }
 ): Promise<{ added: PanierItem[]; remaining_tasks: { query: string }[] }> {
-  const res = await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier/poste`, {
+  const res = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier/poste`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(posteData),
@@ -330,7 +336,7 @@ export async function addElementToPanierDirect(
   conversationId: string,
   elementData: Record<string, string>
 ): Promise<PanierItem[]> {
-  const res = await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier/element`, {
+  const res = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier/element`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(elementData),
@@ -341,7 +347,7 @@ export async function addElementToPanierDirect(
 }
 
 export async function lockDevisAffaire(conversationId: string, nomAffaire: string): Promise<void> {
-  await fetch(`${API_URL}/api/v1/devis/${conversationId}/lock-affaire`, {
+  await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/lock-affaire`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nom_affaire: nomAffaire }),
@@ -349,7 +355,7 @@ export async function lockDevisAffaire(conversationId: string, nomAffaire: strin
 }
 
 export async function setSearchScope(conversationId: string, searchAll: boolean): Promise<void> {
-  await fetch(`${API_URL}/api/v1/devis/${conversationId}/search-scope`, {
+  await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/search-scope`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ search_all: searchAll }),
@@ -357,19 +363,19 @@ export async function setSearchScope(conversationId: string, searchAll: boolean)
 }
 
 export async function fetchCatalogStatus(): Promise<{ loaded: boolean; rows: number; columns: string[] }> {
-  const response = await fetch(`${API_URL}/api/v1/catalog/status`);
+  const response = await apiFetch(`${API_URL}/api/v1/catalog/status`);
   if (!response.ok) return { loaded: false, rows: 0, columns: [] };
   return response.json();
 }
 
 export async function fetchDevisSettings(conversationId: string): Promise<{ coefficient: number; coef_final: number }> {
-  const res = await fetch(`${API_URL}/api/v1/devis/${conversationId}/settings`);
+  const res = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/settings`);
   if (!res.ok) return { coefficient: 0, coef_final: 0 };
   return res.json();
 }
 
 export async function updateDevisSettings(conversationId: string, coefficient: number, coefFinal: number): Promise<void> {
-  await fetch(`${API_URL}/api/v1/devis/${conversationId}/settings`, {
+  await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/settings`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ coefficient, coef_final: coefFinal }),
@@ -381,7 +387,7 @@ export async function updatePanierItem(
   itemId: string,
   fields: { nbre_jours_etude?: number; nbre_jours_atelier?: number; nbre_jours_client?: number; is_option?: boolean }
 ): Promise<PanierItem> {
-  const res = await fetch(`${API_URL}/api/v1/devis/${conversationId}/panier/${itemId}`, {
+  const res = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/panier/${itemId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(fields),
@@ -391,7 +397,7 @@ export async function updatePanierItem(
 }
 
 export async function exportDevisExcel(conversationId: string): Promise<void> {
-  const response = await fetch(`${API_URL}/api/v1/devis/${conversationId}/export`);
+  const response = await apiFetch(`${API_URL}/api/v1/devis/${conversationId}/export`);
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || `HTTP ${response.status}`);
@@ -464,7 +470,7 @@ export async function debugRfqPlanner(
   message: string,
   collection: string,
 ): Promise<RfqDebugResult> {
-  const response = await fetch(`${API_URL}/api/v1/devis/rfq-debug`, {
+  const response = await apiFetch(`${API_URL}/api/v1/devis/rfq-debug`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message, collection }),
@@ -481,7 +487,7 @@ export async function debugRAG(
   collectionName: string,
   promptName: string = "defaut"
 ): Promise<DebugResult> {
-  const response = await fetch(`${API_URL}/api/chat/debug`, {
+  const response = await apiFetch(`${API_URL}/api/chat/debug`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

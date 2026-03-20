@@ -3,12 +3,17 @@
 import asyncio
 import json
 import threading
+import uuid as _uuid
 from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 
-from backend.api.dependencies import get_collection_manager
+from backend.adapters.auth_adapter import get_current_user
+from backend.api.dependencies import get_authorization_service, get_collection_manager
+from backend.db.models import Conversation, Message, UserTable
 from backend.domain.models.chat import ChatRequest, ChatResponse
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -33,15 +38,53 @@ def _format_history(history: list) -> str:
     return "\n".join(formatted)
 
 
+async def _persist_messages(
+    conv_id: str,
+    user_id: _uuid.UUID,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    """Persiste les messages dans PostgreSQL (async, hors thread)."""
+    try:
+        conv_uuid = _uuid.UUID(conv_id)
+    except ValueError:
+        return
+    try:
+        from backend.db.base import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Conversation).where(
+                    Conversation.id == conv_uuid,
+                    Conversation.user_id == user_id,
+                )
+            )
+            conv = result.scalar_one_or_none()
+            if conv:
+                session.add(Message(conversation_id=conv.id, role="user", content=user_message))
+                if assistant_message:
+                    session.add(Message(conversation_id=conv.id, role="assistant", content=assistant_message))
+                conv.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+    except Exception:
+        pass
+
+
 async def _stream_rag_response(
-    message: str, collection_name: str, prompt_name: str, history: list, conv_id: str | None = None
+    message: str,
+    collection_name: str,
+    prompt_name: str,
+    history: list,
+    conv_id: str | None = None,
+    reasoning_mode: bool = False,
+    user_id: _uuid.UUID | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream RAG response as SSE events.
 
     Le RAG (recherche ChromaDB + génération Ollama) tourne dans un thread dédié
     via asyncio.Queue + call_soon_threadsafe pour ne pas bloquer la boucle d'événements.
+    La persistance des messages se fait côté async (PostgreSQL) après réception du done.
     """
-    from core.search import RAGEngine
+    from core.search import RAGEngine, ReasoningEngine
 
     cm = get_collection_manager()
     if not cm.collection_existe(collection_name):
@@ -49,7 +92,6 @@ async def _stream_rag_response(
         return
 
     try:
-        rag = RAGEngine(collection_name, prompt_name=prompt_name, collection_manager=cm)
         history_text = _format_history(history)
 
         loop = asyncio.get_running_loop()
@@ -58,42 +100,53 @@ async def _stream_rag_response(
         def _run_in_thread() -> None:
             """Exécute le pipeline RAG dans un thread pour ne pas bloquer l'event loop."""
             try:
-                result = rag.generer_avec_sources(message, stream=True, history=history_text)
                 answer_parts: list[str] = []
-                for token in result["reponse"]:
-                    answer_parts.append(token)
-                    loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+                sources: list = []
+                metrics: dict = {}
 
-                # Stocker dans eval_queue pour évaluation différée
-                metrics = result.get("metrics", {})
-                try:
-                    from backend.core.evaluator import enqueue_eval
-                    enqueue_eval(
-                        collection=collection_name,
-                        pipeline_hash=metrics.get("pipeline_hash", "unknown"),
-                        search_hash=metrics.get("search_hash", "unknown"),
-                        question=message,
-                        answer="".join(answer_parts),
-                        context_chunks=result.get("context_chunks", []),
-                        retrieval_ms=metrics.get("retrieval_ms", 0),
-                    )
-                except Exception:
-                    pass
+                if reasoning_mode:
+                    engine = ReasoningEngine(collection_name, prompt_name=prompt_name, collection_manager=cm)
 
-                # Persistance backend (résiste aux déconnexions SSE)
-                if conv_id:
+                    def _cb(kind, data):
+                        loop.call_soon_threadsafe(queue.put_nowait, (kind, data))
+
+                    for kind, data in engine.stream_with_reasoning(message, history_text, _cb):
+                        if kind == "token":
+                            answer_parts.append(data)
+                            loop.call_soon_threadsafe(queue.put_nowait, ("token", data))
+                        elif kind == "done":
+                            sources = data.get("sources", [])
+                            metrics = data.get("metrics", {})
+                else:
+                    rag = RAGEngine(collection_name, prompt_name=prompt_name, collection_manager=cm)
+                    result = rag.generer_avec_sources(message, stream=True, history=history_text)
+                    metrics = result.get("metrics", {})
+
+                    for token in result["reponse"]:
+                        answer_parts.append(token)
+                        loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+
+                    sources = result["sources"]
+
+                    # Stocker dans eval_queue pour évaluation différée
                     try:
-                        from backend.core.conversation_manager import ConversationManager
-                        cm = ConversationManager()
-                        cm.add_message(conv_id, "user", message)
-                        if answer_parts:
-                            cm.add_message(conv_id, "assistant", "".join(answer_parts))
+                        from backend.core.evaluator import enqueue_eval
+                        enqueue_eval(
+                            collection=collection_name,
+                            pipeline_hash=metrics.get("pipeline_hash", "unknown"),
+                            search_hash=metrics.get("search_hash", "unknown"),
+                            question=message,
+                            answer="".join(answer_parts),
+                            context_chunks=result.get("context_chunks", []),
+                            retrieval_ms=metrics.get("retrieval_ms", 0),
+                        )
                     except Exception:
                         pass
 
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", {
-                    "sources": result["sources"],
+                    "sources": sources,
                     "metrics": metrics,
+                    "answer_text": "".join(answer_parts),
                 }))
             except Exception as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
@@ -103,16 +156,22 @@ async def _stream_rag_response(
 
         while True:
             try:
-                kind, data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                kind, data = await asyncio.wait_for(queue.get(), timeout=10.0)
             except asyncio.TimeoutError:
-                # Keepalive SSE : évite que le browser ferme la connexion pendant
-                # le chargement du modèle Ollama (cold start pouvant dépasser 60s)
-                yield ": keepalive\n\n"
+                # Keepalive SSE : vrai event data: (pas un commentaire) pour que
+                # Uvicorn, les proxies et le browser flush réellement le stream.
+                # Le frontend ignore les événements avec keepalive=True.
+                yield f"data: {json.dumps({'keepalive': True})}\n\n"
                 continue
             if kind == "token":
                 yield f"data: {json.dumps({'token': data})}\n\n"
+            elif kind == "reasoning_step":
+                yield f"data: {json.dumps({'reasoning_step': data})}\n\n"
             elif kind == "done":
                 yield f"data: {json.dumps({'sources': data['sources'], 'metrics': data.get('metrics'), 'done': True})}\n\n"
+                # Persistance async PostgreSQL (remplace l'ancien ConversationManager synchrone)
+                if conv_id and user_id:
+                    await _persist_messages(conv_id, user_id, message, data.get("answer_text", ""))
                 break
             elif kind == "error":
                 yield f"data: {json.dumps({'error': data})}\n\n"
@@ -125,13 +184,17 @@ async def _stream_rag_response(
 
 
 @router.post("/chat")
-async def chat(request: ChatRequest) -> StreamingResponse:
+async def chat(
+    request: ChatRequest,
+    current_user: UserTable = Depends(get_current_user),
+) -> StreamingResponse:
     """
     Chat endpoint with RAG and SSE streaming.
 
     Searches the specified collection for relevant context,
     then streams the LLM response token by token.
     """
+    get_authorization_service().assert_can_access(current_user.role, request.collection_name)
     return StreamingResponse(
         _stream_rag_response(
             request.message,
@@ -139,6 +202,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             request.prompt_name,
             request.history,
             request.conv_id,
+            request.reasoning_mode,
+            user_id=current_user.id,
         ),
         media_type="text/event-stream",
         headers={
@@ -150,12 +215,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
 
 
 @router.post("/chat/debug")
-async def chat_debug(request: ChatRequest) -> dict:
+async def chat_debug(
+    request: ChatRequest,
+    current_user: UserTable = Depends(get_current_user),
+) -> dict:
     """
     Debug endpoint : retourne les chunks récupérés + query rewriting, sans appeler le LLM.
     Utile pour diagnostiquer le pipeline RAG.
     """
     from core.search import RAGEngine
+
+    get_authorization_service().assert_can_access(current_user.role, request.collection_name)
 
     cm = get_collection_manager()
     if not cm.collection_existe(request.collection_name):
@@ -171,7 +241,10 @@ async def chat_debug(request: ChatRequest) -> dict:
 
 
 @router.post("/chat/sync", response_model=ChatResponse)
-async def chat_sync(request: ChatRequest) -> ChatResponse:
+async def chat_sync(
+    request: ChatRequest,
+    current_user: UserTable = Depends(get_current_user),
+) -> ChatResponse:
     """
     Non-streaming chat endpoint for testing.
 
@@ -179,6 +252,8 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
     """
     from core.collection_manager import CollectionManager
     from core.search import RAGEngine
+
+    get_authorization_service().assert_can_access(current_user.role, request.collection_name)
 
     cm = CollectionManager()
     if not cm.collection_existe(request.collection_name):

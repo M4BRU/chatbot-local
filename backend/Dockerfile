@@ -22,9 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Toutes les dépendances Python viennent de l'image de base (pré-installées)
+# Dépendances ML lourdes viennent de l'image de base (pré-installées)
 COPY --from=chatbot-local-ml-base /root/.local /root/.local
 ENV PATH=/root/.local/bin:$PATH
+
+# Dépendances légères (auth, SQL, etc.) — installées ici pour éviter rebuild de la base
+COPY backend/requirements-infra.txt ./backend/requirements-infra.txt
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --user -r backend/requirements-infra.txt -r backend/requirements.txt --quiet
 
 # Code applicatif uniquement
 COPY backend/ ./backend/
@@ -36,4 +41,4 @@ RUN mkdir -p /app/documents
 ENV PYTHONPATH=/app/backend:/app
 
 EXPOSE 8000
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--timeout-keep-alive", "0"]

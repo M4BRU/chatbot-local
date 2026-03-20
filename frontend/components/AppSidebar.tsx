@@ -2,8 +2,8 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { Bot, FileText, MessageSquare, Mic, Plus, Trash2 } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import { Bot, FileText, LogOut, MessageSquare, Mic, Plus, Settings, Trash2 } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { useConversation } from "@/app/providers";
+import { logout, useCurrentUser } from "@/app/lib/auth";
 
 const MODES = [
   { label: "Chat", href: "/", icon: MessageSquare },
@@ -27,6 +28,8 @@ const MODES = [
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const { user } = useCurrentUser();
   const { conversations, currentConversationId, selectConversation, createConversation, deleteConversation, mode } =
     useConversation();
 
@@ -44,6 +47,7 @@ export function AppSidebar() {
             width={120}
             height={40}
             className="object-contain"
+            unoptimized
           />
         </div>
         <Button
@@ -104,13 +108,40 @@ export function AppSidebar() {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarFooter className="p-4">
-        <Link
-          href="/admin"
-          className="text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors"
-        >
-          Admin
-        </Link>
+      <SidebarFooter className="p-4 space-y-2">
+        {["ADMIN", "DEV"].includes(user?.role ?? "") && (
+          <Link
+            href="/admin"
+            className="text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors"
+          >
+            Admin
+          </Link>
+        )}
+        {user && (
+          <div className="flex items-center justify-between text-xs text-sidebar-foreground/60">
+            <span className="truncate">{user.email}</span>
+            <div className="flex items-center gap-1 ml-2 shrink-0">
+              <Link
+                href="/account"
+                title="Mon compte"
+                className="hover:text-foreground transition-colors"
+              >
+                <Settings className="h-3 w-3" />
+              </Link>
+              <button
+                onClick={async () => {
+                  await logout();
+                  router.push("/login");
+                  router.refresh();
+                }}
+                title="Déconnexion"
+                className="hover:text-destructive transition-colors"
+              >
+                <LogOut className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+        )}
       </SidebarFooter>
     </Sidebar>
   );

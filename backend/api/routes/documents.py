@@ -11,7 +11,15 @@ import requests as _requests
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from backend.api.dependencies import get_collection_manager, get_excel_collection_adapter, get_settings
+from backend.adapters.auth_adapter import get_current_user
+from backend.api.dependencies import (
+    RoleChecker,
+    get_authorization_service,
+    get_collection_manager,
+    get_excel_collection_adapter,
+    get_settings,
+)
+from backend.db.models import UserTable
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +29,9 @@ settings = get_settings()
 
 # Extensions Excel reconnues
 _EXCEL_SUFFIXES = {".xlsx", ".xls"}
+
+_admin_role = RoleChecker(["ADMIN"])
+_admin_or_commercial = RoleChecker(["ADMIN", "COMMERCIAL"])
 
 
 class DocumentInfo(BaseModel):
@@ -72,8 +83,12 @@ class ExcelCompareRequest(BaseModel):
 
 
 @router.get("", response_model=DocumentListResponse)
-async def list_documents(collection_name: str) -> DocumentListResponse:
+async def list_documents(
+    collection_name: str,
+    current_user: UserTable = Depends(get_current_user),
+) -> DocumentListResponse:
     """List all documents in a collection."""
+    get_authorization_service().assert_can_access(current_user.role, collection_name)
     from core.document_manager import DocumentManager
 
     cm = get_collection_manager()
@@ -91,6 +106,7 @@ async def upload_document(
     file: UploadFile = File(...),
     force: bool = Query(False, description="Force re-indexation even if document exists"),
     excel_adapter=Depends(get_excel_collection_adapter),
+    _: UserTable = Depends(_admin_role),
 ) -> IndexResult:
     """
     Upload and index a document in a collection.
@@ -162,6 +178,7 @@ async def delete_document(
     collection_name: str,
     document_name: str,
     excel_adapter=Depends(get_excel_collection_adapter),
+    _: UserTable = Depends(_admin_role),
 ) -> None:
     """Delete a document from a collection (vecteur + SQL si Excel)."""
     from core.document_manager import DocumentManager
@@ -225,11 +242,13 @@ excel_router = APIRouter(
 async def list_excel_tables(
     collection_name: str,
     excel_adapter=Depends(get_excel_collection_adapter),
+    current_user: UserTable = Depends(get_current_user),
 ) -> ExcelListResponse:
     """
     Liste les fichiers Excel indexés dans le pipeline SQL pour cette collection.
     Retourne le schéma (colonnes + types) et un échantillon de 3 lignes par table.
     """
+    get_authorization_service().assert_can_access(current_user.role, collection_name)
     tables = excel_adapter.list_tables(collection_name)
     return ExcelListResponse(tables=[ExcelTableInfo(**t) for t in tables])
 
@@ -239,6 +258,7 @@ async def compare_excel_retrieval(
     collection_name: str,
     req: ExcelCompareRequest,
     excel_adapter=Depends(get_excel_collection_adapter),
+    current_user: UserTable = Depends(_admin_or_commercial),
 ) -> dict:
     """
     Compare les deux pipelines de retrieval Excel côte à côte :
@@ -251,6 +271,7 @@ async def compare_excel_retrieval(
       POST /api/collections/tarifs-2024/excel/compare
       {"question": "prix du moteur 3kW ?"}
     """
+    get_authorization_service().assert_can_access(current_user.role, collection_name)
     question = req.question
 
     # ── Pipeline SQL ──────────────────────────────────────────────────────────
@@ -333,6 +354,7 @@ async def delete_excel_file(
     collection_name: str,
     filename: str,
     excel_adapter=Depends(get_excel_collection_adapter),
+    _: UserTable = Depends(_admin_role),
 ) -> None:
     """Supprime un fichier Excel du pipeline SQL (les données vecteur restent intactes)."""
     deleted = excel_adapter.delete_file(collection_name, filename)

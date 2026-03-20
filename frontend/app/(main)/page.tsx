@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowDown, Send } from "lucide-react";
+import { ArrowDown, Brain, Send } from "lucide-react";
 import { fetchCollections, fetchLLMStatus, getConversationMessages, streamChat } from "@/app/lib/api";
 import type { ChatMessage } from "@/app/lib/types";
 import { useConversation } from "@/app/providers";
@@ -31,6 +31,62 @@ function MessageItem({ msg }: { msg: ChatMessage }) {
 }
 
 
+// ─── Reasoning progress banner ─────────────────────────────────────────────────
+const REASONING_STEP_LABELS: Record<string, string> = {
+  exploring:  "Exploration large des documents…",
+  reflecting: "Analyse des résultats, identification des lacunes…",
+  deepening:  "Approfondissement ciblé…",
+  generating: "Génération de la réponse synthétisée…",
+};
+
+function ReasoningBanner({
+  step,
+}: {
+  step: { step: string; query?: string; index?: number; total?: number; found?: string; gaps_count?: number };
+}) {
+  const label = REASONING_STEP_LABELS[step.step] ?? step.step;
+  const deepenDetail = step.step === "deepening" && step.query
+    ? `[${step.index}/${step.total}] ${step.query}`
+    : null;
+  const reflectDetail = step.step === "reflecting" && step.found
+    ? step.found
+    : null;
+
+  return (
+    <div className="flex gap-3 mb-4">
+      <div className="w-8 shrink-0" />
+      <div className="flex-1 rounded-lg border border-violet-500/20 bg-violet-500/5 px-4 py-3 max-w-[580px]">
+        <div className="flex items-center gap-2 mb-1">
+          <svg className="animate-spin h-3.5 w-3.5 text-violet-500 shrink-0" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+          <span className="text-xs font-semibold text-violet-600 dark:text-violet-400">
+            Mode Raisonnement
+          </span>
+          {step.step === "deepening" && step.total != null && (
+            <span className="ml-auto text-xs bg-violet-500/15 rounded-full px-2 py-0.5 text-violet-700 dark:text-violet-300 shrink-0">
+              {step.index}/{step.total}
+            </span>
+          )}
+          {step.step === "reflecting" && step.gaps_count != null && (
+            <span className="ml-auto text-xs bg-violet-500/15 rounded-full px-2 py-0.5 text-violet-700 dark:text-violet-300 shrink-0">
+              {step.gaps_count} lacune{step.gaps_count !== 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">{label}</p>
+        {deepenDetail && (
+          <p className="text-[11px] text-muted-foreground/70 truncate mt-0.5">{deepenDetail}</p>
+        )}
+        {reflectDetail && (
+          <p className="text-[11px] text-muted-foreground/70 line-clamp-2 mt-0.5">{reflectDetail}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main page ─────────────────────────────────────────────────────────────────
 export default function ChatPage() {
   const { currentConversationId, createConversation, refreshConversations, mode } =
@@ -44,6 +100,8 @@ export default function ChatPage() {
   const [collection, setCollection] = useState("");
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reasoningMode, setReasoningMode] = useState(false);
+  const [reasoningStep, setReasoningStep] = useState<{ step: string; query?: string; index?: number; total?: number; found?: string; gaps_count?: number } | null>(null);
 
   const activeConvIdRef = useRef<string | null>(null);
   const skipNextReloadRef = useRef(false);
@@ -130,10 +188,11 @@ export default function ChatPage() {
   const handleSend = useCallback(
     async (content?: string) => {
       const text = (content ?? input).trim();
-      if (!text || isLoading || !llmReady) return;
+      if (!text || isLoading || !llmReady || !collection) return;
 
       setInput("");
       setError(null);
+      setReasoningStep(null);
 
       const userMsg: ChatMessage = {
         id: Math.random().toString(36).slice(2),
@@ -164,15 +223,21 @@ export default function ChatPage() {
 
       try {
         let firstToken = true;
+        let doneReceived = false;
 
-        for await (const event of streamChat(text, collection, "defaut", history, convId ?? undefined)) {
+        for await (const event of streamChat(text, collection, "defaut", history, convId ?? undefined, reasoningMode)) {
           if (event.error) {
             setError(event.error);
             setIsLoading(false);
             break;
           }
 
+          if (event.reasoning_step) {
+            setReasoningStep(event.reasoning_step);
+          }
+
           if (event.token) {
+            setReasoningStep(null); // clear banner when first token arrives
             assistantContent += event.token;
 
             if (firstToken) {
@@ -193,6 +258,8 @@ export default function ChatPage() {
           }
 
           if (event.done) {
+            doneReceived = true;
+            setReasoningStep(null);
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === assistantId
@@ -204,18 +271,34 @@ export default function ChatPage() {
           }
         }
 
-        // Edge case: no tokens received
-        if (assistantContent === "") setIsLoading(false);
+        // Connexion interrompue sans event done
+        if (!doneReceived) {
+          setReasoningStep(null);
+          if (assistantContent === "") {
+            // Aucun token reçu — spinner fantôme
+            setIsLoading(false);
+            setError("La connexion au serveur a été interrompue. Veuillez réessayer.");
+          } else {
+            // Réponse partielle reçue — finaliser le message
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, isStreaming: false } : m
+              )
+            );
+            setError("Réponse peut-être incomplète (connexion interrompue).");
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Erreur de connexion";
         setError(msg);
         setIsLoading(false);
+        setReasoningStep(null);
       } finally {
         // Le backend persiste les messages directement (résistant aux déconnexions SSE)
         if (convId) refreshConversations();
       }
     },
-    [input, isLoading, llmReady, messages, collection, mode, createConversation, refreshConversations, scrollToBottom]
+    [input, isLoading, llmReady, messages, collection, mode, createConversation, refreshConversations, scrollToBottom, reasoningMode]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -231,6 +314,21 @@ export default function ChatPage() {
   const inputBar = (
     <>
       <div className="flex items-end gap-3 bg-card border border-border rounded-2xl px-4 py-3 shadow-sm">
+        {/* Reasoning mode toggle */}
+        <button
+          type="button"
+          onClick={() => setReasoningMode((v) => !v)}
+          title={reasoningMode ? "Mode Raisonnement actif — cliquer pour désactiver" : "Activer le Mode Raisonnement (multi-requêtes RAG)"}
+          className={cn(
+            "flex-shrink-0 flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-xs border transition-all",
+            reasoningMode
+              ? "bg-violet-500/15 border-violet-500/30 text-violet-600 dark:text-violet-400"
+              : "bg-transparent border-border text-muted-foreground hover:text-foreground"
+          )}
+        >
+          <Brain size={12} />
+          <span className="hidden sm:inline">Raisonnement</span>
+        </button>
         <textarea
           ref={textareaRef}
           value={input}
@@ -244,10 +342,10 @@ export default function ChatPage() {
         />
         <button
           onClick={() => handleSend()}
-          disabled={!input.trim() || isLoading || !llmReady}
+          disabled={!input.trim() || isLoading || !llmReady || !collection}
           className={cn(
             "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center transition-all",
-            input.trim() && !isLoading && llmReady
+            input.trim() && !isLoading && llmReady && collection
               ? "bg-foreground text-background hover:opacity-80"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           )}
@@ -333,7 +431,10 @@ export default function ChatPage() {
               {messages.map((msg) => (
                 <MessageItem key={msg.id} msg={msg} />
               ))}
-              {isLoading && <LoadingDots />}
+              {isLoading && reasoningStep && (
+                <ReasoningBanner step={reasoningStep} />
+              )}
+              {isLoading && !reasoningStep && <LoadingDots />}
               {error && (
                 <p className="text-center text-sm text-destructive py-2">{error}</p>
               )}

@@ -151,7 +151,7 @@ export function AssistantMessage({
     <div className="flex gap-3 mb-6">
       {/* Avatar */}
       <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center mt-0.5 border border-border">
-        <Image src="/logoVLM.png" alt="Assistant" width={18} height={18} className="object-contain" />
+        <Image src="/logoVLM.png" alt="Assistant" width={18} height={18} className="object-contain" unoptimized />
       </div>
 
       {/* Contenu */}
@@ -203,7 +203,7 @@ export function LoadingDots() {
   return (
     <div className="flex gap-3 mb-6">
       <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted flex items-center justify-center border border-border">
-        <Image src="/logoVLM.png" alt="Assistant" width={18} height={18} className="object-contain" />
+        <Image src="/logoVLM.png" alt="Assistant" width={18} height={18} className="object-contain" unoptimized />
       </div>
       <div className="flex items-center gap-1.5 mt-2">
         <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.3s]" />

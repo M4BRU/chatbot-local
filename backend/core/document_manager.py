@@ -326,6 +326,23 @@ def _enrichir_chunk_contexte(chunk: str, document_complet: str) -> str:
         logger.warning(f"Contextual retrieval chunk échoué : {e}")
     return chunk
 
+def _detecter_content_type(texte_raw: str) -> str:
+    """
+    Détecte le type de contenu d'un chunk depuis le texte RAW (labels Docling présents).
+    Appelé AVANT le nettoyage des labels — ceux-ci sont supprimés ensuite du texte embedé.
+
+    Retourne : "table" | "list" | "step" | "text"
+    """
+    if re.search(r'\[TABLE', texte_raw, re.IGNORECASE):
+        return "table"
+    if re.search(r'\[LIST_ITEM', texte_raw, re.IGNORECASE):
+        return "list"
+    # Lignes numérotées en début de ligne (étapes de procédure : "1.", "2)", etc.)
+    if re.search(r'^\s*\d+[\.\)]\s+\S', texte_raw, re.MULTILINE):
+        return "step"
+    return "text"
+
+
 def detect_hierarchy_patterns(text: str) -> list[dict]:
     """
     Détecte les patterns hiérarchiques dans le texte avec validation IA flexible.
@@ -697,6 +714,10 @@ class DocumentManager:
         tous_raw_hierarchie = [(page, m) for page, morceaux in morceaux_par_page for m in morceaux]
         hierarchies = _construire_hierarchie_parents(tous_raw_hierarchie)
 
+        # ── Content types sur morceaux RAW (labels encore présents) ───────────
+        # Doit tourner AVANT le nettoyage des labels ci-dessous.
+        content_types = [_detecter_content_type(m) for _, m in tous_raw_hierarchie]
+
         # ── Nettoyage labels avant enrichissement contextuel ──────────────────
         # Les labels sont supprimés ici pour que le LLM contextuel reçoive du
         # texte propre → résumé contextuel sans [SECTION-L1] ni [TEXT-L1].
@@ -734,6 +755,8 @@ class DocumentManager:
             logger.info(f"Contextual retrieval terminé : {nb_total} chunks enrichis")
 
         fingerprint = build_pipeline_fingerprint()
+        # total_chunks_in_doc connu ici (ajouter_document traite un seul fichier à la fois)
+        total_chunks_in_doc = len(tous_raw)
         chunk_global_idx = 0
         for page, morceaux in morceaux_par_page:
             for morceau in morceaux:
@@ -749,6 +772,13 @@ class DocumentManager:
                     "source": page.source,
                     "page":   page.page,
                     "chunk_idx": chunk_global_idx,
+                    # ── Position dans ce document (reset à 0 par fichier) ──────
+                    "chunk_idx_in_doc": chunk_global_idx,
+                    "total_chunks_in_doc": total_chunks_in_doc,
+                    "is_first_chunk": chunk_global_idx == 0,
+                    "is_last_chunk": chunk_global_idx == total_chunks_in_doc - 1,
+                    # ── Type de contenu (détecté sur texte raw avant nettoyage) ─
+                    "content_type": content_types[chunk_global_idx],
                     "has_continuation": continuation_flags[chunk_global_idx],
                     "pipeline_hash": fingerprint["hash"],
                     **meta_fichier,

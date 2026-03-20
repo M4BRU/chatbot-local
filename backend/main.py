@@ -7,14 +7,33 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from backend.api.dependencies import get_settings
-from backend.api.routes import agent_router, chat_router, collections_router, conversations_router, devis_router, documents_router, excel_documents_router, eval_router, health_router
+from backend.api.routes import (
+    agent_router,
+    chat_router,
+    collections_router,
+    conversations_router,
+    devis_router,
+    documents_router,
+    excel_documents_router,
+    eval_router,
+    health_router,
+)
+from backend.api.routes.auth import router as auth_router
+from backend.api.routes.totp import router as totp_router
 
 logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
+# ── Rate limiter (slowapi) ────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
 
 
 def _warmup_ollama() -> None:
@@ -26,9 +45,6 @@ def _warmup_ollama() -> None:
 
     # 1. Warm-up embed
     if USE_HF_EMBEDDINGS:
-        # HF embeddings : charger le modèle sentence-transformers directement.
-        # Ne PAS appeler l'endpoint Ollama embed — ça chargerait mxbai inutilement
-        # dans Ollama (96 Mo VRAM + 601 Mo RAM) alors qu'on ne l'utilise plus depuis Ollama.
         try:
             from core.embeddings import get_embeddings
             get_embeddings().embed_query("warmup")
@@ -46,11 +62,6 @@ def _warmup_ollama() -> None:
         except Exception as e:
             logger.warning(f"Warmup embed échoué : {e}")
 
-    # 2. Warm-up LLM : charge le modèle en mémoire sans générer.
-    # timeout=600 : 10 min max. Évite un thread zombie si Ollama crash définitivement.
-    # Le chargement de llama3.1:8b peut dépasser 5 min sur certaines machines,
-    # un timeout court ferme la connexion et fait abandonner le chargement à Ollama
-    # ("client connection closed before server finished loading").
     try:
         requests.post(
             OLLAMA_API_GENERATE,
@@ -79,17 +90,42 @@ def _warmup_all() -> None:
     _warmup_reranker()
 
 
+async def _run_migrations() -> None:
+    """Lance les migrations Alembic de façon synchrone bloquante (avant yield)."""
+    from alembic import command as alembic_command
+    from alembic.config import Config
+
+    alembic_cfg = Config("alembic.ini")
+    await asyncio.to_thread(alembic_command.upgrade, alembic_cfg, "head")
+    logger.info("Migrations Alembic appliquées")
+
+
+def _check_rbac_config() -> None:
+    """Vérifie que le fichier rbac.yaml est présent et valide au démarrage."""
+    from backend.domain.services.authorization_service import AuthorizationService
+    AuthorizationService(settings.rbac_config_path)  # lève RuntimeError si invalide
+    logger.info("RBAC config OK")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lance le pre-warm Ollama + reranker en arrière-plan au démarrage."""
-    # Init SQLite DBs
-    from backend.api.dependencies import get_conversation_manager, get_catalog_adapter, get_excel_collection_adapter
-    get_conversation_manager().init_db()
-    get_catalog_adapter().init_db()  # creates devis_paniers table
-    get_excel_collection_adapter().init_db()  # creates excel_collections table
-    from backend.core.eval_store import init_eval_db
-    init_eval_db()  # creates eval_log table
+    """Initialise la DB (Alembic), vérifie le RBAC, puis lance les warmups."""
+    # 1. Migrations PostgreSQL (bloquant — le schéma doit exister avant de servir)
+    await _run_migrations()
 
+    # 2. Validation RBAC (fail-fast si config absente ou malformée)
+    await asyncio.to_thread(_check_rbac_config)
+
+    # 3. SQLite DBs existantes (catalog, excel, eval) — inchangées
+    from backend.api.dependencies import get_catalog_adapter, get_excel_collection_adapter
+    get_catalog_adapter().init_db()
+    get_excel_collection_adapter().init_db()
+    from backend.core.eval_store import init_eval_db
+    init_eval_db()
+
+    # DEPRECATED: get_conversation_manager().init_db() — replaced by SQLAlchemy/Alembic
+
+    # 4. Warmup modèles (arrière-plan)
     loop = asyncio.get_event_loop()
     logger.info("Démarrage pre-warm modèles (arrière-plan)…")
     loop.run_in_executor(None, _warmup_all)
@@ -103,7 +139,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# ── Middlewares ───────────────────────────────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -112,7 +152,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers
+# ── Routers ───────────────────────────────────────────────────────────────────
+app.include_router(auth_router)
+app.include_router(totp_router)
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(collections_router)

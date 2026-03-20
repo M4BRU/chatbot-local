@@ -64,6 +64,14 @@ export interface SSEEvent {
   metrics?: RagMetrics;
   done?: boolean;
   error?: string;
+  reasoning_step?: {
+    step: "exploring" | "reflecting" | "deepening" | "generating";
+    query?: string;
+    index?: number;
+    total?: number;
+    found?: string;
+    gaps_count?: number;
+  };
 }
 
 export interface PanierItem {
@@ -84,6 +92,19 @@ export interface PanierItem {
   created_at: string;
 }
 
+export interface RfqCandidate {
+  nom_poste: string;
+  nom_affaire?: string;
+  num_poste?: string;
+  ensemble?: string;
+  fournisseur?: string;
+  prix_unitaire?: number | null;
+  _score: number;
+  _confidence: "high" | "medium" | "low" | "fts_only";
+  dimension: string;
+  composant_source: string;
+}
+
 export interface DevisSSEEvent {
   token?: string;
   tool_call?: { name: string; status: "running" | "done" };
@@ -94,6 +115,7 @@ export interface DevisSSEEvent {
   error?: string;
   settings?: { coefficient: number; coef_final: number };
   rfq_planning?: { status: "analyzing" | "searching" | "gap_check" | "synthesizing" | "done"; step: string; dimensions_found?: number };
+  rfq_candidates?: RfqCandidate[];
   choices?: {
     type?: "poste" | "poste_affaire" | "affaire" | "element" | "relevance" | "search_scope" | "search_column" | "findings_confirmation";
     question: string;
@@ -114,6 +136,7 @@ export interface DevisSSEEvent {
   highlight?: string;
   catalog_preview?: {
     query: string;
+    total?: number;
     postes: { nom_poste: string; ensemble?: string; nom_affaire?: string }[];
   };
 }

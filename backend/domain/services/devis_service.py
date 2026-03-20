@@ -83,6 +83,68 @@ _COMPRESS_CHARS_THRESHOLD = 7000
 _CATALOG_PATH = Path("/app/documents/catalogue.xlsx")
 _CATALOG_CHALLENGE_COLLECTION = "_catalog_challenge"
 
+# ── ANCIEN SYSTEM PROMPT (conservé pour référence, à supprimer plus tard) ──────
+# """Tu es un assistant de devis pour VLM Robotics. Ton seul travail : trouver des postes
+# dans le catalogue et les ajouter au panier.
+#
+# CATALOGUE : historique de projets réels. Chaque poste (nom_poste) a un num_poste
+# et appartient à une nom_affaire.
+# Les "elements" (col H) sont des sous-composants internes — PAS des postes à ajouter.
+#
+# PANIER ACTUEL :
+# {panier_section}
+#
+# {task_section}
+# {rfq_section}
+# COEFFICIENTS : fournitures={current_coefficient}% · final={current_coef_final}%
+# → set_devis_settings si l'utilisateur demande à les changer.
+#
+# ━━━ COMPORTEMENT ━━━
+#
+# 1. TOUTE DEMANDE MULTI-ACTIONS → appelle plan_tasks([...]) EN PREMIER avec la liste
+#    complète des actions.
+#    • "ajoute X et Y" → plan_tasks(["search X", "search Y"])
+#    • "update X et Y" → plan_tasks(["update X champ=val", "update Y champ=val"])
+#    • "ajoute X et update Y" → plan_tasks(["search X", "update Y champ=val"])
+#    ✗ EXCEPTION : message "[SYSTÈME]" ou "Cherche" → NE PAS appeler plan_tasks.
+#
+# 2. EXÉCUTER LES TÂCHES dans l'ordre de la LISTE DE TÂCHES. Après chaque tool call
+#    réussi, passer au [ ] suivant.
+#    • task "search …" → search_catalog(column="nom_poste", query=…)
+#    • task "update …" → update_panier_item directement (pas search_catalog)
+#    • Poste absent du panier → search_catalog d'abord
+#    • Message "Sélectionné :" → add_to_panier directement
+#    • Message "[SYSTÈME]" ou "Cherche X" → search_catalog pour le [ ] suivant
+#
+# 3. RIEN TROUVÉ dans le catalogue → search_docs pour identifier des composants dans les PDFs.
+#    search_docs retourne directement {"components": [...], "sources": [...]}.
+#    Appelle IMMÉDIATEMENT report_findings(components=[...]) avec les noms du résultat.
+#    JAMAIS de texte entre search_docs et report_findings.
+# 3b. DONNÉES TABULAIRES → search_collection_excel.
+# 3c. APRÈS search_catalog avec plusieurs postes (champ _next_action présent) :
+#    → Tu DOIS appeler un tool ensuite, jamais de texte seul.
+#    → Analyse si la demande contient des contraintes.
+#    → OUI : search_docs puis report_findings.
+#    → NON : ask_user_choice avec les postes trouvés.
+#
+# 4. AJOUTER → add_to_panier avec nom_poste, nom_affaire, num_poste EXACTS.
+#    • Si search_catalog retourne 1 seul poste (_hint présent) → add_to_panier IMMÉDIATEMENT.
+#    • Jours dans le message → nbre_jours_etude/atelier/client.
+#    • "en option" → is_option=true.
+#
+# 5. MODIFIER → update_panier_item pour jours/option d'un poste déjà dans le panier.
+#
+# 6. RÉPONSE TEXTE → 1 ligne max. Jamais de code, jamais de plan écrit.
+#    ✗ INTERDIT : blocs ```, code inline, listes inventées, questions pro-actives.
+#
+# ━━━ RÈGLES ABSOLUES ━━━
+# • num_poste vient UNIQUEMENT des résultats de search_catalog.
+# • Ne jamais mentionner de num_poste dans le texte.
+# • UNE tâche à la fois.
+# • Si rfq_context mentionne un composant → plan_tasks([...]) puis UNE recherche à la fois."""
+# ── FIN ANCIEN SYSTEM PROMPT ──────────────────────────────────────────────────
+
+
 def _build_system_prompt(
     collection: str,
     current_coefficient: float = 0.0,
@@ -133,10 +195,9 @@ def _build_system_prompt(
         else ""
     )
 
-    return f"""Tu es un assistant de devis pour VLM Robotics. Ton seul travail : trouver des postes dans le catalogue et les ajouter au panier.
+    return f"""Tu es un assistant de devis pour VLM Robotics.
 
 CATALOGUE : historique de projets réels. Chaque poste (nom_poste) a un num_poste et appartient à une nom_affaire.
-Les "elements" (col H) sont des sous-composants internes — PAS des postes à ajouter.
 
 PANIER ACTUEL :
 {panier_section}
@@ -144,72 +205,54 @@ PANIER ACTUEL :
 {task_section}
 {rfq_section}
 COEFFICIENTS : fournitures={current_coefficient}% · final={current_coef_final}%
-→ set_devis_settings si l'utilisateur demande à les changer.
 
-━━━ COMPORTEMENT ━━━
+━━━ QUE FAIRE ━━━
 
-1. TOUTE DEMANDE MULTI-ACTIONS → appelle plan_tasks([...]) EN PREMIER avec la liste complète des actions.
-   • "ajoute X et Y" → plan_tasks(["search X", "search Y"])
-   • "update X et Y" → plan_tasks(["update X champ=val", "update Y champ=val"])
-   • "ajoute X et update Y" → plan_tasks(["search X", "update Y champ=val"])
-   ✗ EXCEPTION : message "[SYSTÈME]" ou "Cherche" → NE PAS appeler plan_tasks (liste déjà enregistrée).
+ÉTAPE 1 — Toujours commencer par un tool call, jamais du texte.
+• Demande contient "Sélectionné :" → add_to_panier directement.
+• Tâche [ ] en attente → search_catalog ou update_panier_item selon la tâche.
+• Message "[SYSTÈME]" ou "Cherche X" → search_catalog(query=X).
+• Sinon → search_catalog pour ce que l'utilisateur demande.
 
-2. EXÉCUTER LES TÂCHES dans l'ordre de la LISTE DE TÂCHES. Après chaque tool call réussi, passer au [ ] suivant.
-   • task "search …" → search_catalog(column="nom_poste", query=…)
-   • task "update …" → update_panier_item directement (pas search_catalog)
-   • Poste absent du panier → search_catalog d'abord
-   • Message "Sélectionné :" → add_to_panier directement
-   • Message "[SYSTÈME]" ou "Cherche X" → search_catalog(column="nom_poste", query=X) pour le [ ] suivant
+ÉTAPE 2 — Après search_catalog :
+• Champ "_hint" présent → add_to_panier immédiatement.
+• Champ "_next_action" présent → suis l'instruction du champ (tool call obligatoire, pas de texte).
+• Plusieurs postes retournés, pas de _hint → ask_user_choice avec les postes trouvés.
 
-3. RIEN TROUVÉ dans le catalogue → search_docs pour identifier des composants dans les PDFs.
-   search_docs retourne directement {{"components": [{{"nom": "...", "specs": "..."}}], "sources": [...]}}.
-   Appelle IMMÉDIATEMENT report_findings(components=[nom1, nom2, ...]) avec les noms du résultat.
-   JAMAIS de texte entre search_docs et report_findings. L'utilisateur validera avant search_catalog.
-3b. DONNÉES TABULAIRES (tarifs, inventaires, tableaux Excel de la collection) → search_collection_excel.
-3c. APRÈS search_catalog avec plusieurs postes (champ _next_action présent) :
-   → Tu DOIS appeler un tool ensuite, jamais de texte seul.
-   → Analyse si la demande contient des contraintes (capacité, poids, dimension, IP, vitesse…).
-   → OUI : search_docs(query="type + contrainte", catalog_refs=[noms_exacts_postes])
-            puis report_findings(catalog_matches=[{{"nom_poste":..., "spec_status":..., "note":...}}], doc_only_models=[...], suggestion="...").
-   → NON : ask_user_choice avec les postes trouvés.
-   ✗ NE PAS chercher docs avant catalogue. ✗ NE PAS générer de texte si _next_action présent.
+ÉTAPE 3 — Après search_docs :
+• Appelle report_findings avec les noms de composants du résultat. Pas de texte entre les deux.
 
-4. AJOUTER → add_to_panier avec nom_poste, nom_affaire, num_poste EXACTS du catalogue.
-   • Si search_catalog retourne 1 seul poste (champ "_hint" présent) → appelle add_to_panier IMMÉDIATEMENT, sans texte intermédiaire.
-   • Jours dans le message → nbre_jours_etude/atelier/client (sinon 0).
-   • "en option" → is_option=true.
+RÉPONSE TEXTE : 1 phrase max. Jamais de code, jamais de liste inventée.
 
-5. MODIFIER → update_panier_item pour jours/option d'un poste déjà dans le panier.
+━━━ RÈGLES ━━━
+• nom_poste, nom_affaire, num_poste : copier les valeurs EXACTES des résultats search_catalog.
+• "en option" → is_option=true. Jours mentionnés → nbre_jours_etude/atelier/client.
+• Données tabulaires (tarifs, tableaux Excel) → search_collection_excel.
+• set_devis_settings uniquement si l'utilisateur demande à changer les coefficients.
+• UNE tâche à la fois."""
 
-6. RÉPONSE TEXTE → 1 ligne max pour confirmer. Jamais de code, jamais de plan écrit.
-   ✗ INTERDIT : blocs ```, code inline, listes de composants inventés, questions pro-actives.
-
-━━━ RÈGLES ABSOLUES ━━━
-• num_poste vient UNIQUEMENT des résultats de search_catalog. Ne jamais inventer, deviner ou mémoriser un num_poste.
-• Ne jamais mentionner de num_poste dans le texte. Seul search_catalog peut les retourner.
-• UNE tâche à la fois : exécute une action, affiche le résultat, attends avant de continuer.
-• Si rfq_context mentionne un composant → plan_tasks(["search <composant>"]) puis exécuter UNE recherche à la fois."""
+# ── Tool definitions ──────────────────────────────────────────────────────────
+# Descriptions volontairement concises : le LLM n'a pas besoin de savoir QUAND
+# utiliser chaque tool (c'est dans le system prompt + les hints _next_action).
+# Il a besoin de savoir CE QUE fait le tool et quels paramètres passer.
+# Économie estimée : ~400 tokens vs l'ancienne version.
+#
+# NOTE migration 5090 : avec Qwen3.5-35B-A3B (contexte 32K), l'économie de tokens
+# est moins critique. Mais des descriptions courtes = moins de confusion pour le LLM.
 
 _TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "plan_tasks",
-            "description": (
-                "Enregistre la liste ordonnée de TOUTES les actions à effectuer pour répondre à la demande. "
-                "À appeler EN PREMIER dès que la demande comporte plusieurs actions (ajouts ET/OU modifications). "
-                "Chaque item = UNE action atomique courte et lisible. "
-                "CORRECT : [\"search vireur\", \"search orbiteur\", \"update Vireur atelier=5\"]. "
-                "INTERDIT : syntaxe de tool call (search_catalog query=...), appels report_findings ou search_docs dans les items. "
-                "NE PAS appeler si une seule action est demandée."
-            ),
+            "description": "Enregistre la liste des actions à effectuer. Chaque item = label court.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "items": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Labels courts lisibles uniquement. Ex: [\"search vireur\", \"update orbiteur atelier=5\"]. JAMAIS de syntaxe tool call.",
+                        "description": "Ex: [\"search vireur\", \"update orbiteur atelier=5\"]",
                     }
                 },
                 "required": ["items"],
@@ -220,22 +263,18 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "update_panier_item",
-            "description": (
-                "Modifie un poste EXISTANT dans le panier (jours d'étude/atelier/client, option). "
-                "À utiliser quand l'utilisateur veut changer les MdO ou passer un poste en option. "
-                "NE PAS utiliser pour ajouter un nouveau poste au panier."
-            ),
+            "description": "Modifie un poste existant dans le panier (jours ou option).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "nom_poste": {
                         "type": "string",
-                        "description": "Nom EXACT du poste dans le panier (copier depuis la liste 'PANIER ACTUEL')",
+                        "description": "Nom EXACT du poste (copier depuis PANIER ACTUEL)",
                     },
                     "nbre_jours_etude":   {"type": "integer", "description": "Jours d'étude"},
                     "nbre_jours_atelier": {"type": "integer", "description": "Jours d'atelier"},
                     "nbre_jours_client":  {"type": "integer", "description": "Jours client"},
-                    "is_option": {"type": "boolean", "description": "true = passer en option, false = poste principal"},
+                    "is_option": {"type": "boolean", "description": "true = option"},
                 },
                 "required": ["nom_poste"],
             },
@@ -245,30 +284,18 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "search_catalog",
-            "description": (
-                "Recherche dans le catalogue de composants VLM (historique de projets réels). "
-                "Retourne des postes (produits) avec fournisseur et prix. "
-                "Accepte un nom de poste, un type d'ensemble, des specs techniques "
-                "ou le nom d'une affaire passée."
-            ),
+            "description": "Recherche dans le catalogue VLM. Retourne des postes avec prix.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": (
-                            "Terme de recherche : nom de poste, ensemble, "
-                            "type de composant ou nom d'affaire"
-                        ),
+                        "description": "Terme de recherche",
                     },
                     "column": {
                         "type": "string",
                         "enum": ["nom_poste", "elements", "ensemble", "nom_affaire", "fournisseur"],
-                        "description": (
-                            "Colonne dans laquelle chercher (défaut : \"nom_poste\"). "
-                            "Utiliser une valeur autre que \"nom_poste\" UNIQUEMENT après que "
-                            "l'utilisateur ait sélectionné une colonne dans les cartes de choix."
-                        ),
+                        "description": "Colonne cible (défaut: nom_poste)",
                     },
                 },
                 "required": ["query"],
@@ -279,18 +306,13 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "search_collection_excel",
-            "description": (
-                "Recherche dans les fichiers Excel de la collection courante (données structurées/tabulaires). "
-                "À utiliser pour les questions sur des tarifs, inventaires, tableaux ou tout fichier Excel "
-                "présent dans la collection (hors catalogue VLM). "
-                "Ne pas utiliser pour le catalogue VLM — utiliser search_catalog à la place."
-            ),
+            "description": "Recherche dans les Excel de la collection (tarifs, tableaux). Pas le catalogue VLM.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Question ou terme de recherche pour les données tabulaires",
+                        "description": "Question ou terme de recherche",
                     },
                 },
                 "required": ["query"],
@@ -301,29 +323,18 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "report_findings",
-            "description": (
-                "À appeler OBLIGATOIREMENT après search_docs, AVANT tout search_catalog. "
-                "Liste les composants/termes techniques identifiés dans la documentation. "
-                "Déclenche une confirmation utilisateur avant de lancer la recherche catalogue."
-            ),
+            "description": "Liste les composants trouvés dans les docs. Appeler après search_docs.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "components": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Noms SPÉCIFIQUES de modèles, références ou désignations "
-                            "tels qu'ils apparaissent dans les documents "
-                            "(ex: 'KR360', 'N-220 Comau', 'Fanuc R-2000iC'). "
-                            "NE PAS inclure des catégories génériques "
-                            "(ex: 'robot poly articulé', 'moteur', 'capteur') "
-                            "ni reformuler la demande utilisateur."
-                        ),
+                        "description": "Noms spécifiques de modèles/références trouvés (ex: 'KR360', 'Fanuc R-2000iC')",
                     },
                     "context": {
                         "type": "string",
-                        "description": "Résumé en 1-2 phrases de ce qui a été trouvé dans les docs",
+                        "description": "Résumé court de ce qui a été trouvé",
                     },
                     "catalog_matches": {
                         "type": "array",
@@ -334,28 +345,21 @@ _TOOLS = [
                                 "spec_status": {
                                     "type": "string",
                                     "enum": ["match", "partial", "no_match", "unknown"],
-                                    "description": "'match'=satisfait la contrainte, 'partial'=proche, 'no_match'=ne satisfait pas, 'unknown'=aucune info",
                                 },
-                                "note": {"type": "string", "description": "Ex: 'Capacité 4.5T, pas 8T'"},
+                                "note": {"type": "string"},
                             },
                             "required": ["nom_poste", "spec_status"],
                         },
-                        "description": (
-                            "Pour chaque poste catalogue trouvé, indiquer si la contrainte utilisateur "
-                            "est satisfaite selon les docs. Remplir quand search_docs était fait avec catalog_refs."
-                        ),
+                        "description": "Statut specs par poste catalogue (si catalog_refs utilisé)",
                     },
                     "doc_only_models": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Modèles/références mentionnés dans les docs mais ABSENTS du catalogue. "
-                            "Informatif uniquement — ne pas appeler search_catalog pour eux."
-                        ),
+                        "description": "Modèles dans les docs mais absents du catalogue",
                     },
                     "suggestion": {
                         "type": "string",
-                        "description": "Recommandation courte : meilleur match possible, alternatives, ou message si rien trouvé.",
+                        "description": "Recommandation courte",
                     },
                 },
                 "required": ["components"],
@@ -366,26 +370,18 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "search_docs",
-            "description": (
-                "Recherche dans la documentation technique (PDFs) pour identifier "
-                "des composants compatibles avec des spécifications techniques. "
-                "Si des postes catalogue ont déjà été trouvés, passer leurs noms dans "
-                "catalog_refs pour enrichir la recherche et vérifier leurs specs dans les docs."
-            ),
+            "description": "Recherche dans les PDFs techniques. Retourne composants + specs.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Requête sémantique : type de composant + contraintes (ex: 'vireur 8T basculeur')",
+                        "description": "Type de composant + contraintes (ex: 'vireur 8T basculeur')",
                     },
                     "catalog_refs": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Noms EXACTS des postes catalogue déjà trouvés (ex: ['Vireur VLMV3T', 'Vireur ORB100']). "
-                            "Permet de chercher leurs specs précises dans les docs. Optionnel."
-                        ),
+                        "description": "Noms exacts des postes catalogue à vérifier dans les docs",
                     },
                 },
                 "required": ["query"],
@@ -396,12 +392,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "ask_user_choice",
-            "description": (
-                "Présente des choix à l'utilisateur sous forme de cartes cliquables. "
-                "Utiliser obligatoirement quand search_catalog retourne plusieurs postes "
-                "avec le même nom mais des num_poste ou nom_affaire différents. "
-                "Ne jamais appeler add_to_panier avant que l'utilisateur ait sélectionné."
-            ),
+            "description": "Présente des choix cliquables à l'utilisateur.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -412,8 +403,8 @@ _TOOLS = [
                             "type": "object",
                             "properties": {
                                 "id":     {"type": "string"},
-                                "label":  {"type": "string", "description": "Titre court: nom_poste + affaire"},
-                                "detail": {"type": "string", "description": "Fournisseur, prix, num_affaire"},
+                                "label":  {"type": "string"},
+                                "detail": {"type": "string"},
                             },
                             "required": ["id", "label"],
                         },
@@ -427,20 +418,17 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "set_devis_settings",
-            "description": (
-                "Met à jour les coefficients globaux du devis. "
-                "Appeler uniquement si l'utilisateur demande explicitement à modifier un coefficient."
-            ),
+            "description": "Met à jour les coefficients du devis.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "coefficient": {
                         "type": "number",
-                        "description": "Coefficient fournitures en % (ex: 15.0 pour 15%)",
+                        "description": "Coefficient fournitures en %",
                     },
                     "coef_final": {
                         "type": "number",
-                        "description": "Coefficient final en % (ex: 8.0 pour 8%)",
+                        "description": "Coefficient final en %",
                     },
                 },
                 "required": [],
@@ -451,12 +439,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "add_to_panier",
-            "description": (
-                "Ajoute des postes confirmés par l'utilisateur au panier du devis. "
-                "Appeler uniquement après validation explicite. "
-                "IMPORTANT: nom_poste doit être la valeur EXACTE du catalogue (ne pas fusionner avec elements). "
-                "nom_affaire est OBLIGATOIRE. Tous les postes doivent avoir le même nom_affaire."
-            ),
+            "description": "Ajoute des postes au panier. Utiliser les valeurs EXACTES du catalogue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -465,28 +448,18 @@ _TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "nom_poste": {
-                                    "type": "string",
-                                    "description": "Valeur EXACTE du champ nom_poste du catalogue — ne pas fusionner avec elements",
-                                },
-                                "nom_affaire": {
-                                    "type": "string",
-                                    "description": "Valeur EXACTE du champ nom_affaire du catalogue — OBLIGATOIRE",
-                                },
-                                "num_poste": {
-                                    "type": "string",
-                                    "description": "Valeur du champ num_poste si disponible dans les résultats",
-                                },
-                                "ensemble": {"type": "string"},
-                                "quantite": {"type": "integer"},
-                                "nbre_jours_etude":   {"type": "integer", "description": "Nombre de jours d'étude (défaut 0)"},
-                                "nbre_jours_atelier": {"type": "integer", "description": "Nombre de jours d'atelier (défaut 0)"},
-                                "nbre_jours_client":  {"type": "integer", "description": "Nombre de jours client (défaut 0)"},
-                                "is_option":          {"type": "boolean", "description": "true si le poste est optionnel"},
+                                "nom_poste":   {"type": "string", "description": "Valeur EXACTE de nom_poste"},
+                                "nom_affaire": {"type": "string", "description": "Valeur EXACTE de nom_affaire"},
+                                "num_poste":   {"type": "string"},
+                                "ensemble":    {"type": "string"},
+                                "quantite":    {"type": "integer"},
+                                "nbre_jours_etude":   {"type": "integer"},
+                                "nbre_jours_atelier": {"type": "integer"},
+                                "nbre_jours_client":  {"type": "integer"},
+                                "is_option":          {"type": "boolean"},
                             },
                             "required": ["nom_poste", "nom_affaire"],
                         },
-                        "description": "Liste des postes à ajouter au panier",
                     }
                 },
                 "required": ["postes"],
@@ -992,7 +965,7 @@ class DevisService:
             "stream": False,
             "think": False,
             "format": _SCHEMA_COMPONENTS,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": 8192},  # aligné sur tool_loop — évite reload KV cache
         }
 
         try:
@@ -1066,7 +1039,7 @@ class DevisService:
             "stream": False,
             "think": False,
             "format": _SCHEMA_DIMENSIONS,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1238,7 +1211,7 @@ class DevisService:
             "stream": False,
             "think": False,
             "format": _SCHEMA_DIMENSIONS,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
             async with httpx.AsyncClient(timeout=90.0) as client:
@@ -1286,6 +1259,213 @@ class DevisService:
         except Exception as exc:
             logger.warning("[rfq_planner] _detect_rfq_gaps failed: %s", exc, exc_info=True)
             return []
+
+    # ── Auto-plan : server-side multi-action detection ──────────────────────────
+
+    @staticmethod
+    def _detect_multi_action(message: str) -> list[str] | None:
+        """
+        Détecte les demandes multi-actions dans le message utilisateur.
+        Retourne une liste d'items pour plan_tasks, ou None si mono-action.
+
+        Patterns détectés :
+        - "ajoute X et Y" / "cherche X et Y"
+        - "ajoute X, Y et Z"
+        - "X + Y + Z"
+        - "modifie X et Y"
+        - Listes avec ":" suivi de tirets ou numéros
+
+        Ne se déclenche PAS pour :
+        - Messages "[SYSTÈME]" ou "Sélectionné :"
+        - Messages courts (< 10 chars)
+        - Messages qui ne contiennent pas de conjonction/séparateur
+        """
+        msg = message.strip()
+
+        # Skip messages système et sélections utilisateur
+        if msg.startswith("[SYSTÈME]") or msg.startswith("Sélectionné") or msg.startswith("Cherche"):
+            return None
+        if len(msg) < 10:
+            return None
+
+        # ── Pattern 1 : verbe d'action + liste avec "et" / virgules ──────
+        # Exemples :
+        #   "ajoute un vireur et un orbiteur"
+        #   "cherche vireur, orbiteur et armoire"
+        #   "ajoute vireur, orbiteur, armoire électrique"
+        #   "mets 5 jours étude sur le vireur et 3 sur l'orbiteur"
+
+        # Identifier le verbe d'action (optionnel — certains messages n'en ont pas)
+        action_verbs = re.findall(
+            r"^(ajoute|cherche|recherche|trouve|mets|modifie|update|supprime|passe)\b",
+            msg.lower(),
+        )
+        action_prefix = action_verbs[0] if action_verbs else ""
+
+        # Chercher une structure de liste :
+        # "X, Y et Z" ou "X et Y" ou "X, Y, Z"
+        # On split sur " et " et "," en preservant les segments
+        msg_lower = msg.lower()
+
+        # Retirer le verbe d'action du début pour isoler les items
+        work_text = msg_lower
+        if action_prefix:
+            work_text = re.sub(r"^" + re.escape(action_prefix) + r"\s+", "", work_text)
+
+        # Split sur " et " et ","
+        # "un vireur, un orbiteur et une armoire" → ["un vireur", "un orbiteur", "une armoire"]
+        parts = re.split(r"\s+et\s+|,\s*", work_text)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        # Nettoyer les articles et déterminants communs
+        cleaned = []
+        for p in parts:
+            # Retirer articles, pronoms et déterminants de début
+            p = re.sub(r"^(moi|toi|lui|nous|vous|eux|une|un|les|le|la|des|d'|l[''])\s*", "", p).strip()
+            # Deuxième passe : "un vireur" restant après "moi un" → retirer encore
+            p = re.sub(r"^(une|un|les|le|la|des)\s+", "", p).strip()
+            if p and len(p) >= 2:
+                cleaned.append(p)
+
+        if len(cleaned) < 2:
+            return None
+
+        # Construire les items de task list
+        items = []
+        for item_text in cleaned:
+            # Détecter si c'est un update ("5 jours étude sur le vireur")
+            update_match = re.match(
+                r"(\d+)\s*(?:jours?\s+)?(étude|atelier|client)\s+(?:sur\s+(?:le|la|l[''])\s*)?(.+)",
+                item_text,
+            )
+            if update_match:
+                jours, type_j, poste = update_match.groups()
+                field_map = {"étude": "etude", "atelier": "atelier", "client": "client"}
+                field = field_map.get(type_j, type_j)
+                items.append(f"update {poste.strip()} {field}={jours}")
+            elif action_prefix in ("modifie", "update", "mets", "passe"):
+                items.append(f"update {item_text}")
+            else:
+                items.append(f"search {item_text}")
+
+        logger.info(
+            "[auto_plan] message=%r → %d items détectés: %r",
+            msg[:80], len(items), items,
+        )
+        return items if len(items) >= 2 else None
+
+    # ── Server-side guardrails : detect when LLM should have called a tool ─────
+
+    # Sentinel retourné par _detect_expected_tool quand un nudge est nécessaire
+    # mais qu'aucun tool synthétique ne peut être construit.
+    _NEEDS_NUDGE = {"_needs_nudge": True}
+
+    def _detect_expected_tool(
+        self,
+        messages: list[dict],
+        task_list: list[dict] | None,
+        conversation_id: str,
+    ) -> dict | None:
+        """
+        Analyse l'état courant pour déterminer si le LLM aurait dû appeler un tool
+        au lieu de générer du texte.
+
+        Retourne :
+        - Un dict {"name": "...", "arguments": {...}} → tool call synthétique à exécuter
+        - self._NEEDS_NUDGE → le LLM doit réessayer avec un rappel
+        - None → fin normale (pas de tool attendu)
+
+        Cas détectés :
+        1. Tâches [ ] en attente dans la task list → search_catalog pour la prochaine tâche
+        2. Dernier tool result contenait _next_action → le LLM devait appeler un tool
+        3. Dernier tool était search_docs → report_findings attendu
+        """
+        # ── Cas 3 : search_docs sans report_findings ──────────────────────────
+        # Parcourir les messages en ordre inverse pour trouver le dernier couple
+        # (assistant tool_call → tool result). On cherche d'abord le tool result,
+        # puis on remonte pour trouver quel tool l'a produit.
+        last_tool_name = None
+        last_tool_content = None
+        _found_tool_result = False
+        for m in reversed(messages):
+            if not _found_tool_result and m.get("role") == "tool":
+                last_tool_content = m.get("content", "")
+                _found_tool_result = True
+                continue
+            if _found_tool_result and m.get("role") == "assistant" and m.get("tool_calls"):
+                tcs = m["tool_calls"]
+                if tcs:
+                    last_tool_name = tcs[-1].get("function", {}).get("name")
+                break
+
+        # Si le dernier tool call était search_docs et qu'on a un result,
+        # le LLM aurait dû enchaîner avec report_findings
+        if last_tool_name == "search_docs" and last_tool_content:
+            try:
+                parsed = json.loads(last_tool_content)
+                components = parsed.get("components", [])
+                comp_names = [c.get("nom", "?") for c in components if isinstance(c, dict)]
+                if comp_names:
+                    logger.info(
+                        "[guardrail] search_docs sans report_findings → injection synthétique (%d composants)",
+                        len(comp_names),
+                    )
+                    return {
+                        "name": "report_findings",
+                        "arguments": {"components": comp_names},
+                    }
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # ── Cas 2 : _next_action ignoré ───────────────────────────────────────
+        if last_tool_content:
+            try:
+                parsed = json.loads(last_tool_content)
+                if isinstance(parsed, list) and parsed:
+                    first = parsed[0] if isinstance(parsed[0], dict) else {}
+                    if first.get("_next_action"):
+                        # Le LLM aurait dû appeler ask_user_choice ou search_docs
+                        # On ne peut pas deviner lequel → nudge pour réessayer
+                        logger.info(
+                            "[guardrail] _next_action présent mais LLM a généré du texte → nudge"
+                        )
+                        return self._NEEDS_NUDGE
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # ── Cas 1 : tâches en attente ─────────────────────────────────────────
+        if task_list:
+            pending = [t for t in task_list if not t.get("done")]
+            if pending:
+                next_query = pending[0].get("query", "")
+                # Distinguer search vs update
+                q_lower = next_query.lower().strip()
+                if q_lower.startswith("update "):
+                    # update task → on ne peut pas construire un update_panier_item
+                    # sans connaitre les champs exacts → nudge seulement.
+                    # NOTE migration 5090 : Qwen3.5-35B-A3B (IFBench 91.5) devrait
+                    # réussir le nudge systématiquement. Si ce n'est pas le cas,
+                    # parser "update X champ=val" ici pour injection.
+                    logger.info(
+                        "[guardrail] tâche update en attente %r → nudge (pas d'injection)",
+                        next_query,
+                    )
+                    return self._NEEDS_NUDGE
+                else:
+                    # search task → on peut construire un search_catalog synthétique
+                    # Nettoyer le préfixe "search " s'il existe
+                    search_query = q_lower.removeprefix("search ").strip()
+                    if search_query:
+                        logger.info(
+                            "[guardrail] tâche en attente → search_catalog synthétique query=%r",
+                            search_query,
+                        )
+                        return {
+                            "name": "search_catalog",
+                            "arguments": {"query": search_query, "column": "nom_poste"},
+                        }
+
+        return None  # Rien d'anormal — fin de boucle légitime
 
     # ── Context compression helpers ────────────────────────────────────────────
 
@@ -1440,7 +1620,7 @@ class DevisService:
             ],
             "stream": False,
             "think": False,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
             async with httpx.AsyncClient(timeout=90.0) as client:
@@ -1630,6 +1810,52 @@ class DevisService:
 
         rfq_context = await self._synthesize_rfq_context(message, all_findings)
 
+        # ── Phase SQL : catalogue lookup pour construire rfq_candidates ───────
+        logger.info("[rfq_planner] ── Phase SQL : lookup catalogue par composant")
+        candidates_by_key: dict[str, dict] = {}  # keyed by nom_poste.lower()
+        for finding in all_findings:
+            dim_name = finding.get("dimension", "?")
+            for comp in finding.get("components", []):
+                comp_nom = comp.get("nom", "").strip()
+                if not comp_nom:
+                    continue
+                try:
+                    rows = await asyncio.to_thread(
+                        self.catalog.search_hybrid, comp_nom, 8, "nom_poste"
+                    )
+                    for row in rows:
+                        nom_poste = (row.get("nom_poste") or "").strip()
+                        if not nom_poste:
+                            continue
+                        key = nom_poste.lower()
+                        score = float(row.get("_score", 0.0))
+                        # Keep the occurrence with the best score
+                        if key not in candidates_by_key or score > candidates_by_key[key].get("_score", 0.0):
+                            candidates_by_key[key] = {
+                                "nom_poste":         nom_poste,
+                                "nom_affaire":       row.get("nom_affaire", ""),
+                                "num_poste":         row.get("num_poste", ""),
+                                "ensemble":          row.get("ensemble", ""),
+                                "fournisseur":       row.get("fournisseur", ""),
+                                "prix_unitaire":     row.get("prix_unitaire"),
+                                "_score":            score,
+                                "_confidence":       row.get("_confidence", "fts_only"),
+                                "dimension":         dim_name,
+                                "composant_source":  comp_nom,
+                            }
+                except Exception as exc:
+                    logger.warning(
+                        "[rfq_planner] SQL lookup failed for %r: %s", comp_nom, exc
+                    )
+
+        rfq_candidates = sorted(
+            candidates_by_key.values(), key=lambda r: r.get("_score", 0.0), reverse=True
+        )
+        logger.info("[rfq_planner] rfq_candidates: %d postes uniques", len(rfq_candidates))
+
+        if rfq_candidates:
+            yield {"rfq_candidates": rfq_candidates}
+
         total_comp = sum(len(f.get("components", [])) for f in all_findings)
         logger.info("=" * 60)
         logger.info("[rfq_planner] ══ TERMINÉ ══")
@@ -1737,7 +1963,7 @@ class DevisService:
                 if not nom:
                     continue
                 try:
-                    rows = await asyncio.to_thread(self.catalog.search, nom, 5, "nom_poste")
+                    rows = await asyncio.to_thread(self.catalog.search_hybrid, nom, 8, "nom_poste")
                     for row in rows:
                         sql_postes.append({
                             "composant_nom": nom,
@@ -1746,6 +1972,8 @@ class DevisService:
                             "ensemble": row.get("ensemble", ""),
                             "fournisseur": row.get("fournisseur", ""),
                             "prix_unitaire": row.get("prix_unitaire"),
+                            "_score": row.get("_score", 0.0),
+                            "_confidence": row.get("_confidence", "fts_only"),
                         })
                 except Exception as exc:
                     logger.warning("[rfq_debug] SQL lookup failed for %r: %s", nom, exc)
@@ -1921,13 +2149,9 @@ class DevisService:
                 # Single unambiguous result: tell LLM to add immediately.
                 deduped[0]["_hint"] = "1 résultat → add_to_panier maintenant."
             elif len(deduped) > 1:
-                # Multiple postes: LLM must reason before showing choice cards.
-                # Hint on first row only to minimise token overhead.
-                deduped[0]["_next_action"] = (
-                    "N postes trouvés → MUST call tool: "
-                    "specs détectées? search_docs(catalog_refs=[…])+report_findings. "
-                    "Sinon: ask_user_choice. Pas de texte."
-                )
+                # Multiple postes: demander à l'utilisateur lequel il veut.
+                # Le LLM appelle ask_user_choice. Pas de texte, pas de search_docs.
+                deduped[0]["_next_action"] = "N postes → appelle ask_user_choice maintenant."
 
             return json.dumps(deduped, ensure_ascii=False, default=str)
 
@@ -2160,9 +2384,43 @@ class DevisService:
         rfq_context: str | None = None
         _add_to_panier_succeeded = False
 
+        # ── Auto-plan : détecter les demandes multi-actions côté serveur ────
+        # Évite de dépendre du LLM pour appeler plan_tasks.
+        # Le pattern matching ci-dessous détecte les conjonctions ("et", virgules)
+        # dans les messages qui demandent d'ajouter/chercher/modifier plusieurs postes.
+        # NOTE migration 5090 : Qwen3.5-35B-A3B (BFCL 66.1) appellera probablement
+        # plan_tasks tout seul. Le auto-plan reste un filet — on pourra le désactiver
+        # si le modèle est fiable sur ce point.
+        if not current_tasks:
+            auto_items = self._detect_multi_action(message)
+            if auto_items:
+                logger.info("[auto_plan] détection multi-actions → %r", auto_items)
+                await asyncio.to_thread(
+                    self.catalog.set_task_list, conversation_id, auto_items
+                )
+                current_tasks = await asyncio.to_thread(
+                    self.catalog.get_task_list, conversation_id
+                )
+
+        # Auto-plan depuis findings confirmation : "[SYSTÈME] Composants validés : "X", "Y"..."
+        # Le frontend envoie ce message quand l'utilisateur valide les composants trouvés dans les docs.
+        # _detect_multi_action saute les messages [SYSTÈME] intentionnellement → extraction manuelle ici.
+        if not current_tasks and "[SYSTÈME] Composants validés :" in message:
+            _cv_comps = re.findall(r'"([^"]+)"', message)
+            if len(_cv_comps) >= 2:
+                logger.info("[auto_plan] composants validés → plan auto: %r", _cv_comps)
+                await asyncio.to_thread(
+                    self.catalog.set_task_list, conversation_id, _cv_comps
+                )
+                current_tasks = await asyncio.to_thread(
+                    self.catalog.get_task_list, conversation_id
+                )
+
         try:
             # ── RFQ Planner : analyse documentaire sur le premier message ──────
-            if not history:
+            # Seuil 120 chars : un RFQ est un document structuré, pas une demande courte.
+            # "vireur et orbiteur" (20 chars) ne doit pas déclencher les 4 phases.
+            if not history and len(message) >= 120:
                 logger.info(
                     "[chat_stream] Premier message — lancement RFQPlanner collection=%r",
                     collection,
@@ -2228,17 +2486,125 @@ class DevisService:
                 tool_calls = assistant_msg.get("tool_calls") or []
 
                 if not tool_calls:
-                    # No more tool calls — ready for final generation
-                    break
+                    # ── Guardrail : le LLM aurait-il dû appeler un tool ? ─────
+                    # Calibré pour qwen3.5:4b (BFCL-V4 ~50, IFBench ~75).
+                    # Sur RTX 5090 avec Qwen3.5-35B-A3B (BFCL 66.1, IFBench 91.5),
+                    # ces guardrails se déclencheront rarement mais restent un filet
+                    # de sécurité utile. Voir migration-hp-z2-rtx5090-2026-03-17.md.
+                    _tasks_now_guard = await asyncio.to_thread(
+                        self.catalog.get_task_list, conversation_id
+                    )
+                    expected = self._detect_expected_tool(
+                        messages, _tasks_now_guard, conversation_id
+                    )
 
-                # Append assistant tool-call message
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_msg.get("content", ""),
-                        "tool_calls": tool_calls,
-                    }
-                )
+                    if expected is not None and expected is not self._NEEDS_NUDGE:
+                        # Cas avec tool call synthétique connu → exécuter directement
+                        logger.info(
+                            "[guardrail] injection synthétique : %s(%r)",
+                            expected["name"], expected.get("arguments", {}),
+                        )
+                        # Ajouter le texte du LLM comme message assistant (il a quand même parlé)
+                        llm_text = assistant_msg.get("content", "")
+                        if llm_text:
+                            messages.append({"role": "assistant", "content": llm_text})
+                        # Simuler un tool call dans le flux
+                        tool_calls = [{
+                            "function": {
+                                "name": expected["name"],
+                                "arguments": expected.get("arguments", {}),
+                            }
+                        }]
+                        messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": tool_calls,
+                        })
+                        # Continuer la boucle normale ci-dessous (le for tc in tool_calls)
+                    elif expected is self._NEEDS_NUDGE or (
+                        _tasks_now_guard
+                        and any(not t.get("done") for t in _tasks_now_guard)
+                    ):
+                        # Nudge : le LLM doit réessayer (soit _next_action ignoré,
+                        # soit tâches en attente, soit update task non injectable)
+                        if not getattr(self, "_guardrail_nudged", False):
+                            self._guardrail_nudged = True
+                            # Construire un nudge contextuel
+                            if expected is self._NEEDS_NUDGE:
+                                nudge_text = (
+                                    "[SYSTÈME] Tu devais appeler un tool (ask_user_choice ou search_docs). "
+                                    "Regarde le champ _next_action du dernier résultat et appelle le tool approprié."
+                                )
+                            else:
+                                pending = [t for t in _tasks_now_guard if not t.get("done")]
+                                nudge_text = (
+                                    f'[SYSTÈME] Tâche en attente : "{pending[0]["query"]}". '
+                                    f"Appelle le tool approprié maintenant."
+                                )
+                            logger.info("[guardrail] nudge → %s", nudge_text)
+                            messages.append({"role": "user", "content": nudge_text})
+                            continue  # re-loop pour que le LLM réessaie
+                        else:
+                            # Déjà nudgé une fois — si c'est _NEEDS_NUDGE (pas de tâches),
+                            # on ne peut pas injecter → abandon. Si tâches, tenter injection.
+                            self._guardrail_nudged = False
+                            if (
+                                expected is not self._NEEDS_NUDGE
+                                and _tasks_now_guard
+                            ):
+                                # Dernière chance : injection synthétique forcée
+                                pending = [t for t in _tasks_now_guard if not t.get("done")]
+                                if pending:
+                                    q = pending[0].get("query", "").lower().strip()
+                                    search_q = q.removeprefix("search ").strip()
+                                    if search_q and not q.startswith("update "):
+                                        logger.warning(
+                                            "[guardrail] nudge échoué → injection forcée search_catalog(%r)",
+                                            search_q,
+                                        )
+                                        tool_calls = [{
+                                            "function": {
+                                                "name": "search_catalog",
+                                                "arguments": {"query": search_q, "column": "nom_poste"},
+                                            }
+                                        }]
+                                        llm_text = assistant_msg.get("content", "")
+                                        if llm_text:
+                                            messages.append({"role": "assistant", "content": llm_text})
+                                        messages.append({
+                                            "role": "assistant",
+                                            "content": "",
+                                            "tool_calls": tool_calls,
+                                        })
+                                    else:
+                                        logger.warning("[guardrail] nudge échoué, tâche non injectable → break")
+                                        break
+                                else:
+                                    break
+                            else:
+                                logger.warning(
+                                    "[guardrail] nudge échoué, pas d'injection possible → break"
+                                )
+                                break
+                    else:
+                        # Pas de tâche en attente, pas d'action attendue → fin normale
+                        break
+
+                    # Reset nudge flag quand le LLM coopère (ou après injection)
+                    self._guardrail_nudged = False
+                    _synthetic_injection = True
+                else:
+                    _synthetic_injection = False
+
+                # Append assistant tool-call message (skip si déjà ajouté par le guardrail)
+                if not _synthetic_injection:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": assistant_msg.get("content", ""),
+                            "tool_calls": tool_calls,
+                        }
+                    )
 
                 for tc in tool_calls:
                     fn = tc.get("function", {})
@@ -2254,9 +2620,26 @@ class DevisService:
 
                     # ask_user_choice: emit choice cards and stop immediately
                     if tool_name == "ask_user_choice":
-                        question = tool_args.get("question", "Choisissez une option :")
-                        options  = tool_args.get("options", [])
-                        yield {"choices": {"question": question, "options": options}}
+                        # Utiliser les résultats catalog serveur si disponibles
+                        # pour émettre des choice cards correctement typées (type "poste"/"affaire")
+                        # avec le format JSON {nom_poste, occurrences} attendu par le frontend.
+                        last_results = getattr(self, "_last_deduped_results", None)
+                        choice_from_server = None
+                        if last_results:
+                            try:
+                                _current_aff = await asyncio.to_thread(
+                                    self.catalog.get_current_affaire, conversation_id
+                                )
+                                choice_from_server = _detect_conflict(last_results, _current_aff)
+                            except Exception:
+                                pass
+                        if choice_from_server and choice_from_server.get("type") in ("poste", "affaire"):
+                            yield {"choices": choice_from_server}
+                        else:
+                            # Fallback : options LLM sans type → simple boutons
+                            question = tool_args.get("question", "Choisissez une option :")
+                            options  = tool_args.get("options", [])
+                            yield {"choices": {"question": question, "options": options}}
                         panier = await asyncio.to_thread(self.catalog.get_panier, conversation_id)
                         yield {"done": True, "panier": panier}
                         return
@@ -2332,6 +2715,8 @@ class DevisService:
                                 self.catalog.get_current_affaire, conversation_id
                             )
                             deduped_results = json.loads(result)
+                            # Stocker pour réutilisation dans ask_user_choice
+                            self._last_deduped_results = deduped_results
 
                             # Determine whether the query targeted postes or elements.
                             # Use catalog's Snowball tokenizer (handles plurals).
@@ -2377,6 +2762,7 @@ class DevisService:
                                         yield {
                                             "catalog_preview": {
                                                 "query": query_str,
+                                                "total": len(deduped_results),
                                                 "postes": [
                                                     {
                                                         "nom_poste": _s(r.get("nom_poste")),

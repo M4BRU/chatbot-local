@@ -25,7 +25,7 @@ import {
   updateDevisSettings,
   updatePanierItem,
 } from "@/app/lib/api";
-import type { CatalogElement, ChatMessage, PanierItem } from "@/app/lib/types";
+import type { CatalogElement, ChatMessage, PanierItem, RfqCandidate } from "@/app/lib/types";
 import { useConversation } from "@/app/providers";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
@@ -62,6 +62,249 @@ function RfqPlanningBanner({
           )}
         </div>
         <p className="text-xs text-muted-foreground">{planning.step}</p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Search Workspace Modal ────────────────────────────────────────────────────
+type SWPhase = "config" | "searching" | "awaiting_choice" | "done";
+type SWComp = { id: string; name: string; selected: boolean; result: "pending" | "found" | "skipped" };
+type SWChoice = { id: string; label: string; detail?: string };
+type SearchWorkspaceState = {
+  question: string;
+  phase: SWPhase;
+  allComps: SWComp[];
+  queue: string[];       // ids of selected comps, set at launch
+  currentIdx: number;    // index into queue
+  choices: SWChoice[];   // results for current component
+};
+
+function SearchWorkspaceModal({
+  ws,
+  onUpdate,
+  onClose,
+}: {
+  ws: SearchWorkspaceState;
+  onUpdate: (ws: SearchWorkspaceState) => void;
+  onClose: () => void;
+}) {
+  const { phase, allComps, queue, currentIdx, choices } = ws;
+  const currentId = queue[currentIdx];
+  const currentComp = allComps.find(c => c.id === currentId);
+  const canClose = phase === "config" || phase === "done";
+  const foundCount = allComps.filter(c => c.result === "found").length;
+  const skippedCount = allComps.filter(c => c.result === "skipped").length;
+
+  // Mock: simulate search delay → show results
+  useEffect(() => {
+    if (phase !== "searching") return;
+    const t = setTimeout(() => {
+      onUpdate({
+        ...ws,
+        phase: "awaiting_choice",
+        choices: [
+          { id: "m1", label: "VLM-2024-001", detail: "Affaire Paris — 3 occurrences" },
+          { id: "m2", label: "VLM-2023-047", detail: "Affaire Lyon — 1 occurrence" },
+          { id: "m3", label: "VLM-2024-089", detail: "Affaire Bordeaux — 2 occurrences" },
+        ],
+      });
+    }, 1200);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, currentIdx]);
+
+  const advance = (updatedComps: SWComp[]) => {
+    const nextIdx = currentIdx + 1;
+    if (nextIdx >= queue.length) {
+      onUpdate({ ...ws, allComps: updatedComps, phase: "done", choices: [] });
+    } else {
+      onUpdate({ ...ws, allComps: updatedComps, phase: "searching", currentIdx: nextIdx, choices: [] });
+    }
+  };
+
+  const handlePickChoice = (choice: SWChoice) => {
+    void choice;
+    const updated = allComps.map(c => c.id === currentId ? { ...c, result: "found" as const } : c);
+    advance(updated);
+  };
+
+  const handleSkip = () => {
+    const updated = allComps.map(c => c.id === currentId ? { ...c, result: "skipped" as const } : c);
+    advance(updated);
+  };
+
+  const handleLaunch = () => {
+    const selectedIds = allComps.filter(c => c.selected).map(c => c.id);
+    if (selectedIds.length === 0) return;
+    onUpdate({ ...ws, queue: selectedIds, currentIdx: 0, phase: "searching", choices: [] });
+  };
+
+  const resultIcon = (comp: SWComp) => {
+    if (comp.result === "found") return <span className="text-green-500 text-xs leading-none">✓</span>;
+    if (comp.result === "skipped") return <span className="text-muted-foreground text-xs leading-none">—</span>;
+    if (comp.id === currentId && (phase === "searching" || phase === "awaiting_choice")) {
+      return (
+        <svg className="animate-spin h-3 w-3 text-primary shrink-0" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+        </svg>
+      );
+    }
+    return <span className="w-3 h-3 rounded-full border border-border/60 inline-block shrink-0" />;
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={canClose ? onClose : undefined}
+    >
+      <div
+        className="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden flex flex-col max-h-[85vh]"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-border flex-shrink-0">
+          <div className="flex items-center gap-2">
+            {(phase === "searching" || phase === "awaiting_choice") && (
+              <svg className="animate-spin h-3.5 w-3.5 text-primary shrink-0" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+              </svg>
+            )}
+            <h3 className="font-medium text-sm">
+              {phase === "config" && "Composants identifiés"}
+              {(phase === "searching" || phase === "awaiting_choice") && `Composant ${currentIdx + 1} / ${queue.length}`}
+              {phase === "done" && "Recherche terminée"}
+            </h3>
+          </div>
+          {canClose && (
+            <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
+              <X size={15} />
+            </button>
+          )}
+        </div>
+
+        {/* Question context */}
+        <div className="px-5 py-2.5 border-b border-border/50 bg-muted/20 flex-shrink-0">
+          <p className="text-xs text-muted-foreground italic line-clamp-2">{ws.question}</p>
+        </div>
+
+        {/* Component list */}
+        <div className="flex-1 overflow-y-auto min-h-0">
+          {phase === "config" ? (
+            <div className="p-3 space-y-0.5">
+              {allComps.map(comp => (
+                <div key={comp.id} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-muted/50 transition-colors group">
+                  <input
+                    type="checkbox"
+                    checked={comp.selected}
+                    onChange={() => onUpdate({
+                      ...ws,
+                      allComps: allComps.map(c => c.id === comp.id ? { ...c, selected: !c.selected } : c),
+                    })}
+                    className="h-4 w-4 rounded accent-primary cursor-pointer"
+                  />
+                  <span className={cn("flex-1 text-sm", !comp.selected && "text-muted-foreground line-through")}>
+                    {comp.name}
+                  </span>
+                  <button
+                    onClick={() => onUpdate({ ...ws, allComps: allComps.filter(c => c.id !== comp.id) })}
+                    className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-all"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              ))}
+              {allComps.length === 0 && (
+                <p className="text-xs text-muted-foreground text-center py-4">Aucun composant</p>
+              )}
+            </div>
+          ) : (
+            <div className="p-3 space-y-0.5">
+              {allComps.filter(c => queue.includes(c.id)).map(comp => (
+                <div
+                  key={comp.id}
+                  className={cn(
+                    "flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors",
+                    comp.id === currentId && phase !== "done"
+                      ? "bg-primary/5 border border-primary/20 font-medium text-foreground"
+                      : comp.result !== "pending"
+                      ? "text-muted-foreground"
+                      : "text-muted-foreground/50"
+                  )}
+                >
+                  <span className="flex items-center justify-center w-4 shrink-0">{resultIcon(comp)}</span>
+                  <span className="flex-1 truncate">{comp.name}</span>
+                  {comp.result === "found" && <span className="text-xs text-green-600 dark:text-green-400 shrink-0">Ajouté</span>}
+                  {comp.result === "skipped" && <span className="text-xs text-muted-foreground shrink-0">Passé</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Results zone — awaiting_choice */}
+        {phase === "awaiting_choice" && choices.length > 0 && (
+          <div className="border-t border-border flex-shrink-0">
+            <p className="text-xs font-medium text-muted-foreground px-4 pt-3 pb-2">
+              Résultats pour <span className="text-foreground">&ldquo;{currentComp?.name}&rdquo;</span>
+            </p>
+            <div className="px-3 pb-3 space-y-1.5 max-h-48 overflow-y-auto">
+              {choices.map(c => (
+                <button
+                  key={c.id}
+                  onClick={() => handlePickChoice(c)}
+                  className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border border-border hover:border-primary/40 hover:bg-primary/5 transition-all text-left group"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-foreground">{c.label}</p>
+                    {c.detail && <p className="text-xs text-muted-foreground">{c.detail}</p>}
+                  </div>
+                  <ChevronRight size={14} className="text-muted-foreground group-hover:text-primary transition-colors shrink-0" />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="px-4 pb-4 pt-2.5 border-t border-border flex-shrink-0">
+          {phase === "config" && (
+            <button
+              onClick={handleLaunch}
+              disabled={allComps.filter(c => c.selected).length === 0}
+              className="w-full bg-primary text-primary-foreground rounded-lg py-2 text-sm font-medium disabled:opacity-50 hover:bg-primary/90 transition-colors"
+            >
+              Lancer la recherche ({allComps.filter(c => c.selected).length} composant{allComps.filter(c => c.selected).length > 1 ? "s" : ""})
+            </button>
+          )}
+          {phase === "searching" && (
+            <p className="text-xs text-muted-foreground text-center py-1">Recherche en cours…</p>
+          )}
+          {phase === "awaiting_choice" && (
+            <button
+              onClick={handleSkip}
+              className="w-full border border-border rounded-lg py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            >
+              Passer ce composant
+            </button>
+          )}
+          {phase === "done" && (
+            <div className="flex items-center gap-3">
+              <p className="flex-1 text-xs text-muted-foreground">
+                <span className="text-green-600 dark:text-green-400 font-medium">{foundCount} trouvé{foundCount > 1 ? "s" : ""}</span>
+                {skippedCount > 0 && <span> · {skippedCount} passé{skippedCount > 1 ? "s" : ""}</span>}
+              </p>
+              <button
+                onClick={onClose}
+                className="bg-primary text-primary-foreground rounded-lg px-4 py-2 text-sm font-medium hover:bg-primary/90 transition-colors"
+              >
+                Fermer
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -906,6 +1149,140 @@ const SUGGESTIONS = [
   },
 ];
 
+// ─── Confidence badge ──────────────────────────────────────────────────────────
+const CONFIDENCE_STYLES: Record<string, string> = {
+  high:     "bg-green-500/15 border-green-500/30 text-green-700 dark:text-green-400",
+  medium:   "bg-yellow-500/15 border-yellow-500/30 text-yellow-700 dark:text-yellow-400",
+  low:      "bg-orange-500/15 border-orange-500/30 text-orange-700 dark:text-orange-400",
+  fts_only: "bg-muted border-border text-muted-foreground",
+};
+const CONFIDENCE_LABELS: Record<string, string> = {
+  high: "Fort", medium: "Moyen", low: "Faible", fts_only: "FTS",
+};
+
+// ─── Candidates Panel ──────────────────────────────────────────────────────────
+function CandidatesPanel({
+  candidates,
+  selectedKeys,
+  onToggle,
+  onSelectHighMedium,
+  onStart,
+  onClose,
+}: {
+  candidates: RfqCandidate[];
+  selectedKeys: Set<string>;
+  onToggle: (key: string) => void;
+  onSelectHighMedium: () => void;
+  onStart: () => void;
+  onClose: () => void;
+}) {
+  // Group by dimension
+  const byDimension = new Map<string, RfqCandidate[]>();
+  for (const c of candidates) {
+    const dim = c.dimension || "Général";
+    if (!byDimension.has(dim)) byDimension.set(dim, []);
+    byDimension.get(dim)!.push(c);
+  }
+  const maxScore = Math.max(...candidates.map(c => c._score), 1);
+
+  return (
+    <div className="border-t border-border bg-card">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Postes candidats</span>
+          <span className="text-xs text-muted-foreground bg-muted rounded-full px-2 py-0.5">
+            {candidates.length} postes · {selectedKeys.size} sélectionnés
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onSelectHighMedium}
+            className="text-xs text-muted-foreground hover:text-foreground border border-border rounded-full px-2.5 py-1 transition-colors"
+          >
+            Sélectionner Fort+Moyen
+          </button>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+            <X size={16} />
+          </button>
+        </div>
+      </div>
+
+      {/* Candidates list */}
+      <div className="max-h-64 overflow-y-auto divide-y divide-border/40">
+        {Array.from(byDimension.entries()).map(([dim, items]) => (
+          <div key={dim}>
+            <div className="px-4 py-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground bg-muted/40 uppercase">
+              {dim}
+            </div>
+            {items.map((c) => {
+              const key = c.nom_poste.toLowerCase();
+              const checked = selectedKeys.has(key);
+              const scorePct = Math.round((c._score / maxScore) * 100);
+              return (
+                <label
+                  key={key}
+                  className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => onToggle(key)}
+                    className="w-3.5 h-3.5 accent-foreground shrink-0"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium truncate">{c.nom_poste}</span>
+                      <span className={`shrink-0 text-[10px] rounded-full px-1.5 py-0.5 border ${CONFIDENCE_STYLES[c._confidence] ?? CONFIDENCE_STYLES.fts_only}`}>
+                        {CONFIDENCE_LABELS[c._confidence] ?? c._confidence}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      {/* Score bar */}
+                      <div className="w-16 h-1 bg-muted rounded-full overflow-hidden shrink-0">
+                        <div
+                          className="h-full bg-foreground/40 rounded-full"
+                          style={{ width: `${scorePct}%` }}
+                        />
+                      </div>
+                      {c.nom_affaire && (
+                        <span className="text-[11px] text-muted-foreground truncate">{c.nom_affaire}</span>
+                      )}
+                    </div>
+                  </div>
+                  {c.prix_unitaire != null && (
+                    <span className="text-[11px] text-muted-foreground shrink-0">{c.prix_unitaire}€</span>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      {/* Footer */}
+      <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-muted/20">
+        <span className="text-xs text-muted-foreground">
+          {selectedKeys.size === 0 ? "Aucun poste sélectionné" : `${selectedKeys.size} poste(s) à ajouter`}
+        </span>
+        <button
+          onClick={onStart}
+          disabled={selectedKeys.size === 0}
+          className={cn(
+            "flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xs font-medium transition-all",
+            selectedKeys.size > 0
+              ? "bg-foreground text-background hover:opacity-80"
+              : "bg-muted text-muted-foreground cursor-not-allowed"
+          )}
+        >
+          <Send size={12} />
+          Démarrer le devis →
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main page ─────────────────────────────────────────────────────────────────
 export default function DevisPage() {
   const { currentConversationId, createConversation, refreshConversations, mode } = useConversation();
@@ -927,6 +1304,11 @@ export default function DevisPage() {
   // RFQ planning progress state
   const [rfqPlanning, setRfqPlanning] = useState<{ status: string; step: string; dimensions_found?: number } | null>(null);
 
+  // RFQ candidates panel
+  const [rfqCandidates, setRfqCandidates] = useState<RfqCandidate[]>([]);
+  const [selectedCandidateKeys, setSelectedCandidateKeys] = useState<Set<string>>(new Set());
+  const [showCandidatesPanel, setShowCandidatesPanel] = useState(false);
+
   // Tool calls for the current streaming turn
   const [activeToolCalls, setActiveToolCalls] = useState<ToolCallState[]>([]);
   // Map of assistantMessageId → tool calls that belong to it
@@ -935,7 +1317,9 @@ export default function DevisPage() {
   const [postes, setPostes] = useState<PanierItem[]>([]);
   const [devisSettings, setDevisSettings] = useState({ coefficient: 0, coef_final: 0 });
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [searchWS, setSearchWS] = useState<SearchWorkspaceState | null>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const settingsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const activeConvIdRef = useRef<string | null>(null);
@@ -1120,6 +1504,7 @@ export default function DevisPage() {
       setInput("");
       setError(null);
       setRfqPlanning(null);
+      setShowCandidatesPanel(false);
 
       const userMsg: ChatMessage = {
         id: Math.random().toString(36).slice(2),
@@ -1168,17 +1553,32 @@ export default function DevisPage() {
             }
           }
 
+          // RFQ candidates panel
+          if (event.rfq_candidates && event.rfq_candidates.length > 0) {
+            setRfqCandidates(event.rfq_candidates);
+            // Pre-select high + medium confidence
+            const preSelected = new Set(
+              event.rfq_candidates
+                .filter(c => c._confidence === "high" || c._confidence === "medium")
+                .map(c => c.nom_poste.toLowerCase())
+            );
+            setSelectedCandidateKeys(preSelected);
+            setShowCandidatesPanel(true);
+          }
+
           // Catalog preview — show found postes while LLM reasons on specs
           if (event.catalog_preview) {
-            const { query, postes } = event.catalog_preview;
+            const { query, postes, total } = event.catalog_preview;
+            const count = total ?? postes.length;
             const posteList = postes.map((p) => p.nom_poste).join(", ");
+            const suffix = count > postes.length ? ` (+${count - postes.length} autres)` : "";
             const previewId = Math.random().toString(36).slice(2);
             setMessages((prev) => [
               ...prev,
               {
                 id: previewId,
                 role: "assistant" as const,
-                content: `🗂️ Catalogue — **${postes.length} poste(s)** trouvé(s) pour « ${query} » : ${posteList}`,
+                content: `🗂️ Catalogue — **${count} poste(s)** trouvé(s) pour « ${query} » : ${posteList}${suffix}`,
                 isStreaming: false,
               },
             ]);
@@ -1306,6 +1706,7 @@ export default function DevisPage() {
         }
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [input, isLoading, llmReady, messages, collection, catalogMethod, mode, createConversation, refreshConversations, scrollToBottom]
   );
 
@@ -1320,7 +1721,6 @@ export default function DevisPage() {
       const choiceMsg = messages.find((m) => m.id === messageId);
       const choiceType = choiceMsg?.choices?.type;
       const nomPoste = choiceMsg?.choices?.nom_poste;
-      const fromSilent = choiceMsg?.fromSilent ?? false;
       const convId = activeConvIdRef.current;
 
       if (choiceType === "element") {
@@ -1510,8 +1910,10 @@ export default function DevisPage() {
                 const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
                 setMessages((prev) => [...prev, confirmMsg]);
                 await addMessage(convId, "assistant", confirmMsg.content);
-                // Explicit next-search: backend already knows the remaining tasks
-                if (!fromSilent && result.remaining_tasks.length > 0) {
+                // Explicit next-search: backend already knows the remaining tasks.
+                // fromSilent n'est pas vérifié : le chaining doit fonctionner même
+                // quand les choice cards viennent d'un message silencieux (auto-chain).
+                if (result.remaining_tasks.length > 0) {
                   const next = result.remaining_tasks[0].query;
                   handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
                 }
@@ -1566,7 +1968,7 @@ export default function DevisPage() {
             const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
             setMessages((prev) => [...prev, confirmMsg]);
             await addMessage(convId, "assistant", confirmMsg.content);
-            if (!fromSilent && result.remaining_tasks.length > 0) {
+            if (result.remaining_tasks.length > 0) {
               const next = result.remaining_tasks[0].query;
               handleSend(`Cherche "${next}". Lance search_catalog(query="${next}", column="nom_poste").`, { silent: true });
             }
@@ -1731,6 +2133,36 @@ export default function DevisPage() {
     setPostes([]);
   }, []);
 
+  const handleCandidateToggle = useCallback((key: string) => {
+    setSelectedCandidateKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const handleSelectHighMedium = useCallback(() => {
+    setSelectedCandidateKeys(
+      new Set(
+        rfqCandidates
+          .filter(c => c._confidence === "high" || c._confidence === "medium")
+          .map(c => c.nom_poste.toLowerCase())
+      )
+    );
+  }, [rfqCandidates]);
+
+  const handleCandidatesStart = useCallback(() => {
+    const selected = rfqCandidates.filter(c => selectedCandidateKeys.has(c.nom_poste.toLowerCase()));
+    if (selected.length === 0) return;
+    const lines = selected.map(
+      c => `• ${c.nom_poste}${c.nom_affaire ? ` (${c.nom_affaire}` : ""}${c.num_poste ? `, num_poste=${c.num_poste}` : ""}${c.nom_affaire ? ")" : ""}`
+    );
+    const msg = `[SYSTÈME] Ajoute ces postes au devis :\n${lines.join("\n")}`;
+    setShowCandidatesPanel(false);
+    handleSend(msg);
+  }, [rfqCandidates, selectedCandidateKeys, handleSend]);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -1812,6 +2244,26 @@ export default function DevisPage() {
         <header className="flex items-center gap-3 h-14 px-4 border-b border-border flex-shrink-0">
           <SidebarTrigger className="text-muted-foreground hover:text-foreground" />
           <span className="text-sm font-medium text-muted-foreground">Devis de synthèse</span>
+          {/* TODO: remove — debug trigger */}
+          <button
+            onClick={() => setSearchWS({
+              question: "J'ai identifié les composants suivants dans les documents techniques. Lesquels souhaitez-vous inclure dans le devis ?",
+              phase: "config",
+              allComps: [
+                { id: "c0", name: "Variateur de fréquence 15kW", selected: true, result: "pending" },
+                { id: "c1", name: "Moteur asynchrone 11kW", selected: true, result: "pending" },
+                { id: "c2", name: "Armoire de commande TGBT", selected: true, result: "pending" },
+                { id: "c3", name: "Câble HTA 3x95mm²", selected: false, result: "pending" },
+                { id: "c4", name: "Transformateur 630kVA", selected: true, result: "pending" },
+              ],
+              queue: [],
+              currentIdx: 0,
+              choices: [],
+            })}
+            className="ml-auto text-xs px-2 py-1 rounded border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors"
+          >
+            [debug] modal
+          </button>
         </header>
 
         {/* LLM loading banner */}
@@ -1899,12 +2351,35 @@ export default function DevisPage() {
               </button>
             )}
 
+            {showCandidatesPanel && rfqCandidates.length > 0 && (
+              <div className="flex-shrink-0 bg-background">
+                <div className="max-w-[680px] mx-auto border-x border-border">
+                  <CandidatesPanel
+                    candidates={rfqCandidates}
+                    selectedKeys={selectedCandidateKeys}
+                    onToggle={handleCandidateToggle}
+                    onSelectHighMedium={handleSelectHighMedium}
+                    onStart={handleCandidatesStart}
+                    onClose={() => setShowCandidatesPanel(false)}
+                  />
+                </div>
+              </div>
+            )}
             <div className="flex-shrink-0 px-4 pb-4 pt-2 bg-background">
               <div className="max-w-[680px] mx-auto">{inputBar}</div>
             </div>
           </>
         )}
       </div>
+
+      {/* ── SearchWorkspace Modal ────────────────────────────────────────── */}
+      {searchWS && (
+        <SearchWorkspaceModal
+          ws={searchWS}
+          onUpdate={setSearchWS}
+          onClose={() => setSearchWS(null)}
+        />
+      )}
 
       {/* ── Devis panel (visible only when postes exist) ──────────────────── */}
       {postes.length > 0 && (

@@ -9,13 +9,17 @@ import json
 from collections.abc import AsyncGenerator
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from backend.api.dependencies import get_settings
+from backend.adapters.auth_adapter import get_current_user
+from backend.api.dependencies import RoleChecker, get_authorization_service, get_settings
+from backend.db.models import UserTable
 
 router = APIRouter(prefix="/api/v1/agent", tags=["agent"])
+
+_agent_role = RoleChecker(["ADMIN", "COMMERCIAL"])
 
 
 class AgentChatRequest(BaseModel):
@@ -24,15 +28,17 @@ class AgentChatRequest(BaseModel):
     force_mode: Literal["simple_claude", "simple_gpt", "simple_rag", "combined", "combined_gpt"] | None = None
 
 
-async def _stream_with_keepalive(gen: AsyncGenerator[str, None], timeout: float = 15.0):
-    """Wraps an async SSE generator with keepalive comments (évite le browser timeout)."""
+async def _stream_with_keepalive(gen: AsyncGenerator[str, None], timeout: float = 10.0):
+    """Wraps an async SSE generator with keepalive data events (évite le browser timeout).
+    Utilise un vrai event data: (pas un commentaire) pour que Uvicorn et les proxies flushent."""
+    import json as _json
     aiter = gen.__aiter__()
     while True:
         try:
             chunk = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
             yield chunk
         except asyncio.TimeoutError:
-            yield ": keepalive\n\n"
+            yield f"data: {_json.dumps({'keepalive': True})}\n\n"
         except StopAsyncIteration:
             break
 
@@ -50,13 +56,18 @@ def _get_orchestrator():
 
 
 @router.post("/chat")
-async def agent_chat(request: AgentChatRequest) -> StreamingResponse:
+async def agent_chat(
+    request: AgentChatRequest,
+    current_user: UserTable = Depends(_agent_role),
+) -> StreamingResponse:
     """
     Agent orchestrator endpoint.
 
     Classifie l'intention, route vers Claude API, RAG local, ou les deux.
     Aucune donnée VLM n'est transmise à l'API externe.
     """
+    if request.collection_name and request.collection_name != "default":
+        get_authorization_service().assert_can_access(current_user.role, request.collection_name)
     orchestrator = _get_orchestrator()
 
     return StreamingResponse(

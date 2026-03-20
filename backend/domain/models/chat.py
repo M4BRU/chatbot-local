@@ -18,6 +18,7 @@ class ChatRequest(BaseModel):
     prompt_name: str = Field(default="defaut", description="Prompt template name")
     history: list[ChatMessage] = Field(default=[], description="Previous messages for context")
     conv_id: str | None = Field(default=None, description="Conversation ID for backend persistence")
+    reasoning_mode: bool = Field(default=False, description="Enable multi-query reasoning mode")
 
 
 class ChatSource(BaseModel):

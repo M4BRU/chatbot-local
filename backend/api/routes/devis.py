@@ -12,11 +12,24 @@ from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sse_starlette.sse import EventSourceResponse
 
-from backend.api.dependencies import get_catalog_adapter, get_devis_service, get_excel_collection_adapter, get_settings
+from backend.adapters.auth_adapter import get_current_user
+from backend.api.dependencies import (
+    RoleChecker,
+    get_authorization_service,
+    get_catalog_adapter,
+    get_devis_service,
+    get_excel_collection_adapter,
+    get_settings,
+)
+from backend.db.models import UserTable
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["devis"])
+
+# Rôles autorisés pour le module devis (commercial + admin)
+_devis_role = RoleChecker(["ADMIN", "COMMERCIAL"])
+_admin_role = RoleChecker(["ADMIN"])
 
 _SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -87,7 +100,10 @@ class UpdatePanierItemRequest(BaseModel):
 # ── Catalog management ─────────────────────────────────────────────────────────
 
 @router.get("/catalog/status")
-async def catalog_status(catalog=Depends(get_catalog_adapter)):
+async def catalog_status(
+    catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
+):
     """Return catalog metadata (loaded, row count, columns)."""
     return catalog.status
 
@@ -96,6 +112,7 @@ async def catalog_status(catalog=Depends(get_catalog_adapter)):
 async def upload_catalog(
     file: UploadFile = File(...),
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_admin_role),
 ):
     """Upload an Excel catalog file and load it into SQLite."""
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
@@ -116,6 +133,7 @@ async def get_catalog_elements(
     nom_poste: str,
     nom_affaire: str | None = None,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Return all catalog sub-rows for a given nom_poste, optionally filtered by affaire."""
     return await asyncio.to_thread(
@@ -124,7 +142,10 @@ async def get_catalog_elements(
 
 
 @router.post("/catalog/reload")
-async def reload_catalog(catalog=Depends(get_catalog_adapter)):
+async def reload_catalog(
+    catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_admin_role),
+):
     """Reload the catalog from disk (useful after manual file replacement)."""
     catalog_path = Path("/app/documents/catalogue.xlsx")
     if not catalog_path.exists():
@@ -172,6 +193,7 @@ async def catalog_challenge(
     req: CatalogChallengeRequest,
     catalog=Depends(get_catalog_adapter),
     excel_adapter=Depends(get_excel_collection_adapter),
+    _: UserTable = Depends(_devis_role),
 ) -> dict:
     """
     Compare BM25 (méthode catalogue actuelle) vs NL2SQL (nouvelle méthode SQL)
@@ -246,6 +268,7 @@ class RfqDebugRequest(BaseModel):
 async def rfq_planner_debug(
     req: RfqDebugRequest,
     devis_service=Depends(get_devis_service),
+    current_user: UserTable = Depends(_devis_role),
 ) -> dict:
     """
     Exécute le RFQPlanner en mode debug et retourne la structure complète :
@@ -255,6 +278,8 @@ async def rfq_planner_debug(
     - Phase 4 : contexte synthétisé final
     Permet de diagnostiquer ce que le planner trouve (ou rate) à chaque étape.
     """
+    if req.collection:
+        get_authorization_service().assert_can_access(current_user.role, req.collection)
     return await devis_service.run_rfq_planner_debug(req.message, req.collection)
 
 
@@ -264,8 +289,11 @@ async def rfq_planner_debug(
 async def devis_chat(
     req: DevisChatRequest,
     devis_service=Depends(get_devis_service),
+    current_user: UserTable = Depends(_devis_role),
 ):
     """SSE stream for a devis chat turn (tool-calling loop + final generation)."""
+    if req.collection:
+        get_authorization_service().assert_can_access(current_user.role, req.collection)
 
     async def _generator():
         async for event in devis_service.chat_stream(
@@ -284,6 +312,7 @@ async def devis_chat(
 async def generate_devis(
     req: GenerateDevisRequest,
     devis_service=Depends(get_devis_service),
+    _: UserTable = Depends(_devis_role),
 ):
     """SSE stream that generates the final devis markdown table from the panier."""
 
@@ -300,6 +329,7 @@ async def generate_devis(
 async def get_panier(
     conversation_id: str,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Return all panier items for a conversation."""
     return await asyncio.to_thread(catalog.get_panier, conversation_id)
@@ -310,6 +340,7 @@ async def lock_affaire(
     conversation_id: str,
     req: LockAffaireRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Lock an affaire for a conversation (called when user clicks a choice card)."""
     await asyncio.to_thread(catalog.set_affaire_lock, conversation_id, req.nom_affaire)
@@ -321,6 +352,7 @@ async def set_search_scope(
     conversation_id: str,
     req: SearchScopeRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Set whether the next search_catalog call should return all affaires or only the locked one."""
     await asyncio.to_thread(catalog.set_search_scope, conversation_id, req.search_all)
@@ -331,6 +363,7 @@ async def set_search_scope(
 async def clear_panier(
     conversation_id: str,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Remove all items from a conversation's panier."""
     await asyncio.to_thread(catalog.clear_panier, conversation_id)
@@ -341,6 +374,7 @@ async def clear_panier(
 async def get_devis_settings(
     conversation_id: str,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Return devis settings (coefficient, coef_final) for a conversation."""
     return await asyncio.to_thread(catalog.get_devis_settings, conversation_id)
@@ -351,6 +385,7 @@ async def patch_devis_settings(
     conversation_id: str,
     req: DevisSettingsRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Update devis settings (coefficient, coef_final) for a conversation."""
     await asyncio.to_thread(catalog.set_devis_settings, conversation_id, req.coefficient, req.coef_final)
@@ -363,6 +398,7 @@ async def patch_panier_item(
     item_id: str,
     req: UpdatePanierItemRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Partial update of a panier item (MdO fields + is_option)."""
     fields = req.model_dump(exclude_none=True)
@@ -382,6 +418,7 @@ async def patch_panier_item(
 async def export_devis_excel(
     conversation_id: str,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Generate and download a filled Excel devis from the panier."""
     from backend.domain.services.excel_generator import generate_excel_devis
@@ -422,6 +459,7 @@ async def add_poste_to_panier_direct(
     conversation_id: str,
     req: AddPosteRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Add a poste directly to the panier without LLM (called from UI choice cards)."""
     result = await asyncio.to_thread(
@@ -432,11 +470,14 @@ async def add_poste_to_panier_direct(
     if result.get("errors"):
         first_error = result["errors"][0]
         raise HTTPException(status_code=400, detail=first_error.get("error", "Erreur inconnue"))
-    # Mark matching task as done so the LLM's LISTE DE TÂCHES is updated
+    # Mark matching task as done so the LLM's LISTE DE TÂCHES is updated.
+    # fallback_first=True : si le nom_poste ne matche pas textuellement la query
+    # (ex: "Robot N220" pour query "Comau NJ40"), marque quand même la 1ère tâche
+    # pending comme done — l'utilisateur vient de choisir un résultat de recherche.
     for item in result.get("added", []):
         nom = item.get("nom_poste", "") if isinstance(item, dict) else str(item)
         if nom:
-            await asyncio.to_thread(catalog.complete_task_item, conversation_id, nom)
+            await asyncio.to_thread(catalog.complete_task_item, conversation_id, nom, fallback_first=True)
     # Include remaining tasks so the frontend can build an explicit next-search instruction
     all_tasks = await asyncio.to_thread(catalog.get_task_list, conversation_id)
     remaining = [t for t in all_tasks if not t.get("done")]
@@ -448,6 +489,7 @@ async def add_element_to_panier(
     conversation_id: str,
     req: AddElementRequest,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Add an element (col H sub-component) directly to the panier without LLM."""
     result = await asyncio.to_thread(
@@ -463,6 +505,7 @@ async def remove_panier_item(
     conversation_id: str,
     item_id: str,
     catalog=Depends(get_catalog_adapter),
+    _: UserTable = Depends(_devis_role),
 ):
     """Remove a specific item from the panier."""
     await asyncio.to_thread(catalog.remove_from_panier, conversation_id, item_id)

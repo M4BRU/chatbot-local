@@ -260,6 +260,36 @@ class QdrantCollectionManager:
             logger.warning(f"Sparse embeddings indisponibles ({e}) — mode DENSE")
             return None
 
+    def _create_payload_indexes(self, nom: str) -> None:
+        """
+        Crée les payload indexes nécessaires pour les filtres metadata.
+        Doit être appelé UNE FOIS à la création de la collection (avant tout upload)
+        pour que Qdrant construise des liens HNSW filter-aware.
+        """
+        from qdrant_client.models import PayloadSchemaType
+        fields = [
+            ("source",              PayloadSchemaType.KEYWORD),
+            ("chunk_idx",           PayloadSchemaType.INTEGER),
+            ("chunk_idx_in_doc",    PayloadSchemaType.INTEGER),
+            ("total_chunks_in_doc", PayloadSchemaType.INTEGER),
+            ("is_first_chunk",      PayloadSchemaType.BOOL),
+            ("is_last_chunk",       PayloadSchemaType.BOOL),
+            ("content_type",        PayloadSchemaType.KEYWORD),
+            ("chunk_level",         PayloadSchemaType.KEYWORD),
+            ("parent_id",           PayloadSchemaType.KEYWORD),
+            ("page",                PayloadSchemaType.INTEGER),
+        ]
+        for field_name, field_type in fields:
+            try:
+                self._client.create_payload_index(
+                    collection_name=nom,
+                    field_name=field_name,
+                    field_schema=field_type,
+                )
+            except Exception as e:
+                logger.warning(f"Payload index '{field_name}' : {e}")
+        logger.info(f"Payload indexes créés pour '{nom}' ({len(fields)} champs)")
+
     def collection_existe(self, nom: str) -> bool:
         try:
             self._client.get_collection(nom)
@@ -291,6 +321,9 @@ class QdrantCollectionManager:
                 **kwargs,
             )
             logger.info(f"Collection Qdrant '{nom}' créée ({dim}-dim, sparse={EMBED_SPARSE})")
+            # Payload indexes — créés avant le premier upload pour que Qdrant puisse
+            # construire des liens HNSW filter-aware (filtrage O(1) au lieu de post-filter).
+            self._create_payload_indexes(nom)
 
         return QdrantCollectionStore(
             client=self._client,

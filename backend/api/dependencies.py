@@ -3,6 +3,8 @@
 import os
 from functools import lru_cache
 
+from fastapi import Depends, HTTPException, status
+
 from backend.config.settings import Settings
 
 # VECTOR_DB=chroma (défaut) ou VECTOR_DB=qdrant (Group B)
@@ -59,6 +61,34 @@ def get_excel_collection_adapter():
     adapter = ExcelCollectionAdapter()
     adapter.init_db()
     return adapter
+
+
+@lru_cache(maxsize=1)
+def get_authorization_service():
+    """Singleton AuthorizationService — charge rbac.yaml au démarrage."""
+    from backend.domain.services.authorization_service import AuthorizationService
+    settings = get_settings()
+    return AuthorizationService(settings.rbac_config_path)
+
+
+# Re-export pour commodité dans les routes
+from backend.adapters.auth_adapter import get_current_user  # noqa: E402
+from backend.db.base import get_async_session  # noqa: E402
+
+
+class RoleChecker:
+    """Dependency FastAPI — vérifie que l'utilisateur a le bon rôle."""
+
+    def __init__(self, allowed_roles: list[str]):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, user=Depends(get_current_user)):
+        if user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return user
 
 
 @lru_cache(maxsize=1)

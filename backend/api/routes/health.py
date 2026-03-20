@@ -2,7 +2,6 @@
 
 import subprocess
 
-import chromadb
 import httpx
 from fastapi import APIRouter, Depends
 
@@ -25,15 +24,16 @@ async def check_ollama(settings: Settings) -> str:
         return "unavailable"
 
 
-async def check_chromadb(settings: Settings) -> str:
-    """Check ChromaDB service health via Python client."""
+async def check_qdrant(settings: Settings) -> str:
+    """Check Qdrant service health."""
     try:
-        client = chromadb.HttpClient(
-            host=settings.chroma_host,
-            port=settings.chroma_port,
-        )
-        client.heartbeat()
-        return "ok"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"http://{settings.qdrant_host}:{settings.qdrant_port}/healthz"
+            )
+            if response.status_code == 200:
+                return "ok"
+            return "unavailable"
     except Exception:
         return "unavailable"
 
@@ -72,27 +72,22 @@ async def llm_status(settings: Settings = Depends(get_settings)) -> dict:
 
 @router.get("/health")
 async def health_check(settings: Settings = Depends(get_settings)) -> ApiResponse:
-    """Check system health.
-
-    Returns status of Ollama, ChromaDB, and GPU detection.
-    Always returns HTTP 200 - degraded status is indicated in the response body.
-    """
+    """Check system health — Ollama, Qdrant et GPU."""
     ollama_status = await check_ollama(settings)
-    chromadb_status = await check_chromadb(settings)
+    qdrant_status = await check_qdrant(settings)
     gpu_status = check_gpu()
 
     data = {
         "ollama": ollama_status,
-        "chromadb": chromadb_status,
+        "qdrant": qdrant_status,
         "gpu": gpu_status,
     }
 
-    # Build degradation message
     degraded = []
     if ollama_status == "unavailable":
         degraded.append("Ollama unreachable")
-    if chromadb_status == "unavailable":
-        degraded.append("ChromaDB unreachable")
+    if qdrant_status == "unavailable":
+        degraded.append("Qdrant unreachable")
 
     message = f"Degraded: {', '.join(degraded)}" if degraded else None
 

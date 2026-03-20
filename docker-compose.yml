@@ -1,12 +1,36 @@
 services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs
+    # Génère un certificat self-signed au premier démarrage si absent, puis lance nginx
+    command: >-
+      sh -c "apk add --no-cache openssl &&
+      if [ ! -f /etc/nginx/certs/nginx.crt ]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:4096 -keyout /etc/nginx/certs/nginx.key -out /etc/nginx/certs/nginx.crt -subj '/CN=localhost';
+      fi &&
+      nginx -g 'daemon off;'"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - chatbot-network
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: https://localhost
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=https://localhost
+      - BACKEND_INTERNAL_URL=http://backend:8000
     depends_on:
       - backend
     networks:
@@ -88,13 +112,26 @@ services:
       - USE_PARENT_CHILD=true
       # CHILD_CHUNK_SIZE_TOKENS=250
       # PARENT_CHUNK_SIZE_TOKENS=1000
+      # ── Auth & RBAC ────────────────────────────────────────────────────────────
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://chatbot:chatbot@postgres:5432/chatbot}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-changeme-generate-with-openssl-rand-hex-32}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - COOKIE_SAMESITE=${COOKIE_SAMESITE:-lax}
+      - RBAC_CONFIG_PATH=/app/config/rbac.yaml
     volumes:
       - ./backend:/app/backend # Code source en temps réel
+      - ./alembic.ini:/app/alembic.ini:ro
+      - ./scripts:/app/scripts
       - documents_store:/app/documents
       - hf_cache:/root/.cache/huggingface
+      - ./backend/config/rbac.yaml:/app/config/rbac.yaml:ro
     depends_on:
-      - ollama
-      - chromadb
+      ollama:
+        condition: service_started
+      chromadb:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     networks:
       - chatbot-network
 
@@ -122,6 +159,8 @@ services:
       # KV cache en 8-bit : réduit la VRAM du cache de ~50% → permet 8192 tokens de contexte
       - OLLAMA_KV_CACHE_TYPE=q8_0
       - OLLAMA_FLASH_ATTENTION=1
+      # Garde le modèle chargé en VRAM indéfiniment → évite reload + GPU discovery failure (WSL2)
+      - OLLAMA_KEEP_ALIVE=-1
     deploy:
       resources:
         reservations:
@@ -141,6 +180,22 @@ services:
     environment:
       - ANONYMIZED_TELEMETRY=False
       - ALLOW_RESET=True
+    networks:
+      - chatbot-network
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=chatbot
+      - POSTGRES_PASSWORD=chatbot
+      - POSTGRES_DB=chatbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     networks:
       - chatbot-network
 
@@ -167,3 +222,4 @@ volumes:
   ollama_contextual_models:
   hf_cache:
   qdrant_data:
+  postgres_data:

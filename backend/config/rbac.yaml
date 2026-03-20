@@ -1,0 +1,13 @@
+# RBAC — mappage rôle → collections autorisées
+# Modifier ce fichier + docker restart backend (pas de rebuild nécessaire)
+# '*' = accès à toutes les collections (wildcard superuser)
+roles:
+  DEV:
+    - "*"
+  ADMIN:
+    - "*"
+  COMMERCIAL:
+    - catalog
+    - VLMV11
+  STANDARD:
+    - VLMV11

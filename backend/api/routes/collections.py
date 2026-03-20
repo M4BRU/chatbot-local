@@ -1,9 +1,9 @@
 """Collections management API routes."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.api.dependencies import get_collection_manager
+from backend.api.dependencies import get_authorization_service, get_collection_manager, get_current_user
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
 
@@ -28,10 +28,18 @@ class CollectionListResponse(BaseModel):
 
 
 @router.get("", response_model=CollectionListResponse)
-async def list_collections() -> CollectionListResponse:
-    """List all available collections."""
+async def list_collections(user=Depends(get_current_user)) -> CollectionListResponse:
+    """List collections filtered by the current user's RBAC role.
+    Roles with wildcard '*' see all collections.
+    """
     cm = get_collection_manager()
-    return CollectionListResponse(collections=cm.lister_collections())
+    auth_svc = get_authorization_service()
+    all_collections = cm.lister_collections()
+    if auth_svc.is_superuser(user.role):
+        return CollectionListResponse(collections=all_collections)
+    allowed = set(auth_svc.get_authorized_collections(user.role))
+    filtered = [c for c in all_collections if c in allowed]
+    return CollectionListResponse(collections=filtered)
 
 
 @router.post("", response_model=CollectionInfo, status_code=201)

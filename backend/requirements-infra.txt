@@ -24,3 +24,6 @@ xlrd>=2.0.0               # xls (pure Python mais stable)
 # Search
 rank-bm25>=0.2.2          # Pure Python mais stable, jamais changé
 nltk>=3.9.0               # Pure Python mais stable
+
+# Auth DB driver (C extension → Layer 2)
+asyncpg>=0.29.0

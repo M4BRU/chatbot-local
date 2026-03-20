@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const apiFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+  fetch(input, { credentials: "include", ...init });
 
 interface EvalStats {
   total: number;
@@ -118,7 +120,7 @@ export default function EvalDashboard() {
     if (!batchRunning) return;
     const poll = async () => {
       try {
-        const res = await fetch(`${API_URL}/api/eval/queue-status`);
+        const res = await apiFetch(`${API_URL}/api/eval/queue-status`);
         const data = await res.json();
         if (!data.running) {
           setBatchRunning(false);
@@ -134,7 +136,7 @@ export default function EvalDashboard() {
   const handleRunBatch = async () => {
     setBatchMsg(null);
     try {
-      const res = await fetch(`${API_URL}/api/eval/run-batch?limit=5`, { method: "POST" });
+      const res = await apiFetch(`${API_URL}/api/eval/run-batch?limit=5`, { method: "POST" });
       const data = await res.json();
       if (data.started) {
         setBatchRunning(true);
