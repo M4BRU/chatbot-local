@@ -83,68 +83,6 @@ _COMPRESS_CHARS_THRESHOLD = 7000
 _CATALOG_PATH = Path("/app/documents/catalogue.xlsx")
 _CATALOG_CHALLENGE_COLLECTION = "_catalog_challenge"
 
-# ── ANCIEN SYSTEM PROMPT (conservé pour référence, à supprimer plus tard) ──────
-# """Tu es un assistant de devis pour VLM Robotics. Ton seul travail : trouver des postes
-# dans le catalogue et les ajouter au panier.
-#
-# CATALOGUE : historique de projets réels. Chaque poste (nom_poste) a un num_poste
-# et appartient à une nom_affaire.
-# Les "elements" (col H) sont des sous-composants internes — PAS des postes à ajouter.
-#
-# PANIER ACTUEL :
-# {panier_section}
-#
-# {task_section}
-# {rfq_section}
-# COEFFICIENTS : fournitures={current_coefficient}% · final={current_coef_final}%
-# → set_devis_settings si l'utilisateur demande à les changer.
-#
-# ━━━ COMPORTEMENT ━━━
-#
-# 1. TOUTE DEMANDE MULTI-ACTIONS → appelle plan_tasks([...]) EN PREMIER avec la liste
-#    complète des actions.
-#    • "ajoute X et Y" → plan_tasks(["search X", "search Y"])
-#    • "update X et Y" → plan_tasks(["update X champ=val", "update Y champ=val"])
-#    • "ajoute X et update Y" → plan_tasks(["search X", "update Y champ=val"])
-#    ✗ EXCEPTION : message "[SYSTÈME]" ou "Cherche" → NE PAS appeler plan_tasks.
-#
-# 2. EXÉCUTER LES TÂCHES dans l'ordre de la LISTE DE TÂCHES. Après chaque tool call
-#    réussi, passer au [ ] suivant.
-#    • task "search …" → search_catalog(column="nom_poste", query=…)
-#    • task "update …" → update_panier_item directement (pas search_catalog)
-#    • Poste absent du panier → search_catalog d'abord
-#    • Message "Sélectionné :" → add_to_panier directement
-#    • Message "[SYSTÈME]" ou "Cherche X" → search_catalog pour le [ ] suivant
-#
-# 3. RIEN TROUVÉ dans le catalogue → search_docs pour identifier des composants dans les PDFs.
-#    search_docs retourne directement {"components": [...], "sources": [...]}.
-#    Appelle IMMÉDIATEMENT report_findings(components=[...]) avec les noms du résultat.
-#    JAMAIS de texte entre search_docs et report_findings.
-# 3b. DONNÉES TABULAIRES → search_collection_excel.
-# 3c. APRÈS search_catalog avec plusieurs postes (champ _next_action présent) :
-#    → Tu DOIS appeler un tool ensuite, jamais de texte seul.
-#    → Analyse si la demande contient des contraintes.
-#    → OUI : search_docs puis report_findings.
-#    → NON : ask_user_choice avec les postes trouvés.
-#
-# 4. AJOUTER → add_to_panier avec nom_poste, nom_affaire, num_poste EXACTS.
-#    • Si search_catalog retourne 1 seul poste (_hint présent) → add_to_panier IMMÉDIATEMENT.
-#    • Jours dans le message → nbre_jours_etude/atelier/client.
-#    • "en option" → is_option=true.
-#
-# 5. MODIFIER → update_panier_item pour jours/option d'un poste déjà dans le panier.
-#
-# 6. RÉPONSE TEXTE → 1 ligne max. Jamais de code, jamais de plan écrit.
-#    ✗ INTERDIT : blocs ```, code inline, listes inventées, questions pro-actives.
-#
-# ━━━ RÈGLES ABSOLUES ━━━
-# • num_poste vient UNIQUEMENT des résultats de search_catalog.
-# • Ne jamais mentionner de num_poste dans le texte.
-# • UNE tâche à la fois.
-# • Si rfq_context mentionne un composant → plan_tasks([...]) puis UNE recherche à la fois."""
-# ── FIN ANCIEN SYSTEM PROMPT ──────────────────────────────────────────────────
-
-
 def _build_system_prompt(
     collection: str,
     current_coefficient: float = 0.0,
@@ -885,6 +823,50 @@ class DevisService:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
+    async def _process_chunks_and_extract(
+        self,
+        context_parts: list[str],
+        sources: list[dict],
+        query: str,
+        log_prefix: str = "chunks",
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """
+        Shared chunk processing: split context into chunks, extract components
+        via LLM, deduplicate by name.
+
+        Returns (chunks_raw, deduped_components, unique_sources).
+        """
+        MAX_CHUNKS = 3
+        MAX_CHARS_PER_CHUNK = 6000
+        chunks_raw: list[dict] = []
+        all_components: list[dict] = []
+
+        for i in range(min(MAX_CHUNKS, len(context_parts))):
+            text = context_parts[i][:MAX_CHARS_PER_CHUNK]
+            source = sources[i].get("fichier", "") if i < len(sources) else ""
+            chunk = {"text": text, "source": source}
+            chunks_raw.append(chunk)
+            logger.info(
+                "[%s] chunk %d/%d (%d chars) → extraction LLM",
+                log_prefix, i + 1, min(MAX_CHUNKS, len(context_parts)), len(text),
+            )
+            extraction = await self._extract_components_from_chunks([chunk], query)
+            all_components.extend(extraction.get("components", []))
+
+        # Dedup by name (first occurrence kept)
+        seen_noms: set[str] = set()
+        deduped: list[dict] = []
+        for comp in all_components:
+            nom = comp.get("nom", "")
+            if nom and nom not in seen_noms:
+                seen_noms.add(nom)
+                deduped.append(comp)
+            elif not nom:
+                deduped.append(comp)
+
+        unique_sources = list(dict.fromkeys(c["source"] for c in chunks_raw if c["source"]))
+        return chunks_raw, deduped, unique_sources
+
     async def _ollama_chat(
         self, messages: list[dict], tools: list | None = None
     ) -> dict:
@@ -1112,39 +1094,9 @@ class DevisService:
             contexte, sources = await asyncio.to_thread(rag.rechercher, query)
             context_parts = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
 
-            # Traitement chunk par chunk : chaque parent complet (~4000 chars = ~1000 tokens)
-            # est envoyé individuellement au LLM d'extraction (tient dans num_ctx 2048 par défaut).
-            # Les composants extraits sont mergés + dédupliqués par nom.
-            MAX_CHUNKS = 3
-            MAX_CHARS_PER_CHUNK = 6000  # safety cap pour les outliers (tableaux xlsx/docx géants)
-            chunks_raw = []
-            all_components: list[dict] = []
-
-            for i in range(min(MAX_CHUNKS, len(context_parts))):
-                text = context_parts[i][:MAX_CHARS_PER_CHUNK]
-                source = sources[i].get("fichier", "") if i < len(sources) else ""
-                chunk = {"text": text, "source": source}
-                chunks_raw.append(chunk)
-
-                logger.info(
-                    "[rfq_planner] dim %r — chunk %d/%d (%d chars) → extraction LLM",
-                    dim_name, i + 1, min(MAX_CHUNKS, len(context_parts)), len(text),
-                )
-                extraction = await self._extract_components_from_chunks([chunk], query)
-                all_components.extend(extraction.get("components", []))
-
-            # Dédup par nom (première occurrence conservée)
-            seen_noms: set[str] = set()
-            deduped: list[dict] = []
-            for comp in all_components:
-                nom = comp.get("nom", "")
-                if nom and nom not in seen_noms:
-                    seen_noms.add(nom)
-                    deduped.append(comp)
-                elif not nom:
-                    deduped.append(comp)
-
-            unique_sources = list(dict.fromkeys(c["source"] for c in chunks_raw if c["source"]))
+            chunks_raw, deduped, unique_sources = await self._process_chunks_and_extract(
+                context_parts, sources, query, log_prefix=f"rfq_planner:{dim_name}",
+            )
             nb = len(deduped)
             logger.info(
                 "[rfq_planner] dim %r → %d composant(s) (%d chunks traités), sources: %s",
@@ -2211,48 +2163,13 @@ class DevisService:
                 contexte, sources = await asyncio.to_thread(rag.rechercher, query)
                 context_parts = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
 
-                # Traitement chunk par chunk : chaque parent complet (~4000 chars)
-                # est envoyé individuellement au LLM d'extraction.
-                MAX_CHUNKS = 3
-                MAX_CHARS_PER_CHUNK = 6000
-                chunks_raw = []
-                all_components: list[dict] = []
-
-                for i in range(min(MAX_CHUNKS, len(context_parts))):
-                    text = context_parts[i][:MAX_CHARS_PER_CHUNK]
-                    source = sources[i].get("fichier", "") if i < len(sources) else ""
-                    chunk = {"text": text, "source": source}
-                    chunks_raw.append(chunk)
-                    logger.debug(
-                        "search_docs chunk[%d] (%d chars, src=%r): %r",
-                        i, len(text), source, text[:120],
-                    )
-                    chunk_extraction = await self._extract_components_from_chunks([chunk], query)
-                    all_components.extend(chunk_extraction.get("components", []))
-
-                # Dédup par nom
-                seen_noms: set[str] = set()
-                deduped: list[dict] = []
-                for comp in all_components:
-                    nom = comp.get("nom", "")
-                    if nom and nom not in seen_noms:
-                        seen_noms.add(nom)
-                        deduped.append(comp)
-                    elif not nom:
-                        deduped.append(comp)
-
-                unique_sources = list(dict.fromkeys(
-                    c["source"] for c in chunks_raw if c["source"]
-                ))
+                chunks_raw, deduped, unique_sources = await self._process_chunks_and_extract(
+                    context_parts, sources, query, log_prefix="search_docs",
+                )
                 extraction = {"components": deduped, "sources": unique_sources}
                 logger.info(
-                    "search_docs: %d chunk(s) traités → %d composant(s)",
-                    len(chunks_raw), len(deduped),
-                )
-
-                logger.info(
-                    "search_docs: résultat final — %d composant(s), sources: %s",
-                    len(extraction.get("components", [])), unique_sources,
+                    "search_docs: %d chunk(s) → %d composant(s), sources: %s",
+                    len(chunks_raw), len(deduped), unique_sources,
                 )
                 return json.dumps(extraction, ensure_ascii=False)
             except Exception as exc:
