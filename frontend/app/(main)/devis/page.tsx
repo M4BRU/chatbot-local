@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDown, ChevronDown, ChevronRight, Download, MoreHorizontal, Send, Trash2, X } from "lucide-react";
 import Image from "next/image";
 import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
@@ -1065,8 +1065,8 @@ function DevisPanel({
           </thead>
           <tbody>
             {groupByEnsemble(mainPostes).map(({ ensemble, rows }) => (
-              <>
-                <tr key={`grp-${ensemble}`}>
+              <Fragment key={`grp-${ensemble}`}>
+                <tr>
                   <td colSpan={7} className="px-3 py-1 text-[11px] font-semibold tracking-wide text-muted-foreground bg-muted/40 border-y border-border/40 uppercase">
                     {ensemble}
                   </td>
@@ -1081,7 +1081,7 @@ function DevisPanel({
                     onRemove={onRemoveItem}
                   />
                 ))}
-              </>
+              </Fragment>
             ))}
             {/* Options section separator */}
             {optionPostes.length > 0 && (
@@ -1092,7 +1092,7 @@ function DevisPanel({
               </tr>
             )}
             {groupByEnsemble(optionPostes).map(({ ensemble, rows }) => (
-              <>
+              <Fragment key={`opt-${ensemble}`}>
                 {rows.map(item => (
                   <PosteRow
                     key={item.id}
@@ -1103,7 +1103,7 @@ function DevisPanel({
                     onRemove={onRemoveItem}
                   />
                 ))}
-              </>
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -1478,7 +1478,7 @@ export default function DevisPage() {
       if (!silent && scopeChoicePendingRef.current) {
         pendingMessageRef.current = text;
         setInput("");
-        const choiceId = Math.random().toString(36).slice(2);
+        const choiceId = crypto.randomUUID();
         const question = "Souhaitez-vous continuer dans la même affaire ou chercher dans tout le catalogue ?";
         setMessages((prev) => [
           ...prev,
@@ -1507,11 +1507,11 @@ export default function DevisPage() {
       setShowCandidatesPanel(false);
 
       const userMsg: ChatMessage = {
-        id: Math.random().toString(36).slice(2),
+        id: crypto.randomUUID(),
         role: "user",
         content: text,
       };
-      const assistantId = Math.random().toString(36).slice(2);
+      const assistantId = crypto.randomUUID();
 
       const history = messages
         .filter((m) => m.content && !m.isStreaming)
@@ -1572,7 +1572,7 @@ export default function DevisPage() {
             const count = total ?? postes.length;
             const posteList = postes.map((p) => p.nom_poste).join(", ");
             const suffix = count > postes.length ? ` (+${count - postes.length} autres)` : "";
-            const previewId = Math.random().toString(36).slice(2);
+            const previewId = crypto.randomUUID();
             setMessages((prev) => [
               ...prev,
               {
@@ -1588,7 +1588,7 @@ export default function DevisPage() {
           if (event.docs_result) {
             const { query, sources, count } = event.docs_result;
             const sourceList = sources.length > 0 ? sources.join(", ") : "aucune source";
-            const infoId = Math.random().toString(36).slice(2);
+            const infoId = crypto.randomUUID();
             const infoContent = count > 0
               ? `📄 Documentation consultée pour « ${query} » — ${count} passage(s) trouvé(s) dans : ${sourceList}`
               : `📄 Aucun résultat dans la documentation pour « ${query} »`;
@@ -1742,7 +1742,7 @@ export default function DevisPage() {
               });
               if (result.added.length > 0) {
                 setPostes((prev) => [...prev, ...result.added]);
-                const confirmId = Math.random().toString(36).slice(2);
+                const confirmId = crypto.randomUUID();
                 const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
                 setMessages((prev) => [...prev, confirmMsg]);
                 await addMessage(convId, "assistant", confirmMsg.content);
@@ -1764,7 +1764,7 @@ export default function DevisPage() {
                   : { action: "show_element_affaires", element_text: el.text, occurrences: occs };
               return { id: JSON.stringify(idData), label: el.text, detail };
             });
-            const subId = Math.random().toString(36).slice(2);
+            const subId = crypto.randomUUID();
             const subQ = "Lequel des éléments souhaitez-vous ajouter au devis ?";
             setMessages((prev) => [
               ...prev,
@@ -1785,7 +1785,7 @@ export default function DevisPage() {
               label: occ.nom_affaire || "?",
               detail: `Poste : ${occ.nom_poste}${occ.fournisseur ? ` · ${occ.fournisseur}` : ""}`,
             }));
-            const subId = Math.random().toString(36).slice(2);
+            const subId = crypto.randomUUID();
             const subQ = `L'élément « ${elText} » est disponible dans plusieurs affaires. Laquelle utiliser ?`;
             setMessages((prev) => [
               ...prev,
@@ -1802,7 +1802,7 @@ export default function DevisPage() {
             const newItems = await addElementToPanierDirect(convId, parsed as Record<string, string>);
             if (newItems.length > 0) {
               setPostes((prev) => [...prev, ...newItems]);
-              const confirmId = Math.random().toString(36).slice(2);
+              const confirmId = crypto.randomUUID();
               const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.elements ?? label}** ajouté au devis.` };
               setMessages((prev) => [...prev, confirmMsg]);
               await addMessage(convId, "assistant", confirmMsg.content);
@@ -1844,7 +1844,7 @@ export default function DevisPage() {
                 });
                 if (result.added.length > 0) {
                   setPostes((prev) => [...prev, ...result.added]);
-                  const confirmId = Math.random().toString(36).slice(2);
+                  const confirmId = crypto.randomUUID();
                   const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
                   setMessages((prev) => [...prev, confirmMsg]);
                   await addMessage(convId, "assistant", confirmMsg.content);
@@ -1862,7 +1862,7 @@ export default function DevisPage() {
                   detail: detailParts.join(" · ") || undefined,
                 };
               });
-              const subId = Math.random().toString(36).slice(2);
+              const subId = crypto.randomUUID();
               const subQ = `Le poste « ${nomPoste} » existe dans plusieurs affaires. Quelle affaire utiliser ?`;
               setMessages((prev) => [
                 ...prev,
@@ -1906,7 +1906,7 @@ export default function DevisPage() {
               });
               if (result.added.length > 0) {
                 setPostes((prev) => [...prev, ...result.added]);
-                const confirmId = Math.random().toString(36).slice(2);
+                const confirmId = crypto.randomUUID();
                 const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${nomPoste}** ajouté au devis.` };
                 setMessages((prev) => [...prev, confirmMsg]);
                 await addMessage(convId, "assistant", confirmMsg.content);
@@ -1932,7 +1932,7 @@ export default function DevisPage() {
                 detail: detailParts.join(" · ") || undefined,
               };
             });
-            const subId = Math.random().toString(36).slice(2);
+            const subId = crypto.randomUUID();
             const subQ = `Le poste « ${nomPoste} » existe dans plusieurs affaires. Quelle affaire utiliser pour ce devis ?`;
             setMessages((prev) => [
               ...prev,
@@ -1964,7 +1964,7 @@ export default function DevisPage() {
           });
           if (result.added.length > 0) {
             setPostes((prev) => [...prev, ...result.added]);
-            const confirmId = Math.random().toString(36).slice(2);
+            const confirmId = crypto.randomUUID();
             const confirmMsg = { id: confirmId, role: "assistant" as const, content: `**${parsed.nom_poste}** ajouté au devis.` };
             setMessages((prev) => [...prev, confirmMsg]);
             await addMessage(convId, "assistant", confirmMsg.content);
@@ -2050,7 +2050,7 @@ export default function DevisPage() {
     setIsGenerating(true);
     setError(null);
 
-    const assistantId = Math.random().toString(36).slice(2);
+    const assistantId = crypto.randomUUID();
     let devisContent = "";
 
     try {
@@ -2244,26 +2244,6 @@ export default function DevisPage() {
         <header className="flex items-center gap-3 h-14 px-4 border-b border-border flex-shrink-0">
           <SidebarTrigger className="text-muted-foreground hover:text-foreground" />
           <span className="text-sm font-medium text-muted-foreground">Devis de synthèse</span>
-          {/* TODO: remove — debug trigger */}
-          <button
-            onClick={() => setSearchWS({
-              question: "J'ai identifié les composants suivants dans les documents techniques. Lesquels souhaitez-vous inclure dans le devis ?",
-              phase: "config",
-              allComps: [
-                { id: "c0", name: "Variateur de fréquence 15kW", selected: true, result: "pending" },
-                { id: "c1", name: "Moteur asynchrone 11kW", selected: true, result: "pending" },
-                { id: "c2", name: "Armoire de commande TGBT", selected: true, result: "pending" },
-                { id: "c3", name: "Câble HTA 3x95mm²", selected: false, result: "pending" },
-                { id: "c4", name: "Transformateur 630kVA", selected: true, result: "pending" },
-              ],
-              queue: [],
-              currentIdx: 0,
-              choices: [],
-            })}
-            className="ml-auto text-xs px-2 py-1 rounded border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors"
-          >
-            [debug] modal
-          </button>
         </header>
 
         {/* LLM loading banner */}
