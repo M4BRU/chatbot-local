@@ -1975,8 +1975,14 @@ class DevisService:
         collection: str,
         conversation_id: str,
         catalog_method: str = "bm25",
+        _ctx: dict | None = None,
     ) -> str:
-        """Execute a single tool call and return result as JSON string."""
+        """Execute a single tool call and return result as JSON string.
+
+        _ctx: mutable dict for passing side-data back to chat_stream
+              (e.g. raw results for element detection). Avoids instance-level
+              mutable state that is unsafe under concurrent requests.
+        """
         if tool_name == "plan_tasks":
             items = tool_args.get("items", [])
             if isinstance(items, list):
@@ -2058,8 +2064,9 @@ class DevisService:
                     len(results),
                 )
 
-            # Stash results for element detection in chat_stream.
-            self._last_raw_results: list[dict] = results
+            # Pass raw results to chat_stream for element detection.
+            if _ctx is not None:
+                _ctx["last_raw_results"] = results
 
             # Per-column BM25 already searched the right column — no post-filter needed.
             # If BM25 returned nothing, results is empty → column choice card will be emitted.
@@ -2300,6 +2307,8 @@ class DevisService:
 
         rfq_context: str | None = None
         _add_to_panier_succeeded = False
+        _tool_ctx: dict = {}  # mutable context shared with _execute_tool (avoids instance state)
+        _guardrail_nudged = False  # local to this call (not instance-level)
 
         # ── Auto-plan : détecter les demandes multi-actions côté serveur ────
         # Évite de dépendre du LLM pour appeler plan_tasks.
@@ -2444,8 +2453,8 @@ class DevisService:
                     ):
                         # Nudge : le LLM doit réessayer (soit _next_action ignoré,
                         # soit tâches en attente, soit update task non injectable)
-                        if not getattr(self, "_guardrail_nudged", False):
-                            self._guardrail_nudged = True
+                        if not _guardrail_nudged:
+                            _guardrail_nudged = True
                             # Construire un nudge contextuel
                             if expected is self._NEEDS_NUDGE:
                                 nudge_text = (
@@ -2464,7 +2473,7 @@ class DevisService:
                         else:
                             # Déjà nudgé une fois — si c'est _NEEDS_NUDGE (pas de tâches),
                             # on ne peut pas injecter → abandon. Si tâches, tenter injection.
-                            self._guardrail_nudged = False
+                            _guardrail_nudged = False
                             if (
                                 expected is not self._NEEDS_NUDGE
                                 and _tasks_now_guard
@@ -2508,7 +2517,7 @@ class DevisService:
                         break
 
                     # Reset nudge flag quand le LLM coopère (ou après injection)
-                    self._guardrail_nudged = False
+                    _guardrail_nudged = False
                     _synthetic_injection = True
                 else:
                     _synthetic_injection = False
@@ -2540,7 +2549,7 @@ class DevisService:
                         # Utiliser les résultats catalog serveur si disponibles
                         # pour émettre des choice cards correctement typées (type "poste"/"affaire")
                         # avec le format JSON {nom_poste, occurrences} attendu par le frontend.
-                        last_results = getattr(self, "_last_deduped_results", None)
+                        last_results = _tool_ctx.get("last_deduped_results")
                         choice_from_server = None
                         if last_results:
                             try:
@@ -2621,7 +2630,8 @@ class DevisService:
 
                     yield {"tool_call": {"name": tool_name, "status": "running"}}
                     result = await self._execute_tool(
-                        tool_name, tool_args, collection, conversation_id, catalog_method
+                        tool_name, tool_args, collection, conversation_id, catalog_method,
+                        _ctx=_tool_ctx,
                     )
 
                     # After search_catalog: server-side conflict/element detection
@@ -2633,7 +2643,7 @@ class DevisService:
                             )
                             deduped_results = json.loads(result)
                             # Stocker pour réutilisation dans ask_user_choice
-                            self._last_deduped_results = deduped_results
+                            _tool_ctx["last_deduped_results"] = deduped_results
 
                             # Determine whether the query targeted postes or elements.
                             # Use catalog's Snowball tokenizer (handles plurals).
@@ -2648,8 +2658,8 @@ class DevisService:
 
                             if column == "elements":
                                 # User explicitly chose to search in elements (col H).
-                                # _last_raw_results stashed by _execute_tool (unfiltered).
-                                raw = getattr(self, "_last_raw_results", [])
+                                # Raw results passed via _tool_ctx by _execute_tool (unfiltered).
+                                raw = _tool_ctx.get("last_raw_results", [])
                                 choice_event = _detect_element_conflict(query_str, raw)
                                 if choice_event is None and deduped_results:
                                     choice_event = _build_relevance_choice(
