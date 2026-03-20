@@ -361,35 +361,11 @@ def _get_or_build_bm25(db, collection_name: str) -> "_BM25CollectionIndex | None
         return None
 
 
-def _rrf_fusion(vector_results: list, bm25_results: list, k_final: int) -> list:
-    """
-    Reciprocal Rank Fusion : combine les résultats vector search et BM25.
-    Chaque chunk reçoit un score RRF = Σ 1/(RRF_K + rang) pour chaque liste.
-    """
-    def uid(doc) -> str:
-        return doc.page_content[:150]  # fingerprint unique par chunk
-
-    scores: dict[str, float] = {}
-    doc_map: dict[str, object] = {}
-
-    for rank, (doc, _) in enumerate(vector_results):
-        u = uid(doc)
-        scores[u] = scores.get(u, 0.0) + 1.0 / (RRF_K + rank + 1)
-        doc_map[u] = doc
-
-    for rank, (doc, _) in enumerate(bm25_results):
-        u = uid(doc)
-        scores[u] = scores.get(u, 0.0) + 1.0 / (RRF_K + rank + 1)
-        doc_map[u] = doc
-
-    sorted_uids = sorted(scores, key=lambda u: scores[u], reverse=True)
-    return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
-
-
 def _rrf_fusion_lists(result_lists: list, k_final: int) -> list:
     """
-    A5 — RRF fusion sur plusieurs listes de résultats (multi-query).
-    Chaque liste reçoit un score RRF = Σ 1/(RRF_K + rang) par chunk présent.
+    Reciprocal Rank Fusion sur N listes de résultats.
+    Chaque chunk reçoit un score RRF = Σ 1/(RRF_K + rang) par liste présente.
+    Used for multi-query fusion and hybrid (vector + BM25) fusion.
     """
     def uid(doc) -> str:
         return doc.page_content[:150]
@@ -405,6 +381,11 @@ def _rrf_fusion_lists(result_lists: list, k_final: int) -> list:
 
     sorted_uids = sorted(scores, key=lambda u: scores[u], reverse=True)
     return [(doc_map[u], scores[u]) for u in sorted_uids[:k_final]]
+
+
+def _rrf_fusion(vector_results: list, bm25_results: list, k_final: int) -> list:
+    """RRF fusion for exactly 2 result lists (vector + BM25)."""
+    return _rrf_fusion_lists([vector_results, bm25_results], k_final)
 
 
 def _generer_variantes_question(question: str, history: str, hyde_doc: str = "") -> list:
@@ -882,7 +863,7 @@ _STOPWORDS_FALLBACK = {
     "donne", "mois", "references", "documents", "trouve", "trouver",
     "parle", "concernant", "cela", "ceci", "avoir", "etre", "faire",
     "peux", "mots", "toute", "base", "donnees", "infos", "informations",
-    "passages", "concernant",
+    "passages",
     # FR — mots vagues fréquents dans les questions de suivi
     "plus", "detail", "details", "meme", "encore", "bien", "tres",
     "non", "oui", "comment", "quoi", "quel", "quelle", "quels", "quelles",
@@ -1668,82 +1649,32 @@ class RAGEngine:
 
     def rechercher_debug(self, question: str, history: str = "") -> dict:
         """
-        Retourne les données brutes du pipeline de retrieval pour debug frontend.
-
-        Retourne :
-          {
-            "original_question": str,
-            "rewritten_query": str,
-            "chunks": [
-              {
-                "rank": int,
-                "score": float,
-                "source": str,
-                "page": str|int,
-                "chunk_idx": int,
-                "machine": str,
-                "sections": list[str],   # hierarchy_parents désérialisé
-                "content": str,          # contenu complet
-                "content_preview": str,  # 300 premiers chars
-              }
-            ]
-          }
+        Retourne les données du pipeline de retrieval pour debug frontend.
+        Uses the same rechercher() pipeline as production to ensure parity
+        (CRAG, MMR, seuil relatif, parent/child, etc. all applied).
         """
         k, _ = self._adapter_parametres()
-        history_text = history if history else ""
+        history_text = history or ""
 
         rewritten_query = _reformuler_question(question, history_text)
-        _, sources_list = self.rechercher(rewritten_query, k=k, history=history_text)
+        contexte, sources_list = self.rechercher(rewritten_query, k=k, history=history_text)
 
-        # Re-run pour récupérer les docs complets (rechercher() retourne contexte str + sources)
-        # On refait le pipeline directement ici pour avoir les docs avec contenu
-        filtre = _extraire_filtre_question(rewritten_query)
-        reranker = _get_reranker()
-        k_candidats = min(k * RERANKER_CANDIDATS_MULT, RERANKER_CANDIDATS_MAX) if reranker else k
-
-        try:
-            resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats, filter=filtre)
-            if not resultats and filtre:
-                resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats)
-        except Exception:
-            resultats = self.db.similarity_search_with_score(rewritten_query, k=k_candidats)
-
-        bm25_index = _get_or_build_bm25(self.db, self.nom_collection)
-        if bm25_index:
-            bm25_results = bm25_index.search(rewritten_query, k=k_candidats, filtre=filtre)
-            resultats = _rrf_fusion(resultats, bm25_results, k_final=k_candidats)
-
-        colbert = _get_colbert()
-        if colbert and len(resultats) > k:
-            resultats = _appliquer_colbert(colbert, rewritten_query, resultats, top_k=k)
-        elif reranker and resultats:
-            resultats = _appliquer_reranker(reranker, rewritten_query, resultats, top_k=k)
-
-        resultats = _deduplicater_pdf_docx(resultats)
-        resultats = _ajouter_tail_suivant(self.db, resultats)
-
+        # Reconstruct chunk data from the context string and sources
+        context_parts = [c for c in contexte.split("\n\n---\n\n") if c.strip()]
         chunks = []
-        for rank, (doc, score) in enumerate(resultats, 1):
-            meta = doc.metadata or {}
-            # Désérialiser hierarchy_parents (stocké en JSON string)
-            sections_raw = meta.get("hierarchy_parents", "[]")
-            try:
-                sections = json.loads(sections_raw) if isinstance(sections_raw, str) else sections_raw
-            except Exception:
-                sections = []
-
-            parent_text = meta.get("parent_text")
+        for rank, content in enumerate(context_parts, 1):
+            src = sources_list[rank - 1] if rank - 1 < len(sources_list) else {}
             chunks.append({
                 "rank": rank,
-                "score": round(score, 4),
-                "source": meta.get("source", "?"),
-                "page": meta.get("page", "?"),
-                "chunk_idx": meta.get("chunk_idx"),
-                "machine": meta.get("machine"),
-                "sections": sections,
-                "content": doc.page_content,
-                "content_preview": doc.page_content[:300],
-                "parent_text": parent_text,
+                "score": src.get("score", 0),
+                "source": src.get("fichier", "?"),
+                "page": src.get("page", "?"),
+                "chunk_idx": None,  # not available from rechercher() output
+                "machine": None,
+                "sections": [],
+                "content": content,
+                "content_preview": content[:300],
+                "parent_text": None,
             })
 
         return {
@@ -1858,21 +1789,15 @@ class RAGEngine:
                 logger.info(f"[OLLAMA] génération → stream started after {time.monotonic()-_t0:.1f}s")
         except requests.ConnectionError:
             msg = "Impossible de contacter Ollama. Vérifiez qu'il est lancé avec `ollama serve`."
-            if stream:
-                def _err():
-                    yield msg
-                return _err()
-            return msg
         except requests.Timeout:
             logger.error(f"[OLLAMA] génération → TIMEOUT after {time.monotonic()-_t0:.1f}s | num_ctx={num_ctx} stream={stream}")
             msg = "Ollama n'a pas répondu à temps. Réessayez."
-            if stream:
-                def _err():
-                    yield msg
-                return _err()
-            return msg
         except requests.HTTPError as e:
             msg = f"Erreur Ollama : {e}"
+        else:
+            msg = None
+
+        if msg is not None:
             if stream:
                 def _err():
                     yield msg
