@@ -255,7 +255,11 @@ class OrchestratorService:
         threading.Thread(target=_run, daemon=True).start()
 
         while True:
-            kind, data = await queue.get()
+            try:
+                kind, data = await asyncio.wait_for(queue.get(), timeout=120.0)
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'error': 'Timeout — aucune réponse du pipeline RAG'})}\n\n"
+                break
             if kind == "token":
                 yield f"data: {json.dumps({'token': data})}\n\n"
             elif kind == "done":
@@ -330,7 +334,11 @@ class OrchestratorService:
                 loop.call_soon_threadsafe(rag_queue.put_nowait, ("error", str(exc)))
 
         threading.Thread(target=_run_rag, daemon=True).start()
-        kind, rag_data = await rag_queue.get()
+        try:
+            kind, rag_data = await asyncio.wait_for(rag_queue.get(), timeout=120.0)
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'error': 'Timeout — recherche RAG trop longue'})}\n\n"
+            return
 
         if kind == "error":
             yield f"data: {json.dumps({'error': rag_data})}\n\n"
@@ -388,7 +396,11 @@ class OrchestratorService:
         threading.Thread(target=_run_synthesis, daemon=True).start()
 
         while True:
-            kind, data = await synth_queue.get()
+            try:
+                kind, data = await asyncio.wait_for(synth_queue.get(), timeout=120.0)
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'error': 'Timeout — synthèse trop longue'})}\n\n"
+                break
             if kind == "token":
                 yield f"data: {json.dumps({'token': data})}\n\n"
             elif kind == "done":

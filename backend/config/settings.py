@@ -59,3 +59,16 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     cookie_samesite: str = "lax"
     rbac_config_path: str = "/app/config/rbac.yaml"
+
+    # Whisper transcription service
+    whisper_url: str = "http://whisper:9000"
+    whisper_timeout: int = 600
+
+    # LangGraph feature flag (USE_LANGGRAPH=true active la nouvelle architecture)
+    use_langgraph: bool = False
+
+    # Langfuse observability (100% local, self-hosted)
+    langfuse_enabled: bool = False
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "http://langfuse:3000"

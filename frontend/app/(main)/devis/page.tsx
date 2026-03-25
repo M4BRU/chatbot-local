@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ChevronDown, ChevronRight, Download, MoreHorizontal, Send, Trash2, X } from "lucide-react";
 import Image from "next/image";
 import { AssistantMessage, LoadingDots, UserBubble } from "@/components/chat/MarkdownMessage";
@@ -93,21 +93,11 @@ function SearchWorkspaceModal({
   const foundCount = allComps.filter(c => c.result === "found").length;
   const skippedCount = allComps.filter(c => c.result === "skipped").length;
 
-  // Mock: simulate search delay → show results
+  // TODO: replace with real API call
   useEffect(() => {
     if (phase !== "searching") return;
-    const t = setTimeout(() => {
-      onUpdate({
-        ...ws,
-        phase: "awaiting_choice",
-        choices: [
-          { id: "m1", label: "VLM-2024-001", detail: "Affaire Paris — 3 occurrences" },
-          { id: "m2", label: "VLM-2023-047", detail: "Affaire Lyon — 1 occurrence" },
-          { id: "m3", label: "VLM-2024-089", detail: "Affaire Bordeaux — 2 occurrences" },
-        ],
-      });
-    }, 1200);
-    return () => clearTimeout(t);
+    let t: ReturnType<typeof setTimeout> | undefined;
+    return () => { if (t) clearTimeout(t); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, currentIdx]);
 
@@ -583,7 +573,7 @@ function QueryVariantSelector({
 }
 
 // ─── Message item ──────────────────────────────────────────────────────────────
-function MessageItem({
+const MessageItem = React.memo(function MessageItem({
   msg,
   toolCalls,
   onChoiceSelect,
@@ -736,10 +726,10 @@ function MessageItem({
       {toolCalls && toolCalls.map((tc) => <ToolCallBadge key={tc.id} tool={tc} />)}
     </AssistantMessage>
   );
-}
+});
 
 // ─── Poste row (editable MdO fields, expandable elements) ─────────────────────
-function PosteRow({
+const PosteRow = React.memo(function PosteRow({
   item,
   isOption,
   highlighted,
@@ -951,10 +941,10 @@ function PosteRow({
       )}
     </>
   );
-}
+});
 
 // ─── Devis panel ──────────────────────────────────────────────────────────────
-function DevisPanel({
+const DevisPanel = React.memo(function DevisPanel({
   postes,
   devisSettings,
   highlightedId,
@@ -1109,7 +1099,7 @@ function DevisPanel({
       </div>
     </aside>
   );
-}
+});
 
 // ─── Welcome screen ────────────────────────────────────────────────────────────
 const SUGGESTIONS = [
@@ -1381,6 +1371,14 @@ export default function DevisPage() {
   messagesRef.current = messages;
   const sendDepthRef = useRef(0);
 
+  // ── Cleanup timers on unmount ───────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+      if (settingsSaveTimerRef.current) clearTimeout(settingsSaveTimerRef.current);
+    };
+  }, []);
+
   // ── Sidebar auto-close on 0→1 transition, reopen on N→0 ─────────────────
   useEffect(() => {
     const prev = prevPostesLengthRef.current;
@@ -1469,18 +1467,20 @@ export default function DevisPage() {
 
   // ── Settings change (debounced save) ─────────────────────────────────────
   const handleSettingsChange = useCallback((key: "coefficient" | "coef_final", value: number) => {
-    setDevisSettings(prev => {
-      const next = { ...prev, [key]: value };
-      if (settingsSaveTimerRef.current) clearTimeout(settingsSaveTimerRef.current);
-      settingsSaveTimerRef.current = setTimeout(async () => {
-        const convId = activeConvIdRef.current;
-        if (convId) {
-          await updateDevisSettings(convId, next.coefficient, next.coef_final).catch(console.error);
-        }
-      }, 500);
-      return next;
-    });
+    setDevisSettings(prev => ({ ...prev, [key]: value }));
   }, []);
+
+  // Debounced persist when devisSettings changes
+  useEffect(() => {
+    if (settingsSaveTimerRef.current) clearTimeout(settingsSaveTimerRef.current);
+    settingsSaveTimerRef.current = setTimeout(async () => {
+      const convId = activeConvIdRef.current;
+      if (convId) {
+        await updateDevisSettings(convId, devisSettings.coefficient, devisSettings.coef_final).catch(console.error);
+      }
+    }, 500);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devisSettings]);
 
   // ── Update panier item (MdO fields) ──────────────────────────────────────
   const handleUpdateItem = useCallback(async (itemId: string, field: string, value: number | boolean) => {

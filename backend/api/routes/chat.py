@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import threading
 import uuid as _uuid
 from collections.abc import AsyncGenerator
@@ -13,6 +14,8 @@ from sqlalchemy import select
 
 from backend.adapters.auth_adapter import get_current_user
 from backend.api.dependencies import get_authorization_service, get_collection_manager
+
+logger = logging.getLogger(__name__)
 from backend.db.models import Conversation, Message, UserTable
 from backend.domain.models.chat import ChatRequest, ChatResponse
 
@@ -65,8 +68,8 @@ async def _persist_messages(
                     session.add(Message(conversation_id=conv.id, role="assistant", content=assistant_message))
                 conv.updated_at = datetime.now(timezone.utc)
                 await session.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to persist messages for conversation %s: %s", conv_id, e)
 
 
 async def _stream_rag_response(
@@ -140,8 +143,8 @@ async def _stream_rag_response(
                             context_chunks=result.get("context_chunks", []),
                             retrieval_ms=metrics.get("retrieval_ms", 0),
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to enqueue evaluation: %s", e)
 
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", {
                     "sources": sources,
@@ -250,12 +253,11 @@ async def chat_sync(
 
     Returns the complete response at once.
     """
-    from core.collection_manager import CollectionManager
     from core.search import RAGEngine
 
     get_authorization_service().assert_can_access(current_user.role, request.collection_name)
 
-    cm = CollectionManager()
+    cm = get_collection_manager()
     if not cm.collection_existe(request.collection_name):
         raise HTTPException(status_code=404, detail=f"Collection '{request.collection_name}' not found")
 

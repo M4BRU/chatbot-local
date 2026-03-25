@@ -712,7 +712,8 @@ def _detecter_section_ciblee(db, question: str, resultats_initiaux: list) -> str
                     logger.info(f"Titre Docling détecté : [{label_type}] '{titre_clean}'")
 
     # Si résultats dispersés (multiple sources, pages très éloignées), pas une section
-    if len(sources) > 1 or (len(pages) > 1 and max(pages) - min(pages) > 3):
+    numeric_pages = {p for p in pages if isinstance(p, (int, float))}
+    if len(sources) > 1 or (len(numeric_pages) > 1 and max(numeric_pages) - min(numeric_pages) > 3):
         return None
 
     # Si on trouve des titres avec labels Docling, retourner le premier
@@ -1513,7 +1514,8 @@ class RAGEngine:
                     logger.info("CRAG : qualité insuffisante → re-query keyword fallback déclenché")
                     fallback_crag = _keyword_fallback_search(self.db, question, k=k)
                     if fallback_crag:
-                        resultats = fallback_crag + [r for r in resultats if r not in fallback_crag]
+                        seen = {doc.page_content[:150] for doc, _ in fallback_crag}
+                        resultats = fallback_crag + [r for r in resultats if r[0].page_content[:150] not in seen]
 
         # 5b. Keyword fallback — si le reranker (ou la RRF sans reranker) ne trouve
         # rien de pertinent, recherche exacte par mots-clés via where_document.
@@ -1522,7 +1524,8 @@ class RAGEngine:
             fallback = _keyword_fallback_search(self.db, question, k=k)
             if fallback:
                 # On prepend les résultats keyword : ils ont une correspondance exacte
-                resultats = fallback + [r for r in resultats if r not in fallback]
+                seen = {doc.page_content[:150] for doc, _ in fallback}
+                resultats = fallback + [r for r in resultats if r[0].page_content[:150] not in seen]
 
         # 5c. A4 MMR — diversification après reranking, avant seuil relatif
         if USE_MMR and resultats:

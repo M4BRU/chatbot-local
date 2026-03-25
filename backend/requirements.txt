@@ -33,6 +33,15 @@ pyyaml>=6.0.0
 pyotp>=2.9.0
 qrcode[pil]>=7.4.2
 
+# LangGraph + LangChain orchestration
+langgraph>=0.4
+langchain-core>=0.3
+langchain-ollama>=0.3
+langgraph-checkpoint-postgres>=2.0
+
+# Langfuse observability (self-hosted, local only)
+langfuse>=2.0
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.24.0

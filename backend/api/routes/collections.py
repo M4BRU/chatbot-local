@@ -1,9 +1,13 @@
 """Collections management API routes."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.api.dependencies import get_authorization_service, get_collection_manager, get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
 
@@ -43,7 +47,7 @@ async def list_collections(user=Depends(get_current_user)) -> CollectionListResp
 
 
 @router.post("", response_model=CollectionInfo, status_code=201)
-async def create_collection(request: CollectionCreate) -> CollectionInfo:
+async def create_collection(request: CollectionCreate, user=Depends(get_current_user)) -> CollectionInfo:
     """Create a new collection."""
     cm = get_collection_manager()
     if cm.collection_existe(request.name):
@@ -53,25 +57,38 @@ async def create_collection(request: CollectionCreate) -> CollectionInfo:
     return CollectionInfo(name=request.name, document_count=0)
 
 
+@router.get("/version-status")
+async def version_status(user=Depends(get_current_user)) -> list[dict]:
+    """
+    Vérifie si les collections ont des chunks périmés (pipeline d'indexation modifié).
+    Lecture des metadata.json uniquement — pas de requête vector DB.
+    """
+    from backend.api.dependencies import get_document_manager
+    dm = get_document_manager()
+    return dm.verifier_versions_toutes_collections()
+
+
 @router.get("/{name}", response_model=CollectionInfo)
-async def get_collection(name: str) -> CollectionInfo:
+async def get_collection(name: str, user=Depends(get_current_user)) -> CollectionInfo:
     """Get collection information."""
     cm = get_collection_manager()
+    auth_svc = get_authorization_service()
+    auth_svc.assert_can_access(user.role, name)
     if not cm.collection_existe(name):
         raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
 
     db = cm.get_collection(name)
-    # Get document count from ChromaDB
     try:
         count = db._collection.count()
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to get collection count for %s: %s", name, e)
         count = 0
 
     return CollectionInfo(name=name, document_count=count)
 
 
 @router.get("/{name}/sources")
-async def list_sources(name: str) -> dict:
+async def list_sources(name: str, user=Depends(get_current_user)) -> dict:
     """Liste les noms de fichiers uniques indexés dans une collection."""
     cm = get_collection_manager()
     if not cm.collection_existe(name):
@@ -107,11 +124,12 @@ async def list_sources(name: str) -> dict:
 
         return {"sources": sorted(sources)}
     except Exception as e:
+        logger.error("Failed to list sources for collection %s: %s", name, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{name}/chunks")
-async def list_chunks(name: str, offset: int = 0, limit: int = 50, source: str = "") -> dict:
+async def list_chunks(name: str, offset: int = 0, limit: int = 50, source: str = "", user=Depends(get_current_user)) -> dict:
     """Liste les chunks d'une collection avec pagination. Filtre optionnel par source."""
     cm = get_collection_manager()
     if not cm.collection_existe(name):
@@ -206,19 +224,8 @@ async def list_chunks(name: str, offset: int = 0, limit: int = 50, source: str =
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/version-status")
-async def version_status() -> list[dict]:
-    """
-    Vérifie si les collections ont des chunks périmés (pipeline d'indexation modifié).
-    Lecture des metadata.json uniquement — pas de requête vector DB.
-    """
-    from backend.api.dependencies import get_document_manager
-    dm = get_document_manager()
-    return dm.verifier_versions_toutes_collections()
-
-
 @router.delete("/{name}", status_code=204)
-async def delete_collection(name: str) -> None:
+async def delete_collection(name: str, user=Depends(get_current_user)) -> None:
     """Delete a collection."""
     cm = get_collection_manager()
     if not cm.collection_existe(name):

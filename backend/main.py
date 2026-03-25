@@ -23,6 +23,7 @@ from backend.api.routes import (
     excel_documents_router,
     eval_router,
     health_router,
+    transcription_router,
 )
 from backend.api.routes.auth import router as auth_router
 from backend.api.routes.totp import router as totp_router
@@ -116,10 +117,13 @@ async def lifespan(app: FastAPI):
     # 2. Validation RBAC (fail-fast si config absente ou malformée)
     await asyncio.to_thread(_check_rbac_config)
 
-    # 3. SQLite DBs existantes (catalog, excel, eval) — inchangées
+    # 3. SQLite DBs existantes (catalog, excel, eval)
+    # Note: get_catalog_adapter() / get_excel_collection_adapter() appellent déjà
+    # init_db() dans leur @lru_cache factory (dependencies.py).
+    # On force juste la création des singletons ici (eager init).
     from backend.api.dependencies import get_catalog_adapter, get_excel_collection_adapter
-    get_catalog_adapter().init_db()
-    get_excel_collection_adapter().init_db()
+    get_catalog_adapter()
+    get_excel_collection_adapter()
     from backend.core.eval_store import init_eval_db
     init_eval_db()
 
@@ -164,6 +168,7 @@ app.include_router(excel_documents_router)
 app.include_router(devis_router)
 app.include_router(eval_router)
 app.include_router(agent_router)
+app.include_router(transcription_router)
 
 
 @app.get("/")

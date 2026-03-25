@@ -99,3 +99,10 @@ def get_devis_service():
         catalog_adapter=get_catalog_adapter(),
         excel_adapter=get_excel_collection_adapter(),
     )
+
+
+@lru_cache(maxsize=1)
+def get_transcription_service():
+    """Singleton TranscriptionService — audio transcription Whisper + résumé LLM."""
+    from backend.domain.services.transcription_service import TranscriptionService
+    return TranscriptionService()

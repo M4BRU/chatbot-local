@@ -153,6 +153,38 @@ export interface AgentSSEEvent {
   error?: string;
 }
 
+// ── Transcription Mode ──────────────────────────────────────────────────────
+export type TranscriptionStatus = "transcribing" | "transcribed" | "summarizing" | "done" | "error";
+
+export interface TranscriptionSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface TranscriptionAction {
+  responsable?: string;
+  description: string;
+  deadline?: string;
+}
+
+export interface TranscriptionSummary {
+  decisions: string[];
+  actions: TranscriptionAction[];
+  participants: string[];
+  points_cles: string[];
+}
+
+export interface TranscriptionSSEEvent {
+  status?: TranscriptionStatus;
+  step?: string;
+  transcript?: string;
+  segments?: TranscriptionSegment[];
+  duration_seconds?: number;
+  summary?: TranscriptionSummary;
+  error?: string;
+}
+
 export interface CatalogElement {
   nom_poste?: string;
   elements?: string;

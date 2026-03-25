@@ -1,4 +1,4 @@
-import type { AgentMode, AgentSSEEvent, CatalogElement, Conversation, Message, SSEEvent, DevisSSEEvent, PanierItem } from "./types";
+import type { AgentMode, AgentSSEEvent, CatalogElement, Conversation, Message, SSEEvent, DevisSSEEvent, PanierItem, TranscriptionSSEEvent } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -480,6 +480,51 @@ export async function debugRfqPlanner(
     throw new Error(err.detail || `HTTP ${response.status}`);
   }
   return response.json();
+}
+
+// ── Transcription Mode ──────────────────────────────────────────────────────
+
+export async function* streamTranscription(
+  file: File,
+): AsyncGenerator<TranscriptionSSEEvent> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await apiFetch(`${API_URL}/api/v1/transcription/upload`, {
+    method: "POST",
+    body: formData,
+    // Pas de Content-Type — le browser set multipart/form-data + boundary
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }));
+    throw new Error(err.detail || `HTTP ${response.status}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        try {
+          yield JSON.parse(line.slice(6)) as TranscriptionSSEEvent;
+        } catch {
+          // Ignore parse errors
+        }
+      }
+    }
+  }
 }
 
 export async function debugRAG(

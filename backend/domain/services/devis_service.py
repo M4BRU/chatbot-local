@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+# ── Shared httpx.AsyncClient — un seul client réutilisé pour toutes les requêtes Ollama ──
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Retourne un AsyncClient partagé (connection pooling, pas de leak TCP)."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(timeout=600.0)
+    return _HTTP_CLIENT
 MAX_TOOL_ITERATIONS = 12  # safety cap on the tool-calling loop (RFQ complexe = plan_tasks + N searches)
 
 # ── Structured output : JSON schemas pour Ollama format-constrained generation ──
@@ -103,15 +114,14 @@ def _build_system_prompt(
         panier_section = "Le panier est vide."
 
     if task_list:
-        import re as _re
         # Cross-reference with panier: a task is done if its query matches any panier item
         panier_noms_lower = {(p.get("nom_poste") or "").lower() for p in (panier or [])}
         def _task_done(task: dict) -> bool:
             if task.get("done"):
                 return True
-            q_words = set(_re.findall(r"\w{3,}", task["query"].lower()))
+            q_words = set(re.findall(r"\w{3,}", task["query"].lower()))
             return any(
-                bool(q_words & set(_re.findall(r"\w{3,}", nom)))
+                bool(q_words & set(re.findall(r"\w{3,}", nom)))
                 for nom in panier_noms_lower
             )
         task_lines = [
@@ -420,13 +430,13 @@ def _query_matches_postes(query: str, results: list[dict]) -> bool:
     """
     # Fast path: delegate to catalog adapter at call site (needs catalog instance).
     # This standalone version uses a simple regex word intersection as fallback.
-    import re as _re
-    q_words = _re.findall(r"\w{3,}", query.lower())
+
+    q_words = re.findall(r"\w{3,}", query.lower())
     if not q_words:
         return bool(results)
     for row in results:
         nom_poste = _s(row.get("nom_poste")).lower()
-        np_words = _re.findall(r"\w+", nom_poste)
+        np_words = re.findall(r"\w+", nom_poste)
         for qw in q_words:
             for npw in np_words:
                 if npw.startswith(qw) or qw.startswith(npw):
@@ -448,10 +458,10 @@ def _detect_element_conflict(query: str, raw_results: list[dict]) -> dict | None
 
     Every option id is JSON with an 'action' field; the frontend dispatches accordingly.
     """
-    import re as _re
+
     from collections import defaultdict
 
-    q_words = _re.findall(r"\w{3,}", query.lower())
+    q_words = re.findall(r"\w{3,}", query.lower())
     if not q_words:
         return None
 
@@ -461,7 +471,7 @@ def _detect_element_conflict(query: str, raw_results: list[dict]) -> dict | None
         elements_text = _s(row.get("elements"))
         if not elements_text:
             continue
-        el_words = _re.findall(r"\w+", elements_text.lower())
+        el_words = re.findall(r"\w+", elements_text.lower())
         for qw in q_words:
             if any(ew.startswith(qw) or qw.startswith(ew) for ew in el_words):
                 element_groups[elements_text].append(row)
@@ -885,10 +895,10 @@ class DevisService:
         if tools:
             payload["tools"] = tools
 
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        client = _get_http_client()
+        resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
         # Log du thinking pour debug (non injecté dans le contexte)
         thinking = data.get("message", {}).get("thinking", "")
@@ -951,10 +961,10 @@ class DevisService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            client = _get_http_client()
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
             content = data.get("message", {}).get("content", "").strip()
             logger.info("[extract_components] réponse brute (%d chars): %r", len(content), content[:500])
@@ -1024,10 +1034,10 @@ class DevisService:
             "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            client = _get_http_client()
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
             content = data.get("message", {}).get("content", "").strip()
             logger.info(
@@ -1166,10 +1176,10 @@ class DevisService:
             "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            client = _get_http_client()
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
             content = data.get("message", {}).get("content", "").strip()
             logger.info(
@@ -1492,9 +1502,9 @@ class DevisService:
             "options": {"temperature": 0, "num_ctx": 8192},  # aligné sur tool_loop — évite reload KV cache
         }
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-                resp.raise_for_status()
+            client = _get_http_client()
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
             summary = resp.json().get("message", {}).get("content", "").strip()
 
             after_chars = len(summary) + len(original_user_msg)
@@ -1575,10 +1585,10 @@ class DevisService:
             "options": {"temperature": 0, "num_ctx": 8192},
         }
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            client = _get_http_client()
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
 
             synthesis = data.get("message", {}).get("content", "").strip()
             logger.info(
@@ -2789,9 +2799,9 @@ class DevisService:
                     if tool_name == "search_docs":
                         try:
                             parsed = json.loads(result)
-                            # result is {"chunks": [...], "catalog_postes": [...]}
+                            # result is {"components": [...], "sources": [...]}
                             inner_chunks = (
-                                parsed.get("chunks", [])
+                                parsed.get("components", [])
                                 if isinstance(parsed, dict)
                                 else parsed
                             )
@@ -2859,39 +2869,39 @@ class DevisService:
                     break
 
             # ── Final streaming response (no tools passed) ────────────────────
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA_BASE_URL}/api/chat",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": messages,
-                        "stream": True,
-                        "think": False,  # Désactive le mode thinking qwen3
-                    },
-                ) as resp:
-                    _in_think = False  # filtre tokens <think>...</think> (qwen3)
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            if token:
-                                if "<think>" in token:
-                                    _in_think = True
-                                if _in_think:
-                                    if "</think>" in token:
-                                        _in_think = False
-                                        after = token.split("</think>", 1)[1]
-                                        if after:
-                                            yield {"token": after}
-                                else:
-                                    yield {"token": token}
-                            if chunk.get("done"):
-                                break
-                        except json.JSONDecodeError:
-                            continue
+            client = _get_http_client()
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": True,
+                    "think": False,  # Désactive le mode thinking qwen3
+                },
+            ) as resp:
+                _in_think = False  # filtre tokens <think>...</think> (qwen3)
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            if "<think>" in token:
+                                _in_think = True
+                            if _in_think:
+                                if "</think>" in token:
+                                    _in_think = False
+                                    after = token.split("</think>", 1)[1]
+                                    if after:
+                                        yield {"token": after}
+                            else:
+                                yield {"token": token}
+                        if chunk.get("done"):
+                            break
+                    except json.JSONDecodeError:
+                        continue
 
         except Exception as exc:
             logger.error("Devis chat error: %s", exc, exc_info=True)
@@ -2949,24 +2959,35 @@ class DevisService:
         ]
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA_BASE_URL}/api/chat",
-                    json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            if token:
-                                yield {"token": token}
-                            if chunk.get("done"):
-                                break
-                        except json.JSONDecodeError:
-                            continue
+            client = _get_http_client()
+            _in_think = False
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={"model": OLLAMA_MODEL, "messages": messages, "stream": True, "think": False},
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            # Filtrer les blocs <think> qui peuvent passer malgré think=False
+                            if "<think>" in token:
+                                _in_think = True
+                            if _in_think:
+                                if "</think>" in token:
+                                    _in_think = False
+                                    after = token.split("</think>", 1)[1]
+                                    if after:
+                                        yield {"token": after}
+                                continue
+                            yield {"token": token}
+                        if chunk.get("done"):
+                            break
+                    except json.JSONDecodeError:
+                        continue
         except Exception as exc:
             logger.error("Generate devis error: %s", exc, exc_info=True)
             yield {"error": str(exc)}

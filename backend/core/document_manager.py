@@ -440,9 +440,10 @@ def _validate_title_with_ai(text: str, context_before: str, context_after: str) 
         resp.raise_for_status()
         response = resp.json().get("response", "").strip().upper()
         return "TITRE" in response
-    except Exception:
-        # Si validation IA échoue, on considère que c'est un titre (fail-safe)
-        return True
+    except Exception as e:
+        # Conservateur : en cas de doute, ce n'est PAS un titre
+        logger.warning("Title validation AI failed: %s — returning False (conservative)", e)
+        return False
 
 
 # Noms de machines VLM Robotics à détecter dans les noms de fichiers

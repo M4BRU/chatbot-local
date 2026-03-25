@@ -118,6 +118,15 @@ services:
       - COOKIE_SECURE=${COOKIE_SECURE:-false}
       - COOKIE_SAMESITE=${COOKIE_SAMESITE:-lax}
       - RBAC_CONFIG_PATH=/app/config/rbac.yaml
+      # ── Whisper transcription ──────────────────────────────────────────────────
+      - WHISPER_URL=http://whisper:9000
+      - WHISPER_TIMEOUT=600
+      # ── LangGraph + Langfuse ────────────────────────────────────────────────
+      - USE_LANGGRAPH=${USE_LANGGRAPH:-false}
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-false}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=http://langfuse:3000
     volumes:
       - ./backend:/app/backend # Code source en temps réel
       - ./alembic.ini:/app/alembic.ini:ro
@@ -208,6 +217,40 @@ services:
       - qdrant_data:/qdrant/storage
     environment:
       - QDRANT__TELEMETRY_DISABLED=true
+    networks:
+      - chatbot-network
+
+  # ── Langfuse v2 observability (100% local, self-hosted) ─────────────────────
+  # UI accessible sur http://localhost:3100 après création de compte
+  # Partage le PostgreSQL existant (database séparée "langfuse")
+  langfuse:
+    image: langfuse/langfuse:2
+    ports:
+      - "3100:3000"
+    environment:
+      - DATABASE_URL=postgresql://langfuse:langfuse@postgres:5432/langfuse
+      - NEXTAUTH_SECRET=${LANGFUSE_NEXTAUTH_SECRET:-changeme-32chars-minimum-secret}
+      - SALT=${LANGFUSE_SALT:-changeme-salt-minimum}
+      - NEXTAUTH_URL=http://localhost:3100
+      - TELEMETRY_ENABLED=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - chatbot-network
+
+  # ── Whisper transcription (CPU-only) ────────────────────────────────────────
+  whisper:
+    build:
+      context: ./whisper-service
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - WHISPER_MODEL=large-v3-turbo
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_LANGUAGE=fr
     networks:
       - chatbot-network
 

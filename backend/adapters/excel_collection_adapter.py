@@ -418,16 +418,41 @@ class ExcelCollectionAdapter:
             return self._bm25_result(question, collection_name, sql=generated_sql, sql_error=str(e), filename=filename)
 
     def _execute_sql(self, sql: str) -> list[dict]:
-        """Exécute un SELECT dans la DB et retourne les résultats."""
+        """Exécute un SELECT read-only dans la DB avec protections contre injection."""
         # Sécurité : n'autoriser que les SELECT
         sql_clean = sql.strip().upper()
         if not sql_clean.startswith("SELECT"):
             raise ValueError(f"Seuls les SELECT sont autorisés (reçu : {sql[:50]})")
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql).fetchall()
-        return [dict(r) for r in rows]
+        # Forcer LIMIT pour éviter OOM sur grosses tables
+        if "LIMIT" not in sql_clean:
+            sql = f"{sql.rstrip(';')} LIMIT 200"
+
+        # Ouvrir en read-only + authorizer whitelist tables xl_*
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+
+        def _authorizer(action, arg1, arg2, db_name, trigger):
+            if action == sqlite3.SQLITE_SELECT:
+                return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_READ:
+                if arg1 and (arg1.startswith("xl_") or arg1 == "sqlite_master"):
+                    return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_FUNCTION:
+                # Autoriser fonctions SQL standard, bloquer load_extension etc.
+                blocked = {"load_extension", "fts3_tokenizer"}
+                if arg2 and arg2.lower() in blocked:
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+
+        conn.set_authorizer(_authorizer)
+
+        try:
+            rows = conn.execute(sql).fetchmany(200)
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     def _bm25_result(
         self,
@@ -450,7 +475,7 @@ class ExcelCollectionAdapter:
         Utilisé comme fallback quand le SQL ne retourne rien.
         filename : si renseigné, restreint la recherche à ce fichier uniquement.
         """
-        from core.bm25_utils import BM25Index, tokenize
+        from core.bm25_utils import BM25Index
 
         tables = self.list_tables(collection_name)
         if filename:
